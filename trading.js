@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.24
+// @version      6.25
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
+// @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -14,8 +15,13 @@
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @grant        GM_openInTab
+// @grant        GM_notification
+// @grant        GM_registerMenuCommand
+// @grant        GM_info
+// @connect      raw.githubusercontent.com
 // @downloadURL  https://x-access-token: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@raw.githubusercontent.com/bepis1/p-trad/main/trading.js
-// @updateURL    https://x-access-token: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@raw.githubusercontent.com/bepis1/p-trad/main/trading.meta.js
 // ==/UserScript==
 
 (function() {
@@ -5689,4 +5695,148 @@ const SECTOR_DATA = {
         return results;
     }
 
+})();
+// --- 19. Auto-Update (private-repo self-update via GM_xmlhttpRequest) ---
+//
+// Why this exists: Tampermonkey's native @updateURL check cannot authenticate
+// against a private GitHub repo. raw.githubusercontent.com answers private-repo
+// requests with 404 (not 401) when unauthenticated, and Tampermonkey's
+// background update fetch strips the credentials embedded in the URL (per the
+// fetch spec), so the native check always sees 404 and silently never updates.
+//
+// This section does the check itself using GM_xmlhttpRequest, which CAN send an
+// explicit `Authorization: token <PAT>` header. When a newer @version is found
+// it notifies the user and, on click, downloads the full trading.js source (also
+// authenticated) and opens it as a blob: navigation. Tampermonkey intercepts
+// that navigation (application/javascript body containing the ==UserScript==
+// header) and shows its normal install dialog, which performs the update.
+//
+// The token + URLs are derived from the script's own @downloadURL (already
+// baked with the token at build time) so there is no second source of truth.
+//
+// NOTE: this updater is itself shipped in v6.25, so v6.25 must be installed
+// manually ONCE; every version thereafter updates automatically.
+
+(function () {
+    'use strict';
+
+    const CHECK_INTERVAL_MS = 8 * 60 * 60 * 1000; // 8 hours between auto-checks
+    const LAST_CHECK_KEY = 'pardus_update_last_check';
+    const SKIPPED_KEY = 'pardus_update_skipped_version';
+
+    const downloadURL = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.downloadURL) || '';
+    const tokenMatch = downloadURL.match(/x-access-token:([^@]+)@/);
+    if (!downloadURL || !tokenMatch) {
+        // No authenticated @downloadURL configured (e.g. dev build) — bail.
+        return;
+    }
+    const GH_TOKEN = tokenMatch[1];
+    const metaURL = downloadURL.replace(/trading\.js(\?|$)/, 'trading.meta.js$1');
+    const scriptURL = downloadURL;
+    const currentVersion = (GM_info.script && GM_info.script.version) || '0';
+
+    function compareVersions(a, b) {
+        const pa = String(a).split(/[.+~-]/).map(n => parseInt(n, 10) || 0);
+        const pb = String(b).split(/[.+~-]/).map(n => parseInt(n, 10) || 0);
+        const len = Math.max(pa.length, pb.length);
+        for (let i = 0; i < len; i++) {
+            const da = pa[i] || 0, db = pb[i] || 0;
+            if (da !== db) return da - db;
+        }
+        return 0;
+    }
+
+    function notify(title, text, opts) {
+        try {
+            GM_notification(Object.assign({ title: title, text: text, timeout: 12000 }, opts || {}));
+        } catch (e) {
+            console.log('[pardus-update]', title, text);
+        }
+    }
+
+    function fetchMeta(cb) {
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: metaURL,
+            headers: { Authorization: 'token ' + GH_TOKEN },
+            timeout: 15000,
+            onload: function (r) {
+                if (r.status >= 200 && r.status < 300) {
+                    const m = (r.responseText || '').match(/@version\s+(\S+)/);
+                    cb(m ? m[1] : null);
+                } else {
+                    console.warn('[pardus-update] meta fetch HTTP', r.status);
+                    cb(null);
+                }
+            },
+            onerror: function () { console.warn('[pardus-update] meta fetch error'); cb(null); },
+            ontimeout: function () { console.warn('[pardus-update] meta fetch timeout'); cb(null); }
+        });
+    }
+
+    function installUpdate(remoteVersion) {
+        notify('Pardus Logistics', 'Downloading v' + remoteVersion + '...');
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: scriptURL,
+            headers: { Authorization: 'token ' + GH_TOKEN },
+            timeout: 60000,
+            onload: function (r) {
+                if (r.status >= 200 && r.status < 300 && r.responseText) {
+                    try {
+                        const blob = new Blob([r.responseText], { type: 'application/javascript' });
+                        const blobURL = URL.createObjectURL(blob);
+                        GM_openInTab(blobURL, { active: true });
+                        GM_setValue(LAST_CHECK_KEY, Date.now());
+                    } catch (e) {
+                        notify('Pardus Logistics', 'Install failed: ' + e.message);
+                    }
+                } else {
+                    notify('Pardus Logistics', 'Update download failed (HTTP ' + r.status + ').');
+                }
+            },
+            onerror: function () { notify('Pardus Logistics', 'Update download failed (network).'); },
+            ontimeout: function () { notify('Pardus Logistics', 'Update download timed out.'); }
+        });
+    }
+
+    function announceUpdate(remoteVersion) {
+        const skipped = GM_getValue(SKIPPED_KEY, '');
+        if (skipped === remoteVersion) return; // user dismissed this version
+        const text = 'Update available: v' + currentVersion + ' → v' + remoteVersion +
+            '. Click to install.';
+        notify('Pardus Logistics Router', text, {
+            highlight: true,
+            timeout: 0,
+            onclick: function () { installUpdate(remoteVersion); }
+        });
+        try {
+            GM_registerMenuCommand('Install Pardus update v' + remoteVersion, function () {
+                installUpdate(remoteVersion);
+            });
+        } catch (e) {}
+    }
+
+    function runCheck(force) {
+        const now = Date.now();
+        if (!force) {
+            const last = GM_getValue(LAST_CHECK_KEY, 0);
+            if (now - last < CHECK_INTERVAL_MS) return;
+        }
+        GM_setValue(LAST_CHECK_KEY, now);
+        fetchMeta(function (remoteVersion) {
+            if (!remoteVersion) return;
+            if (compareVersions(currentVersion, remoteVersion) < 0) {
+                announceUpdate(remoteVersion);
+            } else if (force) {
+                notify('Pardus Logistics', 'You are up to date (v' + currentVersion + ').');
+            }
+        });
+    }
+
+    try {
+        GM_registerMenuCommand('Check for Pardus update', function () { runCheck(true); });
+    } catch (e) {}
+
+    runCheck(false);
 })();
