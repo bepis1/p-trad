@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.33
+// @version      6.34
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -12,6 +12,7 @@
 // @description  v6.31: Version bump to test the Contents API auto-update flow.
 // @description  v6.32: Version bump to test auto-update from 6.31.
 // @description  v6.33: Security — split read-only token (GH_READ_TOKEN, embedded in script) from write token (GH_TOKEN, publish-only). Fine-grained PAT scoped to repo read-only.
+// @description  v6.34: Fix magscoop space leak — sim no longer frees regular cargo space when dropping magscoop items, preventing the route planner from filling the +150 magscoop.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -564,7 +565,7 @@
     // from the run boundary; only moves that stay cargo-feasible are accepted.
     // Hub/TO reload boundaries are never crossed. Only runs with all-unique
     // locations qualify (node-side supply/demand is order-independent).
-    function optimizeFactoryRuns(routeSteps, initialCargo, initialSpace, sectorName, startLoc) {
+    function optimizeFactoryRuns(routeSteps, initialCargo, initialSpace, initialMagScoopUsed, sectorName, startLoc) {
         if (!routeSteps || routeSteps.length < 3) return routeSteps;
         const dijCache = {};
         const travelAP = (a, b) => simTravelAP(a, b, sectorName, dijCache);
@@ -574,13 +575,16 @@
             const snaps = [];
             let cargo = JSON.parse(JSON.stringify(initialCargo));
             let space = initialSpace;
+            let magScoop = initialMagScoopUsed || 0;
             for (const step of routeSteps) {
-                snaps.push({ cargo: JSON.parse(JSON.stringify(cargo)), space });
+                snaps.push({ cargo: JSON.parse(JSON.stringify(cargo)), space, magScoop });
                 for (const item in step.dropoffs) {
                     const amt = step.dropoffs[item].amount;
                     const k = item.toLowerCase();
                     cargo[k] = (cargo[k] || 0) - amt;
-                    space += amt;
+                    const fromMag = Math.min(amt, magScoop);
+                    magScoop -= fromMag;
+                    space += (amt - fromMag);
                 }
                 for (const item in step.pickups) {
                     const amt = step.pickups[item].amount;
@@ -599,16 +603,19 @@
             return cost;
         }
 
-        function feasibleSeq(seq, startCargo, startSpace) {
+        function feasibleSeq(seq, startCargo, startSpace, startMagScoop) {
             let cargo = JSON.parse(JSON.stringify(startCargo));
             let space = startSpace;
+            let magScoop = startMagScoop || 0;
             for (const step of seq) {
                 for (const item in step.dropoffs) {
                     const amt = step.dropoffs[item].amount;
                     const k = item.toLowerCase();
                     if ((cargo[k] || 0) < amt) return false;
                     cargo[k] = (cargo[k] || 0) - amt;
-                    space += amt;
+                    const fromMag = Math.min(amt, magScoop);
+                    magScoop -= fromMag;
+                    space += (amt - fromMag);
                 }
                 for (const item in step.pickups) {
                     const amt = step.pickups[item].amount;
@@ -650,6 +657,7 @@
                 const curCost = seqCost(curSeq, inLoc, outLoc);
                 const startCargo = snapshots[r].cargo;
                 const startSpace = snapshots[r].space;
+                const startMagScoop = snapshots[r].magScoop;
 
                 let bestCost = curCost;
                 let bestSeq = null;
@@ -665,7 +673,7 @@
                         }
                         const newCost = seqCost(reordered, inLoc, outLoc);
                         if (newCost >= bestCost) continue;
-                        if (!feasibleSeq(reordered, startCargo, startSpace)) continue;
+                        if (!feasibleSeq(reordered, startCargo, startSpace, startMagScoop)) continue;
                         bestCost = newCost;
                         bestSeq = reordered;
                     }
@@ -681,7 +689,7 @@
                         reordered.splice(insertPos, 0, elem);
                         const newCost = seqCost(reordered, inLoc, outLoc);
                         if (newCost >= bestCost) continue;
-                        if (!feasibleSeq(reordered, startCargo, startSpace)) continue;
+                        if (!feasibleSeq(reordered, startCargo, startSpace, startMagScoop)) continue;
                         bestCost = newCost;
                         bestSeq = reordered;
                     }
@@ -715,6 +723,13 @@
         shipSpace += magScoopUsed; // Add back magscoop items — they don't take regular space
         shipSpace = Math.max(0, shipSpace);
 
+        // Track how many items are in the magscoop throughout the simulation.
+        // When items are dropped off, we drain from the magscoop first —
+        // only the non-magscoop remainder frees regular shipSpace. This
+        // prevents the sim from planning pickups that overflow into the
+        // magscoop (the +150 should never be used for route planning).
+        let simMagScoopUsed = magScoopUsed;
+
         let toSpace = parseInt(toCapacity, 10) || 0;
         let minTrade = parseInt(minTradeVol, 10) || 1;
         let exportList = (exportItemsStr || "").split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
@@ -732,6 +747,7 @@
 
         let initialShipCargo = JSON.parse(JSON.stringify(shipCargo));
         let initialShipSpace = shipSpace;
+        let initialSimMagScoopUsed = simMagScoopUsed;
 
         let unvisited = JSON.parse(JSON.stringify(rawNodes));
 
@@ -1076,6 +1092,7 @@
                 let simulatedDrop = 0;
                 let simulatedPick = 0;
                 let tempSpace = shipSpace;
+                let tempMagScoop = simMagScoopUsed;
                 let synergyBonus = 1.0;
 
                 for (let rawItem in node.dropoffs) {
@@ -1084,7 +1101,9 @@
                     if (shipCargo[item] > 0) {
                         let canDrop = Math.min(req, shipCargo[item]);
                         simulatedDrop += canDrop;
-                        tempSpace += canDrop;
+                        let fromMag = Math.min(canDrop, tempMagScoop);
+                        tempMagScoop -= fromMag;
+                        tempSpace += (canDrop - fromMag);
                         if (canDrop > 0 && dumpableCargo[item] > 0) synergyBonus += 0.2;
                     }
                 }
@@ -1151,7 +1170,9 @@
                     if (dropAmt <= 0) continue;
 
                     shipCargo[item] = (shipCargo[item] || 0) - dropAmt;
-                    shipSpace += dropAmt;
+                    let fromMag = Math.min(dropAmt, simMagScoopUsed);
+                    simMagScoopUsed -= fromMag;
+                    shipSpace += (dropAmt - fromMag);
                     toSpace -= dropAmt;
                     toInventory[item] = (toInventory[item] || 0) + dropAmt;
                     let displayName = item.charAt(0).toUpperCase() + item.slice(1);
@@ -1230,7 +1251,13 @@
                 // reality checker handles real stock limits at runtime.
                 let foodSell = shipCargo['food'] || 0;
                 let waterSell = shipCargo['water'] || 0;
-                let energyBuy = shipSpace + foodSell + waterSell;
+                // Calculate regular space that will be freed by selling F/W,
+                // accounting for magscoop items (they drain magscoop, not
+                // regular space).
+                let foodFromMag = Math.min(foodSell, simMagScoopUsed);
+                let waterFromMag = Math.min(waterSell, simMagScoopUsed - foodFromMag);
+                let freedRegular = (foodSell - foodFromMag) + (waterSell - waterFromMag);
+                let energyBuy = shipSpace + freedRegular;
                 let sbStep = {
                     location: '[' + evalRes.sbCoords.x + ',' + evalRes.sbCoords.y + ']',
                     name: sbInfo.entry.name || 'Starbase (Energy Run)',
@@ -1240,12 +1267,14 @@
                 };
                 if (foodSell > 0) {
                     shipCargo['food'] = (shipCargo['food'] || 0) - foodSell;
-                    shipSpace += foodSell;
+                    simMagScoopUsed -= foodFromMag;
+                    shipSpace += (foodSell - foodFromMag);
                     sbStep.dropoffs['Food'] = { amount: foodSell, id: (simResNameMap()['food'] && simResNameMap()['food'].id) || 'food' };
                 }
                 if (waterSell > 0) {
                     shipCargo['water'] = (shipCargo['water'] || 0) - waterSell;
-                    shipSpace += waterSell;
+                    simMagScoopUsed -= waterFromMag;
+                    shipSpace += (waterSell - waterFromMag);
                     sbStep.dropoffs['Water'] = { amount: waterSell, id: (simResNameMap()['water'] && simResNameMap()['water'].id) || 'water' };
                 }
                 if (energyBuy > 0) {
@@ -1314,7 +1343,9 @@
                         c.node.dropoffs['Energy'].amount -= give;
                         remaining -= give;
                         shipCargo['energy'] = (shipCargo['energy'] || 0) - give;
-                        shipSpace += give;
+                        let fromMag = Math.min(give, simMagScoopUsed);
+                        simMagScoopUsed -= fromMag;
+                        shipSpace += (give - fromMag);
                         // If the node is now fully satisfied, mark for removal.
                         const remainingDrop = Object.values(c.node.dropoffs).reduce((a, b) => a + b.amount, 0);
                         const remainingPick = Object.values(c.node.pickups).reduce((a, b) => a + b.amount, 0);
@@ -1337,7 +1368,9 @@
                         let req = chosen.dropoffs[rawItem].amount;
                         let dropAmt = Math.min(req, shipCargo[item]);
                         shipCargo[item] -= dropAmt;
-                        shipSpace += dropAmt;
+                        let fromMag = Math.min(dropAmt, simMagScoopUsed);
+                        simMagScoopUsed -= fromMag;
+                        shipSpace += (dropAmt - fromMag);
                         stepRecord.dropoffs[rawItem] = { amount: dropAmt, id: chosen.dropoffs[rawItem].id };
                         chosen.dropoffs[rawItem].amount -= dropAmt;
                     }
@@ -1370,7 +1403,7 @@
             }
         }
 
-        routeSteps = optimizeFactoryRuns(routeSteps, initialShipCargo, initialShipSpace, simSector, startLoc);
+        routeSteps = optimizeFactoryRuns(routeSteps, initialShipCargo, initialShipSpace, initialSimMagScoopUsed, simSector, startLoc);
 
         return { steps: routeSteps, toInventory: toInventory };
     }
