@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.44
+// @version      6.45
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -23,6 +23,7 @@
 // @description  v6.42: Starbase energy run no longer gets Infinity score — scored by energy items per AP (same exponent formula as factories/hub). Far starbases with low stock now lose to nearby factories instead of always winning.
 // @description  v6.43: FWE hub load fills entire hull with F/W in 123:84 ratio instead of tracker-clamped quantities — ship always carries max F/W to the starbase so the trip is worthwhile even if tracker data is stale.
 // @description  v6.44: FWE gate requires 80% hull capacity available for F/W — prevents starbase runs when the ship is mostly full of other cargo. Ship delivers its cargo first, then does FWE with a near-empty hull.
+// @description  v6.45: FWE override clearing phase — when energy demand requires a starbase run but the hull is full of other cargo, proactively delivers cargo to nearest demanding buildings and dumps leftovers at TO before firing FWE, instead of passively waiting.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -845,6 +846,122 @@
             // near-full hull.
             let fwCapacity = (shipCargo['food'] || 0) + (shipCargo['water'] || 0) + shipSpace;
             let fweNeeded = unmetEnergy >= maxC && !noStarbaseAvailable && fwCapacity >= maxC * 0.8 && shipEnergy === 0;
+
+            // >> FWE override clearing phase
+            // When the FWE conditions are met EXCEPT the hull is too full of
+            //  other cargo (fwCapacity < 80%), proactively clear the hull:
+            //  deliver existing cargo to the nearest demanding buildings, dump
+            //  anything with no building demand at the TO, then let the next
+            //  iteration fire the normal FWE block with a near-empty hull.
+            if (!fweNeeded && !noStarbaseAvailable && unmetEnergy >= maxC && shipEnergy === 0 && fwCapacity < maxC * 0.8) {
+                let cleared = false;
+                // Collect clearable items (everything except food, water, energy —
+                // F/W contributes to fwCapacity and energy is already 0).
+                let clearableItems = [];
+                for (let item in shipCargo) {
+                    let k = item.toLowerCase();
+                    if (k === 'food' || k === 'water' || k === 'energy') continue;
+                    let amt = shipCargo[item] || 0;
+                    if (amt <= 0) continue;
+                    clearableItems.push({ item: item, k: k, amt: amt });
+                }
+                // Sort by amount descending — clear biggest chunks first.
+                clearableItems.sort((a, b) => b.amt - a.amt);
+
+                let leftoverForTO = {};
+
+                for (let ci of clearableItems) {
+                    let remaining = ci.amt;
+                    // Find unvisited buildings that demand this item, sorted by
+                    // distance from currentLoc.
+                    let demanders = [];
+                    for (let ui = 0; ui < unvisited.length; ui++) {
+                        let n = unvisited[ui];
+                        if (!n.dropoffs) continue;
+                        for (let rawItem in n.dropoffs) {
+                            if (rawItem.toLowerCase() === ci.k && n.dropoffs[rawItem].amount > 0) {
+                                let d = simTravelAP(currentLoc, parseCoords(n.location), simSector, simDijCache);
+                                demanders.push({ node: n, idx: ui, dist: d, rawItem: rawItem });
+                                break;
+                            }
+                        }
+                    }
+                    demanders.sort((a, b) => a.dist - b.dist);
+
+                    for (let dm of demanders) {
+                        if (remaining <= 0) break;
+                        let need = dm.node.dropoffs[dm.rawItem].amount;
+                        let give = Math.min(need, remaining);
+                        if (give <= 0) continue;
+
+                        let stepRecord = {
+                            location: dm.node.location,
+                            name: dm.node.name,
+                            pickups: {},
+                            dropoffs: {},
+                            destinationType: "factory"
+                        };
+                        stepRecord.dropoffs[dm.rawItem] = { amount: give, id: dm.node.dropoffs[dm.rawItem].id };
+                        routeSteps.push(stepRecord);
+
+                        shipCargo[ci.item] -= give;
+                        let fromMag = Math.min(give, simMagScoopUsed);
+                        simMagScoopUsed -= fromMag;
+                        shipSpace += (give - fromMag);
+                        dm.node.dropoffs[dm.rawItem].amount -= give;
+                        remaining -= give;
+                        currentLoc = parseCoords(dm.node.location);
+                        cleared = true;
+
+                        // Remove node from unvisited if fully satisfied.
+                        let remainingDrop = Object.values(dm.node.dropoffs).reduce((a, b) => a + b.amount, 0);
+                        let remainingPick = Object.values(dm.node.pickups).reduce((a, b) => a + b.amount, 0);
+                        if (remainingDrop === 0 && remainingPick === 0) {
+                            unvisited.splice(dm.idx, 1);
+                            // Adjust indices in demanders list for the splice.
+                            for (let dj = 0; dj < demanders.length; dj++) {
+                                if (demanders[dj].idx > dm.idx) demanders[dj].idx--;
+                            }
+                        }
+                    }
+
+                    // Anything left over with no building demand → TO.
+                    if (remaining > 0) {
+                        if (!exportList.includes(ci.k)) {
+                            leftoverForTO[ci.item] = (leftoverForTO[ci.item] || 0) + remaining;
+                        }
+                    }
+                }
+
+                // Emit a single TO dump step for all leftover items.
+                if (hasTO && Object.keys(leftoverForTO).length > 0 && toSpace > 0) {
+                    let stepRecord = {
+                        location: toCoordStr,
+                        name: "Trading Outpost (FWE Clear)",
+                        pickups: {},
+                        dropoffs: {},
+                        destinationType: "to"
+                    };
+                    for (let item in leftoverForTO) {
+                        if (toSpace <= 0) break;
+                        let dropAmt = Math.min(leftoverForTO[item], toSpace);
+                        if (dropAmt <= 0) continue;
+                        shipCargo[item] = (shipCargo[item] || 0) - dropAmt;
+                        let fromMag = Math.min(dropAmt, simMagScoopUsed);
+                        simMagScoopUsed -= fromMag;
+                        shipSpace += (dropAmt - fromMag);
+                        toSpace -= dropAmt;
+                        toInventory[item] = (toInventory[item] || 0) + dropAmt;
+                        let displayName = item.charAt(0).toUpperCase() + item.slice(1);
+                        stepRecord.dropoffs[displayName] = { amount: dropAmt, id: nameToIdMap[item] || item.replace(/\s/g, '_') };
+                    }
+                    routeSteps.push(stepRecord);
+                    currentLoc = toLoc;
+                    cleared = true;
+                }
+
+                if (cleared) continue;
+            }
 
             let dumpableCargo = {};
             let totalDumpable = 0;
