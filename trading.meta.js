@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.37
+// @version      6.38
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -16,6 +16,7 @@
 // @description  v6.35: Fix runtime magscoop leak — getTrueBaseFreeSpace() now returns only regular cargo space, preventing the reality clamp from allowing magscoop-filling pickups at trade screens.
 // @description  v6.36: Cross-sector auto-fly from exports panel — clicking a starbase/planet name in another sector now routes through wormholes instead of doing nothing.
 // @description  v6.37: Fix same-sector route totalAP reporting 0 instead of actual terrain AP cost.
+// @description  v6.38: Remove backup pathfinding snap-to-nearest-tile fallback in flyToCoords — fail hard instead of wasting AP on a bad resync.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
