@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.44
+// @version      6.45
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -23,6 +23,7 @@
 // @description  v6.42: Starbase energy run no longer gets Infinity score — scored by energy items per AP (same exponent formula as factories/hub). Far starbases with low stock now lose to nearby factories instead of always winning.
 // @description  v6.43: FWE hub load fills entire hull with F/W in 123:84 ratio instead of tracker-clamped quantities — ship always carries max F/W to the starbase so the trip is worthwhile even if tracker data is stale.
 // @description  v6.44: FWE gate requires 80% hull capacity available for F/W — prevents starbase runs when the ship is mostly full of other cargo. Ship delivers its cargo first, then does FWE with a near-empty hull.
+// @description  v6.45: FWE override clearing phase — when energy demand requires a starbase run but the hull is full of other cargo, proactively delivers cargo to nearest demanding buildings and dumps leftovers at TO before firing FWE, instead of passively waiting.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
