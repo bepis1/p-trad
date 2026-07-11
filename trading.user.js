@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.52
+// @version      6.54
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -31,6 +31,8 @@
 // @description  v6.50: Fix fly-here-panel scope — move inside main IIFE so it can access routing functions.
 // @description  v6.51: Fix fly-here-panel crash — use header.querySelector instead of document.getElementById for min-btn before panel is mounted.
 // @description  v6.52: Fix auto-updater — embed read token directly as constant instead of extracting from @downloadURL (Tampermonkey strips URL credentials).
+// @description  v6.53: Fix fly-here cross-sector routing — normalize wormhole destination names (strip #suffix, underscores→spaces) so they match parsedMap sector keys. Previously underscore sectors like Ras Elased and #-suffixed wormholes like SZ 4-419#North silently dropped all wormhole edges, causing "No path found" for most cross-sector routes.
+// @description  v6.54: Equipment-aware terrain AP costs — port getTileCosts() from pardusapcalculator.uk so Dijkstra uses drive speed, nav level, amber stim, pathfinder, boost, exocrab, flux capacitors, viral persuader instead of hard-coded values. Wormhole-seal calendar (Asdwolf epoch logic) skips sealed wormholes. Configurable wormhole jump cost. Ship-config section in Fly Here panel. Sim engine (03-3) now respects configurable wormhole surcharge and seal calendar for route scoring.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -233,10 +235,13 @@
 
     // -- Cross-sector pathfinding (wormhole graph) ---------------------------
     // Pardus sectors are connected by one-way wormholes declared in static_ext.txt.
-    // Jumping through a wormhole costs 10 AP on top of the terrain cost of moving
-    // onto the wormhole tile. We model the universe as a graph: nodes = (sector,
-    // local (x,y)); edges = intra-sector (terrain AP, from getSectorAllDistances)
-    // and inter-sector (wormhole destination local (x,y), 10 AP surcharge).
+    // Jumping through a wormhole costs AP on top of the terrain cost of moving
+    // onto the wormhole tile (configurable via config_ship_wormhole_cost, default
+    // 10). We model the universe as a graph: nodes = (sector, local (x,y));
+    // edges = intra-sector (terrain AP, from getSectorAllDistances) and
+    // inter-sector (wormhole destination local (x,y), configurable AP surcharge).
+    // Wormholes whose endpoint sector is currently sealed (see getWormholeSeals)
+    // are excluded from the edge set.
     //
     // simCrossTravelAP(fromCoords, fromSector, toCoords, toSector, dijCache)
     // returns the minimum-AP path between two (coords, sector) pairs. Uses a
@@ -249,7 +254,14 @@
     // The cache survives across the route engine's main loop iterations, so
     // back-to-back calls for the same pair (e.g. evaluating a starbase run
     // across multiple iterations) reuse work.
-    const WORMHOLE_JUMP_AP = 10;
+    function _simWormholeJumpAP() {
+        try { return Number(getShipOptions().wormhole_cost) || 10; }
+        catch (e) { return 10; }
+    }
+    function _simWormholeSealedSet() {
+        try { return getWormholeSeals(); }
+        catch (e) { return new Set(); }
+    }
 
     // Pull parsedMap into scope (declared in 08-8-local-sector-pathfinder.js
     // via parseStaticMap). TDZ-safe: try/catch to allow this code to run
@@ -268,6 +280,7 @@
         if (!pm) return [];
         // Build sec->sectorStart lookup for cycle detection.
         const sd = _simGetSectorData();
+        const sealed = _simWormholeSealedSet();
         const out = [];
         for (const secName in pm) {
             const sec = pm[secName];
@@ -275,6 +288,8 @@
             for (const destName in sec.wormholes) {
                 const fromLocal = sec.wormholes[destName];
                 if (!fromLocal) continue;
+                // Skip wormholes whose endpoint sector is currently sealed.
+                if (sealed.has(secName.toLowerCase()) || sealed.has(destName.toLowerCase())) continue;
                 // The linked sector's matching wormhole endpoint (the one that
                 // names this sector). It should be the entry in destSec.wormholes
                 // whose key is secName. If missing (data incomplete) skip —
@@ -305,6 +320,8 @@
         const startKey = from.sec + '|' + from.x + ',' + from.y;
         const goalKey  = to.sec   + '|' + to.x   + ',' + to.y;
         if (startKey === goalKey) return 0;
+
+        const WORMHOLE_JUMP_AP = _simWormholeJumpAP();
 
         // Standard priority queue via array sort (small graphs, fine).
         const dist = {};
@@ -2098,8 +2115,102 @@ const SECTOR_DATA = {
     "Zuben Elakrab":      { start: 101100,  cols: 25,  rows: 17 },
     "ZZ 2986":            { start: 6334,    cols: 15,  rows: 5 },
 };
-     const terrainAP = { "f": 5, "e": 13, "o": 18, "g": 9, "b": Infinity, "v": 13, "m": 11 };
-    const parsedMap = {};
+     // >> Equipment-aware terrain AP costs (ported from pardusapcalculator.uk)
+     // Base AP per terrain type (char-keyed), before ship equipment adjustments.
+     // f=fuel, e=energy, g=nebula(gas), o=asteroid, v=viral, m=exotic, b=blocked.
+     const BASE_TERRAIN_AP = { f: 11, e: 20, g: 16, o: 25, v: 18, m: 36, b: Infinity };
+
+     // Default ship options.  drive 6 + nav 3 reproduces the previously
+     // hard-coded terrainAP for f/e/g/o; v and m are now correct (the old
+     // static values v:13, m:11 were stale placeholders).  Overridable via
+     // GM_setValue config_ship_* (set in the fly-here ship-config section).
+     const DEFAULT_SHIP_OPTIONS = {
+         drive_speed: 6,
+         navigation_level: 3,
+         amber_stim: false,
+         pathfinder: 'none',       // 'none' | 'primary' | 'secondary'
+         boost: false,
+         exocrab: false,
+         gas_flux: 'none',         // 'none' | 'weak' | 'strong'
+         energy_flux: 'none',      // 'none' | 'weak' | 'strong'
+         viral_persuader: 0,       // 0 | 1 | 2  (reduces viral terrain cost)
+         wormhole_cost: 10,
+         wormhole_seal: 'none',    // 'none'|'artemis'|'orion'|'pegasus'|'enif-closed'|...
+         spaceflux: false,
+     };
+
+     function getShipOptions() {
+         return {
+             drive_speed:      GM_getValue('config_ship_drive_speed', DEFAULT_SHIP_OPTIONS.drive_speed),
+             navigation_level: GM_getValue('config_ship_navigation_level', DEFAULT_SHIP_OPTIONS.navigation_level),
+             amber_stim:       GM_getValue('config_ship_amber_stim', DEFAULT_SHIP_OPTIONS.amber_stim),
+             pathfinder:       GM_getValue('config_ship_pathfinder', DEFAULT_SHIP_OPTIONS.pathfinder),
+             boost:            GM_getValue('config_ship_boost', DEFAULT_SHIP_OPTIONS.boost),
+             exocrab:          GM_getValue('config_ship_exocrab', DEFAULT_SHIP_OPTIONS.exocrab),
+             gas_flux:         GM_getValue('config_ship_gas_flux', DEFAULT_SHIP_OPTIONS.gas_flux),
+             energy_flux:      GM_getValue('config_ship_energy_flux', DEFAULT_SHIP_OPTIONS.energy_flux),
+             viral_persuader:  GM_getValue('config_ship_viral_persuader', DEFAULT_SHIP_OPTIONS.viral_persuader),
+             wormhole_cost:    GM_getValue('config_ship_wormhole_cost', DEFAULT_SHIP_OPTIONS.wormhole_cost),
+             wormhole_seal:    GM_getValue('config_ship_wormhole_seal', DEFAULT_SHIP_OPTIONS.wormhole_seal),
+             spaceflux:        GM_getValue('config_ship_spaceflux', DEFAULT_SHIP_OPTIONS.spaceflux),
+         };
+     }
+
+     // Pure function: given ship options, return a char-keyed AP cost map.
+     // Mirrors getTileCosts() from the outsourced pardusapcalculator.uk client.
+     function computeTileCosts(options, spaceflux) {
+         const o = options || DEFAULT_SHIP_OPTIONS;
+         const costs = { f: BASE_TERRAIN_AP.f, e: BASE_TERRAIN_AP.e, g: BASE_TERRAIN_AP.g,
+                         o: BASE_TERRAIN_AP.o, v: BASE_TERRAIN_AP.v, m: BASE_TERRAIN_AP.m };
+
+         const nav = Number(o.navigation_level) || 0;
+         if (nav >= 3) costs.e -= 1;
+         if (nav >= 2) costs.g -= 1;
+         if (nav >= 1) costs.o -= 1;
+
+         const drive = Number(o.drive_speed) || 0;
+         const sf = !!spaceflux || !!o.spaceflux;
+         for (const k in costs) {
+             costs[k] -= drive;
+             if (o.amber_stim) costs[k] -= 1;
+             if (o.boost) costs[k] += 2;
+             if (o.exocrab) costs[k] += 1;
+             if (sf) costs[k] += 3;
+         }
+
+         if (o.energy_flux === 'strong') costs.e -= 2;
+         else if (o.energy_flux === 'weak') costs.e -= 1;
+         if (o.gas_flux === 'strong') costs.g -= 2;
+         else if (o.gas_flux === 'weak') costs.g -= 1;
+
+         const vp = Number(o.viral_persuader) || 0;
+         if (vp > 0) costs.v -= vp;
+
+         if (o.pathfinder === 'primary') {
+             for (const k in costs) costs[k] = Math.ceil(costs[k] * 0.66);
+         } else if (o.pathfinder === 'secondary') {
+             for (const k in costs) costs[k] = Math.ceil(costs[k] * 0.83);
+         }
+
+         costs.b = Infinity;
+         return costs;
+     }
+
+     // Cached terrain AP map for the current ship options.
+     let _terrainAPCache = null, _terrainAPCacheKey = null;
+     function getTerrainAP() {
+         const o = getShipOptions();
+         const key = JSON.stringify(o);
+         if (_terrainAPCacheKey === key && _terrainAPCache) return _terrainAPCache;
+         _terrainAPCache = computeTileCosts(o, false);
+         _terrainAPCacheKey = key;
+         return _terrainAPCache;
+     }
+
+     // Legacy static fallback (kept for any external callers; the Dijkstra
+     // loops now use getTerrainAP()).
+     const terrainAP = { f: 5, e: 13, o: 18, g: 9, b: Infinity, v: 13, m: 11 };
+     const parsedMap = {};
     // --- 4. Main Execution Flow & Order of Operations ---
     const currentPath = window.location.pathname;
 
@@ -2550,7 +2661,8 @@ const SECTOR_DATA = {
                 parsedMap[currentSectorName] = { grid: [], wormholes: {}, beacons: [], starbases: [] };
             } else if (line.startsWith("wh ")) {
                 let parts = line.split(" ");
-                parsedMap[currentSectorName].wormholes[parts[1]] = { x: parseInt(parts[2], 10), y: parseInt(parts[3], 10) };
+                let whDest = parts[1].replace(/_/g, " ").split("#")[0];
+                parsedMap[currentSectorName].wormholes[whDest] = { x: parseInt(parts[2], 10), y: parseInt(parts[3], 10) };
             } else if (line.startsWith("beacon ")) {
                 let parts = line.split(" ");
                 parsedMap[currentSectorName].beacons.push({ x: parseInt(parts[parts.length - 2], 10), y: parseInt(parts[parts.length - 1], 10) });
@@ -2600,6 +2712,8 @@ const SECTOR_DATA = {
         if (startX < 0 || startY < 0 || startX >= cols || startY >= rows) return null;
         if (endX < 0 || endY < 0 || endX >= cols || endY >= rows) return null;
 
+        const tap = getTerrainAP();
+
         // Dijkstra over AP costs. Diagonal and orthogonal moves cost the same
         // AP in Pardus, so many equal-cost paths exist. We break ties by
         // preferring paths with fewer direction changes (turns): this keeps the
@@ -2628,7 +2742,7 @@ const SECTOR_DATA = {
                     let ny = current.y + dy;
                     if (ny >= 0 && ny < rows && nx >= 0 && nx < cols) {
                         let terrain = grid[ny][nx];
-                        let moveCost = terrainAP[terrain] !== void 0 ? terrainAP[terrain] : 9;
+                        let moveCost = tap[terrain] !== void 0 ? tap[terrain] : 9;
                         let newCost = current.cost + moveCost;
                         let dirKey = `${dx},${dy}`;
                         let newTurns = (current.dirKey && current.dirKey !== dirKey) ? current.turns + 1 : current.turns;
@@ -2727,6 +2841,7 @@ const SECTOR_DATA = {
         }
         if (startX < 0 || startY < 0 || startX >= cols || startY >= rows) return null;
 
+        const tap = getTerrainAP();
 
         let distances = {};
         let pq = [{ x: startX, y: startY, cost: 0 }];
@@ -2743,7 +2858,7 @@ const SECTOR_DATA = {
                     let nx = current.x + dx, ny = current.y + dy;
                     if (ny < 0 || ny >= rows || nx < 0 || nx >= cols) continue;
                     let terrain = grid[ny][nx];
-                    let moveCost = terrainAP[terrain] !== void 0 ? terrainAP[terrain] : 9;
+                    let moveCost = tap[terrain] !== void 0 ? tap[terrain] : 9;
                     let newCost = current.cost + moveCost;
                     let nKey = nx + ',' + ny;
                     if (newCost < (distances[nKey] !== void 0 ? distances[nKey] : Infinity)) {
@@ -2754,6 +2869,34 @@ const SECTOR_DATA = {
             }
         }
         return distances;
+    }
+
+    // >> Wormhole seal calendar (ported from pardusapcalculator.uk, credit Asdwolf)
+    // The four Pardus wormholes (procyon, nhandu, enif, quaack) rotate on a
+    // 2-day cycle.  Artemis/Orion seals the current wormhole; Pegasus seals
+    // with a 3-day offset.  Returns a Set of lowercased sector names whose
+    // wormhole is currently closed.
+    function getWormholeSeals() {
+        const seal = GM_getValue('config_ship_wormhole_seal', 'none');
+        if (!seal || seal === 'none') return new Set();
+
+        const epoch = 1449120361000; // December 3, 2015 05:26:01 GMT
+        const days = (Date.now() - epoch) / 1000 / 60 / 60 / 24;
+        const cycle = ['procyon', 'nhandu', 'enif', 'quaack'];
+        const closed = new Set();
+
+        switch (seal) {
+            case 'artemis':
+            case 'orion':
+                closed.add(cycle[Math.floor(days / 2) % 4]); break;
+            case 'pegasus':
+                closed.add(cycle[Math.floor((days + 3) / 2) % 4]); break;
+            case 'enif-closed':    closed.add('enif'); break;
+            case 'nhandu-closed':  closed.add('nhandu'); break;
+            case 'procyon-closed': closed.add('procyon'); break;
+            case 'quaack-closed':  closed.add('quaack'); break;
+        }
+        return closed;
     }
 
     // >> Cross-sector route builder (wormhole-aware)
@@ -2773,16 +2916,19 @@ const SECTOR_DATA = {
             if (!result) return null;
             let ap = 0;
             const grid = parsedMap[fromSector].grid;
+            const tap = getTerrainAP();
             for (let i = 1; i < result.path.length; i++) {
                 const p = result.path[i];
                 const ch = grid[p.y][p.x];
-                ap += terrainAP[ch] !== undefined ? terrainAP[ch] : 9;
+                ap += tap[ch] !== undefined ? tap[ch] : 9;
             }
             return { legs: [{ sector: fromSector, path: result.path, tileIds: result.tileIds }], totalAP: ap };
         }
 
         // Build wormhole edges from parsedMap (same logic as the sim engine's
         // _simEnumerateWormholeEdges). Each edge: from (sec,x,y) to (sec,x,y).
+        // Skip wormholes whose endpoint sector is currently sealed.
+        const sealed = getWormholeSeals();
         const edges = [];
         for (const secName in parsedMap) {
             const sec = parsedMap[secName];
@@ -2794,6 +2940,7 @@ const SECTOR_DATA = {
                 if (!destSec || !destSec.wormholes) continue;
                 const toLocal = destSec.wormholes[secName];
                 if (!toLocal) continue;
+                if (sealed.has(secName.toLowerCase()) || sealed.has(destName.toLowerCase())) continue;
                 edges.push({
                     fromSec: secName, fromX: fromLocal.x, fromY: fromLocal.y,
                     toSec: destName, toX: toLocal.x, toY: toLocal.y
@@ -2814,7 +2961,8 @@ const SECTOR_DATA = {
             exitsBySector[e.fromSec].push(e);
         }
 
-        const WJUMP = 10;
+        const shipOpt = getShipOptions();
+        const WJUMP = Number(shipOpt.wormhole_cost) || 10;
         const startKey = fromSector + '|' + fromX + ',' + fromY;
 
         const dist = {};
@@ -6623,6 +6771,101 @@ const SECTOR_DATA = {
         btnRow.appendChild(plotBtn);
         btnRow.appendChild(flyBtn);
         body.appendChild(btnRow);
+
+        // >> Ship config (collapsible) — drive, nav, stims, pathfinder, flux,
+        // viral persuader, wormhole cost & seal.  Stored in GM_setValue as
+        // config_ship_* so the pathfinder's getShipOptions() picks them up.
+        const shipCfg = document.createElement('details');
+        shipCfg.style.cssText = 'margin-top:2px;border:1px solid #222;padding:2px;';
+        const shipSummary = document.createElement('summary');
+        shipSummary.textContent = 'Ship config';
+        shipSummary.style.cssText = 'cursor:pointer;color:#88ccff;font-size:9px;';
+        shipCfg.appendChild(shipSummary);
+        const shipBody = document.createElement('div');
+        shipBody.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:3px;font-size:9px;';
+
+        function shipNum(id, label, val, min, max) {
+            const wrap = document.createElement('div');
+            wrap.style.cssText = 'display:flex;align-items:center;gap:2px;';
+            const lbl = document.createElement('span');
+            lbl.textContent = label; lbl.style.cssText = 'color:#888;width:42px;';
+            const inp = document.createElement('input');
+            inp.type = 'number'; inp.id = 'shipcfg-' + id; inp.value = val;
+            if (min != null) inp.min = min; if (max != null) inp.max = max;
+            inp.style.cssText = 'width:38px;background:#111;color:#0f0;border:1px solid #444;font-size:9px;padding:1px;';
+            wrap.appendChild(lbl); wrap.appendChild(inp); shipBody.appendChild(wrap);
+            return inp;
+        }
+        function shipSel(id, label, val, opts) {
+            const wrap = document.createElement('div');
+            wrap.style.cssText = 'display:flex;align-items:center;gap:2px;';
+            const lbl = document.createElement('span');
+            lbl.textContent = label; lbl.style.cssText = 'color:#888;width:42px;';
+            const sel = document.createElement('select');
+            sel.id = 'shipcfg-' + id;
+            sel.style.cssText = 'width:60px;background:#111;color:#0f0;border:1px solid #444;font-size:9px;padding:1px;';
+            for (const o of opts) {
+                const op = document.createElement('option');
+                op.value = o[0]; op.textContent = o[1];
+                if (String(val) === String(o[0])) op.selected = true;
+                sel.appendChild(op);
+            }
+            wrap.appendChild(lbl); wrap.appendChild(sel); shipBody.appendChild(wrap);
+            return sel;
+        }
+        function shipChk(id, label, checked) {
+            const wrap = document.createElement('div');
+            wrap.style.cssText = 'display:flex;align-items:center;gap:2px;';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox'; cb.id = 'shipcfg-' + id; cb.checked = !!checked;
+            cb.style.cssText = 'cursor:pointer;';
+            const lbl = document.createElement('span');
+            lbl.textContent = label; lbl.style.cssText = 'color:#888;font-size:9px;cursor:pointer;';
+            lbl.addEventListener('click', () => { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); });
+            wrap.appendChild(cb); wrap.appendChild(lbl); shipBody.appendChild(wrap);
+            return cb;
+        }
+
+        const sOpt = getShipOptions();
+        const eDrive    = shipNum('drive', 'Drive', sOpt.drive_speed, 0, 10);
+        const eNav      = shipSel('nav', 'Nav', sOpt.navigation_level, [[0,'0'],[1,'1'],[2,'2'],[3,'3']]);
+        const eAmber    = shipChk('amber', 'Amber', sOpt.amber_stim);
+        const ePF       = shipSel('pf', 'Path', sOpt.pathfinder, [['none','none'],['primary','pri'],['secondary','sec']]);
+        const eBoost    = shipChk('boost', 'Boost', sOpt.boost);
+        const eExocrab  = shipChk('exocrab', 'Exocrab', sOpt.exocrab);
+        const eGasF     = shipSel('gasflux', 'GasFx', sOpt.gas_flux, [['none','none'],['weak','wk'],['strong','str']]);
+        const eEnF      = shipSel('enflux', 'EnFx', sOpt.energy_flux, [['none','none'],['weak','wk'],['strong','str']]);
+        const eVP       = shipSel('vp', 'VPers', sOpt.viral_persuader, [[0,'0'],[1,'1'],[2,'2']]);
+        const eWHC      = shipNum('whcost', 'WH AP', sOpt.wormhole_cost, 0, 50);
+        const eSeal     = shipSel('seal', 'Seal', sOpt.wormhole_seal,
+            [['none','none'],['artemis','artemis'],['orion','orion'],['pegasus','pegasus'],
+             ['enif-closed','enif off'],['nhandu-closed','nhandu off'],
+             ['procyon-closed','procyon off'],['quaack-closed','quaack off']]);
+
+        // Save on change.
+        const cfgMap = [
+            [eDrive, 'config_ship_drive_speed', Number],
+            [eNav, 'config_ship_navigation_level', v => Number(v)],
+            [eAmber, 'config_ship_amber_stim', v => !!v],
+            [ePF, 'config_ship_pathfinder', v => v],
+            [eBoost, 'config_ship_boost', v => !!v],
+            [eExocrab, 'config_ship_exocrab', v => !!v],
+            [eGasF, 'config_ship_gas_flux', v => v],
+            [eEnF, 'config_ship_energy_flux', v => v],
+            [eVP, 'config_ship_viral_persuader', v => Number(v)],
+            [eWHC, 'config_ship_wormhole_cost', Number],
+            [eSeal, 'config_ship_wormhole_seal', v => v],
+        ];
+        for (const [el, key, conv] of cfgMap) {
+            el.addEventListener('change', () => {
+                GM_setValue(key, conv(el.type === 'checkbox' ? el.checked : el.value));
+                // Invalidate terrain cache so next path uses new costs.
+                _terrainAPCacheKey = null;
+            });
+        }
+
+        shipCfg.appendChild(shipBody);
+        body.appendChild(shipCfg);
 
         // >> Sector list population & filtering
         let allSectors = [];
