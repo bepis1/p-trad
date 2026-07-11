@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.34
+// @version      6.35
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -13,6 +13,7 @@
 // @description  v6.32: Version bump to test auto-update from 6.31.
 // @description  v6.33: Security — split read-only token (GH_READ_TOKEN, embedded in script) from write token (GH_TOKEN, publish-only). Fine-grained PAT scoped to repo read-only.
 // @description  v6.34: Fix magscoop space leak — sim no longer frees regular cargo space when dropping magscoop items, preventing the route planner from filling the +150 magscoop.
+// @description  v6.35: Fix runtime magscoop leak — getTrueBaseFreeSpace() now returns only regular cargo space, preventing the reality clamp from allowing magscoop-filling pickups at trade screens.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2843,12 +2844,13 @@ const SECTOR_DATA = {
 
     function getTrueBaseFreeSpace() {
         let text = document.body.innerText;
-        // Parse "Cargo space left: X + Yt" or "free space: X + Yt" — include magscoop
+        // Parse "Cargo space left: X + Yt" or "free space: X + Yt"
+        // Return ONLY regular cargo space — magscoop's +150 is reserved for
+        // single-trade purchases and must not be used as a ceiling for
+        // route-driven pickups (would allow magscoop-filling transfers).
         let match = text.match(/(?:Cargo space left|Free Space):\s*(\d+)(?:\s*\+\s*(\d+)t)?/i);
         if (match) {
-            let regular = parseInt(match[1].replace(/,/g, ''), 10);
-            let magScoop = match[2] ? parseInt(match[2], 10) : 0;
-            return regular + magScoop;
+            return parseInt(match[1].replace(/,/g, ''), 10);
         }
         return null;
     }
@@ -3589,6 +3591,16 @@ const SECTOR_DATA = {
                 pickupsHtml += `<div style="margin-bottom: 4px; color: #ff5555;">Pick up <strong>0 ${name}</strong> <span style="font-size:10px;"><br>(No stock / Cargo Full - 10x AP Penalty Prevented)</span></div>`;
             }
 
+            // NOTE: clampedByCargo (cargo-cap clamp) intentionally does NOT
+            // trigger realityPatched / logistics_needs_recalc here.  A mid-route
+            // recalc triggered by cargo cap could destabilize FWE blocks —
+            // see 03-3-true-ap-density-simulation-engine.js line ~1069 ("FWE
+            // block is immutable").  If a partial pickup due to cargo cap
+            // causes downstream steps to misfire (e.g. factory doesn't get
+            // enough of a commodity), that is the place to revisit.  With the
+            // sim (v6.34) and runtime (v6.35) magscoop fixes, cargo-cap
+            // clamping should only occur if another player trades at the
+            // building between sim run and arrival — a rare edge case.
             if (clampedByStock) {
                 if (nodeIndex !== -1) {
                     realityWarnings.push(`${name} pickup ${planned} → ${safeAmt} (stock ${limits.stock})`);
