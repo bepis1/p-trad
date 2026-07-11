@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.51
+// @version      6.52
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -30,6 +30,7 @@
 // @description  v6.49: Fly Here draggable panel — searchable sector list, plot path/AP cost preview (cross-sector via wormholes), and one-click auto-fly to any sector coordinate.
 // @description  v6.50: Fix fly-here-panel scope — move inside main IIFE so it can access routing functions.
 // @description  v6.51: Fix fly-here-panel crash — use header.querySelector instead of document.getElementById for min-btn before panel is mounted.
+// @description  v6.52: Fix auto-updater — embed read token directly as constant instead of extracting from @downloadURL (Tampermonkey strips URL credentials).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -6390,15 +6391,13 @@ const SECTOR_DATA = {
     const LAST_CHECK_KEY = 'pardus_update_last_check';
     const SKIPPED_KEY = 'pardus_update_skipped_version';
 
-    const downloadURL = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.downloadURL) || '';
-    const tokenMatch = downloadURL.match(/x-access-token:([^@]+)@/);
-    if (!downloadURL || !tokenMatch) {
-        console.warn('[pardus-update] No authenticated @downloadURL — auto-update disabled.');
-        return;
-    }
-    const GH_READ_TOKEN = tokenMatch[1];
-    const metaURL = downloadURL.replace(/[^/]+$/, 'trading.meta.js');
-    const scriptURL = downloadURL;
+    // Token is injected at build time by build-trading.js (replaces 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).
+    // We can't extract it from GM_info.script.downloadURL because Tampermonkey
+    // strips URL-embedded credentials for security.
+    const GH_READ_TOKEN = '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';
+    const RAW_BASE = 'https://raw.githubusercontent.com/bepis1/p-trad/main/';
+    const metaURL = RAW_BASE + 'trading.meta.js';
+    const scriptURL = RAW_BASE + 'trading.user.js';
     const currentVersion = (GM_info.script && GM_info.script.version) || '0';
 
     console.log('[pardus-update] Init — current v' + currentVersion + ', metaURL ' + metaURL);
