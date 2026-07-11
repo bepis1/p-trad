@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.45
+// @version      6.46
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -24,6 +24,7 @@
 // @description  v6.43: FWE hub load fills entire hull with F/W in 123:84 ratio instead of tracker-clamped quantities — ship always carries max F/W to the starbase so the trip is worthwhile even if tracker data is stale.
 // @description  v6.44: FWE gate requires 80% hull capacity available for F/W — prevents starbase runs when the ship is mostly full of other cargo. Ship delivers its cargo first, then does FWE with a near-empty hull.
 // @description  v6.45: FWE override clearing phase — when energy demand requires a starbase run but the hull is full of other cargo, proactively delivers cargo to nearest demanding buildings and dumps leftovers at TO before firing FWE, instead of passively waiting.
+// @description  v6.46: Protect hydrogen fuel and phantom protection from being traded, stashed at TO, or cleared by FWE override — these permanent cargo items now occupy space without being treated as tradeable.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -722,6 +723,10 @@
         let toInventory = {};
 
         let shipCargo = parseLiveCargo(liveCargoStr);
+        // Protected cargo items are always in the ship (fuel, phantom
+        // protection) — they occupy real cargo space but must NEVER be
+        // traded, stashed at the TO, or cleared by the FWE override.
+        const PROTECTED_CARGO = new Set(['hydrogen fuel', 'phantom protection']);
         // Use auto-detected regular ship capacity if available (excludes magscoop)
         let autoShipSpace = parseInt(GM_getValue('logistics_ship_space', '0'), 10);
         let maxC = (autoShipSpace > 0 ? autoShipSpace : (parseInt(maxCargo, 10) || 200));
@@ -861,6 +866,7 @@
                 for (let item in shipCargo) {
                     let k = item.toLowerCase();
                     if (k === 'food' || k === 'water' || k === 'energy') continue;
+                    if (PROTECTED_CARGO.has(k)) continue;
                     let amt = shipCargo[item] || 0;
                     if (amt <= 0) continue;
                     clearableItems.push({ item: item, k: k, amt: amt });
@@ -970,6 +976,7 @@
             const STASH_FAR_AP = 45;
             for (let item in shipCargo) {
                 let k = item.toLowerCase();
+                if (PROTECTED_CARGO.has(k)) continue;
                 let have = shipCargo[item] || 0;
                 let demand = remainingDemand[k] || 0;
                 let excess = have - demand;
@@ -1030,6 +1037,7 @@
                     if (toInventory[item] <= 0) continue;
                     let k = item.toLowerCase();
                     if (exportList.includes(k)) continue;
+                    if (PROTECTED_CARGO.has(k)) continue;
                     let need = Math.max(0, (remainingDemand[k] || 0) - (shipCargo[k] || 0));
                     if (need > 0 && shipSpace > 0) {
                         let take = Math.min(toInventory[item], need, shipSpace);
