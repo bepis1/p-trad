@@ -6356,7 +6356,6 @@ const SECTOR_DATA = {
         return results;
     }
 
-})();
 // --- 19. Auto-Update (private-repo self-update via GM_xmlhttpRequest) ---
 //
 // Why this exists: Tampermonkey's native @updateURL check cannot authenticate
@@ -6820,3 +6819,5 @@ const SECTOR_DATA = {
         if (mount) mount.appendChild(wrap);
         console.log('[pardus-flyhere] panel injected on', window.location.pathname);
     }
+
+})();
