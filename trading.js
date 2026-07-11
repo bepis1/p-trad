@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.49
+// @version      6.50
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -28,6 +28,7 @@
 // @description  v6.47: Monster guard for auto-fly — scans the nav screen for NPCs (navNpc class) before each jump and sidesteps around monsters blocking the path instead of flying into combat.
 // @description  v6.48: Auto-retreat from NPC ambushes — when a cloaked/hidden NPC ambushes during auto-fly, automatically retreats and resumes the flight, sidestepping the ambush tile. Toggle in control center.
 // @description  v6.49: Fly Here draggable panel — searchable sector list, plot path/AP cost preview (cross-sector via wormholes), and one-click auto-fly to any sector coordinate.
+// @description  v6.50: Fix fly-here-panel scope — move inside main IIFE so it can access routing functions.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
