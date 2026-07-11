@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.54
+// @version      6.55
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -33,6 +33,7 @@
 // @description  v6.52: Fix auto-updater — embed read token directly as constant instead of extracting from @downloadURL (Tampermonkey strips URL credentials).
 // @description  v6.53: Fix fly-here cross-sector routing — normalize wormhole destination names (strip #suffix, underscores→spaces) so they match parsedMap sector keys. Previously underscore sectors like Ras Elased and #-suffixed wormholes like SZ 4-419#North silently dropped all wormhole edges, causing "No path found" for most cross-sector routes.
 // @description  v6.54: Equipment-aware terrain AP costs — port getTileCosts() from pardusapcalculator.uk so Dijkstra uses drive speed, nav level, amber stim, pathfinder, boost, exocrab, flux capacitors, viral persuader instead of hard-coded values. Wormhole-seal calendar (Asdwolf epoch logic) skips sealed wormholes. Configurable wormhole jump cost. Ship-config section in Fly Here panel. Sim engine (03-3) now respects configurable wormhole surcharge and seal calendar for route scoring.
+// @description  v6.55: Fix cross-sector routing crash on sub-sector sectors (Betelgeuse East/West, Pardus NE/West, etc.). parseStaticMap now merges sub-sector grid fragments into their parent sector (e.g. Betelgeuse East+West → Betelgeuse) and remaps wormhole destinations. Added getSectorData() fallback resolver for name mismatches (BL3961 vs "BL 3961", Wayaan vs Waayan, directional suffixes). Fixes "sd is undefined" crash when plotting routes through these sectors.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
