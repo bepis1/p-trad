@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.46
+// @version      6.49
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -25,6 +25,9 @@
 // @description  v6.44: FWE gate requires 80% hull capacity available for F/W — prevents starbase runs when the ship is mostly full of other cargo. Ship delivers its cargo first, then does FWE with a near-empty hull.
 // @description  v6.45: FWE override clearing phase — when energy demand requires a starbase run but the hull is full of other cargo, proactively delivers cargo to nearest demanding buildings and dumps leftovers at TO before firing FWE, instead of passively waiting.
 // @description  v6.46: Protect hydrogen fuel and phantom protection from being traded, stashed at TO, or cleared by FWE override — these permanent cargo items now occupy space without being treated as tradeable.
+// @description  v6.47: Monster guard for auto-fly — scans the nav screen for NPCs (navNpc class) before each jump and sidesteps around monsters blocking the path instead of flying into combat.
+// @description  v6.48: Auto-retreat from NPC ambushes — when a cloaked/hidden NPC ambushes during auto-fly, automatically retreats and resumes the flight, sidestepping the ambush tile. Toggle in control center.
+// @description  v6.49: Fly Here draggable panel — searchable sector list, plot path/AP cost preview (cross-sector via wormholes), and one-click auto-fly to any sector coordinate.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -32,6 +35,7 @@
 // @match        https://*.pardus.at/planet_trade.php*
 // @match        https://*.pardus.at/starbase_trade.php*
 // @match        https://*.pardus.at/building_management.php*
+// @match        https://*.pardus.at/ship2opponent_combat.php*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
