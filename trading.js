@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.43
+// @version      6.44
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -22,6 +22,7 @@
 // @description  v6.41: AP-efficiency guard — hub can't win when a factory with actual cargo drops has better linear action/AP ratio; prevents far hub detours that waste AP when nearby factories can be served with current cargo.
 // @description  v6.42: Starbase energy run no longer gets Infinity score — scored by energy items per AP (same exponent formula as factories/hub). Far starbases with low stock now lose to nearby factories instead of always winning.
 // @description  v6.43: FWE hub load fills entire hull with F/W in 123:84 ratio instead of tracker-clamped quantities — ship always carries max F/W to the starbase so the trip is worthwhile even if tracker data is stale.
+// @description  v6.44: FWE gate requires 80% hull capacity available for F/W — prevents starbase runs when the ship is mostly full of other cargo. Ship delivers its cargo first, then does FWE with a near-empty hull.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -834,7 +835,16 @@
             // energy it has to factories; only then does FWE fire for the next
             // full hull.
             let shipEnergy = shipCargo['energy'] || 0;
-            let fweNeeded = unmetEnergy >= maxC && !noStarbaseAvailable && (shipSpace > 0 || shipHasFW) && shipEnergy === 0;
+            // FWE is a full-hull bulk operation: fill hull with F/W → travel
+            // to starbase → sell F/W, buy energy → deliver.  It must NOT fire
+            // when the ship is carrying a lot of non-F/W cargo — doing an
+            // 88-AP detour for 84 energy because the hull is full of metal
+            // is a massive waste.  Require that F/W capacity (existing F/W +
+            // free space) covers at least 80% of the hull.  The ship delivers
+            // its other cargo first, freeing space, then FWE fires with a
+            // near-full hull.
+            let fwCapacity = (shipCargo['food'] || 0) + (shipCargo['water'] || 0) + shipSpace;
+            let fweNeeded = unmetEnergy >= maxC && !noStarbaseAvailable && fwCapacity >= maxC * 0.8 && shipEnergy === 0;
 
             let dumpableCargo = {};
             let totalDumpable = 0;
