@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.40
+// @version      6.41
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -19,6 +19,7 @@
 // @description  v6.38: Remove backup pathfinding snap-to-nearest-tile fallback in flyToCoords — fail hard instead of wasting AP on a bad resync.
 // @description  v6.39: Hub reload now uses sweep lookahead scoring — always evaluates hub as candidate and scores by the full multi-factory sweep it enables, eliminating trailing microtrips from late partial reloads.
 // @description  v6.40: Fix hub sweep overcounting — only count marginal action from hub-loaded supplies (not pre-existing cargo the ship could deliver without the detour), preventing the hub from winning when a far detour isn't worth it.
+// @description  v6.41: AP-efficiency guard — hub can't win when a factory with actual cargo drops has better linear action/AP ratio; prevents far hub detours that waste AP when nearby factories can be served with current cargo.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -921,6 +922,9 @@
             let destinationType = "none";
             let hubLoadPlan = {};
             let bestSbCandidate = null; // { sb, eval } for the starbase energy run branch
+            let hubRate = 0;
+            let bestFactoryRate = 0;
+            let bestFactoryIdx = -1;
 
             if (totalUnmetHubDemand > 0 && shipSpace > 0 && !fweNeeded) {
                 let hubDist = simTravelAP(currentLoc, hubLoc, simSector, simDijCache);
@@ -1046,6 +1050,7 @@
                         ? Math.pow(sweepAction, 1.5) / Math.pow(totalAP, 1.2)
                         : 0;
                     if (hubDist === 0) hubScore *= 1.5;
+                    hubRate = sweepAction > 0 ? sweepAction / totalAP : 0;
 
                     if (hubScore > bestScore) {
                         bestScore = hubScore;
@@ -1216,6 +1221,13 @@
                 let totalAction = simulatedDrop + simulatedPick;
 
                 if (totalAction >= minTrade) {
+                    if (simulatedDrop > 0) {
+                        let factoryRate = totalAction / apCost;
+                        if (factoryRate > bestFactoryRate) {
+                            bestFactoryRate = factoryRate;
+                            bestFactoryIdx = i;
+                        }
+                    }
                     let score = Math.pow(totalAction, 1.5) / Math.pow(apCost, 1.2);
                     score *= synergyBonus;
 
@@ -1235,6 +1247,16 @@
                         destinationType = "factory";
                     }
                 }
+            }
+
+            // AP-efficiency guard: if the hub won on exponent score but
+            // a factory has a better linear action/AP ratio, prefer the
+            // factory. The exponent formula inflates large sweeps;
+            // this guard ensures the hub only wins when it's genuinely
+            // more AP-efficient than the best individual factory visit.
+            if (destinationType === "hub" && bestFactoryRate > hubRate && bestFactoryIdx >= 0) {
+                destinationType = "factory";
+                bestNodeIndex = bestFactoryIdx;
             }
 
             if (destinationType === "none") break;
