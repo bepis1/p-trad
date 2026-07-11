@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.35
+// @version      6.36
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -14,6 +14,7 @@
 // @description  v6.33: Security — split read-only token (GH_READ_TOKEN, embedded in script) from write token (GH_TOKEN, publish-only). Fine-grained PAT scoped to repo read-only.
 // @description  v6.34: Fix magscoop space leak — sim no longer frees regular cargo space when dropping magscoop items, preventing the route planner from filling the +150 magscoop.
 // @description  v6.35: Fix runtime magscoop leak — getTrueBaseFreeSpace() now returns only regular cargo space, preventing the reality clamp from allowing magscoop-filling pickups at trade screens.
+// @description  v6.36: Cross-sector auto-fly from exports panel — clicking a starbase/planet name in another sector now routes through wormholes instead of doing nothing.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2466,10 +2467,153 @@ const SECTOR_DATA = {
         return distances;
     }
 
+    // >> Cross-sector route builder (wormhole-aware)
+    // Returns a multi-leg route from (fromSector, fromX, fromY) to
+    // (toSector, toX, toY). Each leg is a local-sector path with tile IDs.
+    // Wormhole jumps between legs are handled by the game automatically
+    // (navigating onto a wormhole tile triggers the jump).
+    //
+    // Returns: { legs: [{ sector, path: [{x,y}...], tileIds: [...] }], totalAP }
+    // or null if no route is found.
+    function getCrossSectorRoute(fromSector, fromTileId, fromX, fromY, toSector, toX, toY) {
+        if (Object.keys(parsedMap).length === 0) parseStaticMap(true);
+
+        // Same sector — single leg via the existing local pathfinder.
+        if (fromSector === toSector) {
+            const result = pardusGetSectorPath(fromSector, fromTileId, fromX, fromY, toX, toY);
+            if (!result) return null;
+            return { legs: [{ sector: fromSector, path: result.path, tileIds: result.tileIds }], totalAP: 0 };
+        }
+
+        // Build wormhole edges from parsedMap (same logic as the sim engine's
+        // _simEnumerateWormholeEdges). Each edge: from (sec,x,y) to (sec,x,y).
+        const edges = [];
+        for (const secName in parsedMap) {
+            const sec = parsedMap[secName];
+            if (!sec || !sec.wormholes) continue;
+            for (const destName in sec.wormholes) {
+                const fromLocal = sec.wormholes[destName];
+                if (!fromLocal) continue;
+                const destSec = parsedMap[destName];
+                if (!destSec || !destSec.wormholes) continue;
+                const toLocal = destSec.wormholes[secName];
+                if (!toLocal) continue;
+                edges.push({
+                    fromSec: secName, fromX: fromLocal.x, fromY: fromLocal.y,
+                    toSec: destName, toX: toLocal.x, toY: toLocal.y
+                });
+            }
+        }
+
+        // Index: wormhole exits reachable from a given (sec, x, y) tile.
+        const outByKey = {};
+        for (const e of edges) {
+            const k = e.fromSec + '|' + e.fromX + ',' + e.fromY;
+            (outByKey[k] = outByKey[k] || []).push(e);
+        }
+        // Index: all wormhole exit tiles per sector (for intra-sector expansion).
+        const exitsBySector = {};
+        for (const e of edges) {
+            if (!exitsBySector[e.fromSec]) exitsBySector[e.fromSec] = [];
+            exitsBySector[e.fromSec].push(e);
+        }
+
+        const WJUMP = 10;
+        const startKey = fromSector + '|' + fromX + ',' + fromY;
+
+        const dist = {};
+        dist[startKey] = 0;
+
+        // PQ entries carry the wormhole-jump sequence taken so far.
+        const pq = [{ key: startKey, sec: fromSector, x: fromX, y: fromY, cost: 0, jumps: [] }];
+        const dijCache = {};
+        let best = null;
+
+        while (pq.length > 0) {
+            pq.sort((a, b) => a.cost - b.cost);
+            const cur = pq.shift();
+            if (cur.cost > (dist[cur.key] !== undefined ? dist[cur.key] : Infinity)) continue;
+
+            // Check if we can reach the target from here (intra-sector).
+            if (cur.sec === toSector) {
+                const ck = cur.sec + '|' + cur.x + ',' + cur.y;
+                let intra = dijCache[ck];
+                if (!intra) { intra = getSectorAllDistances(cur.sec, cur.x, cur.y); dijCache[ck] = intra; }
+                if (intra) {
+                    const intraAP = intra[toX + ',' + toY];
+                    if (intraAP !== undefined && isFinite(intraAP)) {
+                        const total = cur.cost + intraAP;
+                        if (!best || total < best.totalAP) {
+                            best = { jumps: cur.jumps, totalAP: total };
+                        }
+                    }
+                }
+            }
+
+            // Expand: wormhole jumps from this exact tile.
+            const out = outByKey[cur.key] || [];
+            for (const e of out) {
+                const nk = e.toSec + '|' + e.toX + ',' + e.toY;
+                const nc = cur.cost + WJUMP;
+                if (nc < (dist[nk] !== undefined ? dist[nk] : Infinity)) {
+                    dist[nk] = nc;
+                    pq.push({ key: nk, sec: e.toSec, x: e.toX, y: e.toY, cost: nc, jumps: [...cur.jumps, e] });
+                }
+            }
+
+            // Expand: intra-sector moves to all wormhole exit tiles in cur.sec.
+            const exits = exitsBySector[cur.sec] || [];
+            if (exits.length > 0) {
+                const ck = cur.sec + '|' + cur.x + ',' + cur.y;
+                let intra = dijCache[ck];
+                if (!intra) { intra = getSectorAllDistances(cur.sec, cur.x, cur.y); dijCache[ck] = intra; }
+                if (intra) {
+                    for (const e of exits) {
+                        if (e.fromX === cur.x && e.fromY === cur.y) continue;
+                        const intraAP = intra[e.fromX + ',' + e.fromY];
+                        if (intraAP === undefined || !isFinite(intraAP)) continue;
+                        const nk = cur.sec + '|' + e.fromX + ',' + e.fromY;
+                        const nc = cur.cost + intraAP;
+                        if (nc < (dist[nk] !== undefined ? dist[nk] : Infinity)) {
+                            dist[nk] = nc;
+                            pq.push({ key: nk, sec: cur.sec, x: e.fromX, y: e.fromY, cost: nc, jumps: cur.jumps });
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!best) return null;
+
+        // Build legs from the wormhole-jump sequence.
+        const legs = [];
+        let curPos = { sector: fromSector, x: fromX, y: fromY };
+
+        for (const j of best.jumps) {
+            const path = getSectorPath(curPos.sector, curPos.x, curPos.y, j.fromX, j.fromY);
+            if (!path) return null;
+            const sd = SECTOR_DATA[curPos.sector];
+            const rows = sd ? sd.rows : parsedMap[curPos.sector].grid.length;
+            const tileIds = path.map(p => sd.start + p.x * rows + p.y);
+            legs.push({ sector: curPos.sector, path, tileIds });
+            curPos = { sector: j.toSec, x: j.toX, y: j.toY };
+        }
+
+        const finalPath = getSectorPath(curPos.sector, curPos.x, curPos.y, toX, toY);
+        if (!finalPath) return null;
+        const sd = SECTOR_DATA[curPos.sector];
+        const rows = sd ? sd.rows : parsedMap[curPos.sector].grid.length;
+        const finalTileIds = finalPath.map(p => sd.start + p.x * rows + p.y);
+        legs.push({ sector: curPos.sector, path: finalPath, tileIds: finalTileIds });
+
+        return { legs, totalAP: best.totalAP };
+    }
+
     // --- 9. Rich Nav HUD ---
 
     function flyToCoords(target, destLabel, onArrive) {
         const tx = target.x, ty = target.y;
+        const targetSector = target.sector || null;
         const coordsEl = document.getElementById('coords');
         const sectorEl = document.getElementById('sector');
         if (!coordsEl || !sectorEl) {
@@ -2491,14 +2635,23 @@ const SECTOR_DATA = {
             return;
         }
 
-        const result = pardusGetSectorPath(sectorName, startTileId, current.x, current.y, tx, ty);
-        if (!result || !result.tileIds || result.tileIds.length === 0) {
-            alert(`No local path found within sector "${sectorName}" from [${current.x},${current.y}] to [${tx},${ty}].`);
-            return;
+        // Build route: single-leg (same sector) or multi-leg (cross-sector via wormholes).
+        let legs;
+        if (targetSector && targetSector !== sectorName) {
+            const route = getCrossSectorRoute(sectorName, startTileId, current.x, current.y, targetSector, tx, ty);
+            if (!route || !route.legs || route.legs.length === 0) {
+                alert(`No cross-sector path found from ${sectorName} [${current.x},${current.y}] to ${targetSector} [${tx},${ty}].`);
+                return;
+            }
+            legs = route.legs;
+        } else {
+            const result = pardusGetSectorPath(sectorName, startTileId, current.x, current.y, tx, ty);
+            if (!result || !result.tileIds || result.tileIds.length === 0) {
+                alert(`No local path found within sector "${sectorName}" from [${current.x},${current.y}] to [${tx},${ty}].`);
+                return;
+            }
+            legs = [{ sector: sectorName, path: result.path, tileIds: result.tileIds }];
         }
-
-        const tileIds = result.tileIds;
-        const pathCoords = result.path;
 
         const overlay = document.createElement('div');
         overlay.style.cssText = 'position:fixed; top:0; left:0; width:100%; background:#003355; color:#fff; text-align:center; padding:6px; z-index:999999; font-weight:bold; font-size:13px; border-bottom:2px solid #0088ff;';
@@ -2515,12 +2668,49 @@ const SECTOR_DATA = {
             return (v === undefined || v === null) ? -1 : parseInt(v.toString(), 10);
         }
 
+        function getCurrentSector() {
+            const el = document.getElementById('sector');
+            return el ? el.textContent.trim() : null;
+        }
+
         function setOverlay(text) {
             overlay.innerText = text;
         }
 
+        function fail(msg) {
+            setOverlay(msg);
+            setTimeout(() => overlay.remove(), 4000);
+            if (onArrive) onArrive(false);
+        }
+
+        let legIdx = 0;
+
         function flyNext() {
             const curId = currentTileId();
+            const curSector = getCurrentSector();
+
+            // Detect wormhole jump: if the current sector differs from the
+            // current leg's sector, find the leg matching the new sector.
+            if (curSector !== legs[legIdx].sector) {
+                let found = false;
+                for (let li = legIdx + 1; li < legs.length; li++) {
+                    if (legs[li].sector === curSector) {
+                        legIdx = li;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    fail(`\u26a0 Unexpected sector "${curSector}" after wormhole jump (expected "${legs[legIdx + 1] ? legs[legIdx + 1].sector : '?'}"). Stopping.`);
+                    return;
+                }
+                setOverlay(`\u2708 Wormhole jump complete \u2014 now in ${curSector}. Continuing...`);
+            }
+
+            const leg = legs[legIdx];
+            const tileIds = leg.tileIds;
+            const pathCoords = leg.path;
+
             let idx = tileIds.indexOf(curId);
             if (idx < 0) {
                 // Off-path: snap to the nearest tile in the path by coords.
@@ -2539,16 +2729,43 @@ const SECTOR_DATA = {
                     }
                 }
                 if (idx < 0) {
-                    setOverlay(`\u26a0 Off local path (tile ${curId}). Stopping.`);
-                    setTimeout(() => overlay.remove(), 3000);
-                    if (onArrive) onArrive(false);
+                    fail(`\u26a0 Off local path (tile ${curId}). Stopping.`);
                     return;
                 }
             }
             if (idx === tileIds.length - 1) {
-                setOverlay(`\u2708 Arrived at ${destLabel}.`);
-                setTimeout(() => overlay.remove(), 2500);
-                if (onArrive) onArrive(true);
+                // At the end of this leg.
+                if (legIdx === legs.length - 1) {
+                    // Final destination.
+                    setOverlay(`\u2708 Arrived at ${destLabel}.`);
+                    setTimeout(() => overlay.remove(), 2500);
+                    if (onArrive) onArrive(true);
+                    return;
+                }
+                // At a wormhole tile but the jump hasn't triggered yet
+                // (e.g., we started on the wormhole tile). Try to trigger it.
+                const navFn = resolveNavFn();
+                if (!navFn) {
+                    fail('\u26a0 Pardus nav function (navAjax/nav) not found on page. Stopping.');
+                    return;
+                }
+                const beforeSector = curSector;
+                setOverlay(`\u2708 Triggering wormhole jump (leg ${legIdx + 1}/${legs.length})...`);
+                try { navFn(tileIds[idx]); } catch (e) { fail(`\u26a0 nav() threw: ${e.message}. Stopping.`); return; }
+
+                const deadline = Date.now() + 8000;
+                (function waitForJump() {
+                    const newSector = getCurrentSector();
+                    if (newSector !== beforeSector) {
+                        setTimeout(flyNext, 200);
+                        return;
+                    }
+                    if (Date.now() > deadline) {
+                        fail('\u26a0 Wormhole jump did not trigger. Try moving manually and re-clicking.');
+                        return;
+                    }
+                    setTimeout(waitForJump, 100);
+                })();
                 return;
             }
 
@@ -2567,20 +2784,17 @@ const SECTOR_DATA = {
             const targetId = tileIds[targetIdx];
             const navFn = resolveNavFn();
             if (!navFn) {
-                setOverlay('\u26a0 Pardus nav function (navAjax/nav) not found on page. Stopping.');
-                setTimeout(() => overlay.remove(), 3000);
-                if (onArrive) onArrive(false);
+                fail('\u26a0 Pardus nav function (navAjax/nav) not found on page. Stopping.');
                 return;
             }
 
-            setOverlay(`\u2708 Flying to ${destLabel} via local pathfinding (${tileIds.length - idx - 1} tiles left, jumping ${targetIdx - idx})...`);
+            const legInfo = legs.length > 1 ? ` (leg ${legIdx + 1}/${legs.length}, ${leg.sector})` : '';
+            setOverlay(`\u2708 Flying to ${destLabel}${legInfo} (${tileIds.length - idx - 1} tiles left, jumping ${targetIdx - idx})...`);
             const beforeId = curId;
             try {
                 navFn(targetId);
             } catch (e) {
-                setOverlay(`\u26a0 nav() threw: ${e.message}. Stopping.`);
-                setTimeout(() => overlay.remove(), 3000);
-                if (onArrive) onArrive(false);
+                fail(`\u26a0 nav() threw: ${e.message}. Stopping.`);
                 return;
             }
 
@@ -2591,9 +2805,7 @@ const SECTOR_DATA = {
                     return;
                 }
                 if (Date.now() > deadline) {
-                    setOverlay(`⚠ Nav did not update after moving to tile ${targetId}. Stopping.`);
-                    setTimeout(() => overlay.remove(), 3000);
-                    if (onArrive) onArrive(false);
+                    fail(`\u26a0 Nav did not update after moving to tile ${targetId}. Stopping.`);
                     return;
                 }
                 setTimeout(waitForMove, 100);
@@ -4627,8 +4839,9 @@ const SECTOR_DATA = {
     //
     // Distance model (one-way AP from the TO to the destination):
     //   * Same sector as the TO  -> exact Dijkstra (getSectorAllDistances).
-    //     Cross-sector D cannot be pathed by this script (no wormhole router),
-    //     so cross-sector AP stays null (?).
+    //     Cross-sector AP stays null (?) in the panel display, but clicking
+    //     a cross-sector destination name now auto-flies there via wormhole
+    //     routing (getCrossSectorRoute in the pathfinder module).
     //
     // Packaging model:
     //   * Normal cargo cap = maxCargo (200). For any destination whose one-way
@@ -4855,7 +5068,7 @@ const SECTOR_DATA = {
                 const sameSector = !!(eSector && toSector && eSector === toSector);
 
                 // AP from TO: exact Dijkstra for same-sector; null for cross-sector
-                // (no wormhole router in this script).
+                // (AP not computed for display, but clicking still flies via wormholes).
                 let D = null, estD = false;
                 if (sameSector) {
                     if (toDijkstra) {
@@ -5361,9 +5574,7 @@ const SECTOR_DATA = {
                 const profitTxt = (r.profit == null)
                     ? '<span style="color:#666;">' + fmtCr(r.revenue) + '*</span>'
                     : '<span style="color:' + (r.profit < 0 ? '#ff5555' : '#88ff88') + ';">' + fmtCr(r.profit) + '</span>';
-                const nameAttrs = r.sameSector
-                    ? ' class="export-fly-target" data-idx="' + i + '" title="Click to fly here" style="color:' + typeColor + ';cursor:pointer;text-decoration:underline;"'
-                    : ' style="color:' + typeColor + ';"';
+                const nameAttrs = ' class="export-fly-target" data-idx="' + i + '" title="Click to fly here" style="color:' + typeColor + ';cursor:pointer;text-decoration:underline;"';
                 tr.innerHTML =
                     '<td>' + (i + 1) + '</td>' +
                     '<td style="color:#ffcc77;">' + r.item + '</td>' +
@@ -5385,13 +5596,13 @@ const SECTOR_DATA = {
                 const idx = parseInt(el.dataset.idx, 10);
                 const r = res.routes[idx];
                 if (!r) return;
-                flyToCoords(r.coords, (r.dest.name || '?') + ' [' + r.coords.x + ',' + r.coords.y + ']');
+                flyToCoords({ x: r.coords.x, y: r.coords.y, sector: r.sector }, (r.dest.name || '?') + ' [' + r.coords.x + ',' + r.coords.y + ']');
             });
             body.appendChild(t);
 
             const note = document.createElement('div');
             note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
-            note.innerHTML = 'Click a destination name (same-sector) to auto-fly there. One-way AP from TO via pathfinder. Cross-sector AP = ? (no wormhole router). Sell = price buyer pays you. *revenue shown (no buy price). cr/AP = net profit per AP.<br><span style="color:#5a5a3a;">(packaging) = D&gt;400 AP + buyer room&gt;200: 400 AP overhead doubles cargo to 400 for that trip (apCost = D+400). Finite 400-package stock not depleted across ranked routes.</span>';
+            note.innerHTML = 'Click a destination name to auto-fly there. Cross-sector flights use wormhole routing. One-way AP from TO via pathfinder. Cross-sector AP = ? (not computed for display). Sell = price buyer pays you. *revenue shown (no buy price). cr/AP = net profit per AP.<br><span style="color:#5a5a3a;">(packaging) = D&gt;400 AP + buyer room&gt;200: 400 AP overhead doubles cargo to 400 for that trip (apCost = D+400). Finite 400-package stock not depleted across ranked routes.</span>';
             body.appendChild(note);
         }
 
