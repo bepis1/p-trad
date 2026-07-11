@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.35
+// @version      6.36
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -14,6 +14,7 @@
 // @description  v6.33: Security — split read-only token (GH_READ_TOKEN, embedded in script) from write token (GH_TOKEN, publish-only). Fine-grained PAT scoped to repo read-only.
 // @description  v6.34: Fix magscoop space leak — sim no longer frees regular cargo space when dropping magscoop items, preventing the route planner from filling the +150 magscoop.
 // @description  v6.35: Fix runtime magscoop leak — getTrueBaseFreeSpace() now returns only regular cargo space, preventing the reality clamp from allowing magscoop-filling pickups at trade screens.
+// @description  v6.36: Cross-sector auto-fly from exports panel — clicking a starbase/planet name in another sector now routes through wormholes instead of doing nothing.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
