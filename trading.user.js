@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.50
+// @version      6.51
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -29,6 +29,7 @@
 // @description  v6.48: Auto-retreat from NPC ambushes — when a cloaked/hidden NPC ambushes during auto-fly, automatically retreats and resumes the flight, sidestepping the ambush tile. Toggle in control center.
 // @description  v6.49: Fly Here draggable panel — searchable sector list, plot path/AP cost preview (cross-sector via wormholes), and one-click auto-fly to any sector coordinate.
 // @description  v6.50: Fix fly-here-panel scope — move inside main IIFE so it can access routing functions.
+// @description  v6.51: Fix fly-here-panel crash — use header.querySelector instead of document.getElementById for min-btn before panel is mounted.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -6805,8 +6806,8 @@ const SECTOR_DATA = {
         });
 
         // >> Minimize / expand
-        document.getElementById('flyhere-min-btn').addEventListener('click', () => {
-            const minBtn = document.getElementById('flyhere-min-btn');
+        const minBtn = header.querySelector('#flyhere-min-btn');
+        minBtn.addEventListener('click', () => {
             if (body.style.display === 'none') {
                 body.style.display = 'flex';
                 minBtn.textContent = '[-]';
