@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.29
+// @version      6.30
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
 // @description  v6.27: Remove fwStashPending mechanism that caused F/W dump-to-TO-then-hub-reload loop. FWE fires directly with F/W in cargo.
 // @description  v6.28: Fix auto-updater — publish as trading.user.js so Tampermonkey intercepts the install; open raw URL directly via GM_openInTab instead of broken blob: URL approach.
 // @description  v6.29: Version bump to test the fixed auto-update flow.
+// @description  v6.30: Fix auto-updater install — use GitHub Contents API to get a signed download_url (browsers strip credentials from URL navigations, so GM_openInTab with token-in-URL was 404ing).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -25,6 +26,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_info
 // @connect      raw.githubusercontent.com
+// @connect      api.github.com
 // @downloadURL  https://x-access-token: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@raw.githubusercontent.com/bepis1/p-trad/main/trading.user.js
 // ==/UserScript==
 
@@ -5667,17 +5669,18 @@ const SECTOR_DATA = {
 //
 // Why this exists: Tampermonkey's native @updateURL check cannot authenticate
 // against a private GitHub repo. raw.githubusercontent.com answers private-repo
-// requests with 404 (not 401) when unauthenticated, and Tampermonkey's
-// background update fetch strips the credentials embedded in the URL (per the
-// fetch spec), so the native check always sees 404 and silently never updates.
+// requests with 404 (not 401) when unauthenticated, and both fetch/XHR and
+// browser top-level navigations strip credentials embedded in the URL (per the
+// fetch spec and modern browser security policy), so there is NO way to fetch
+// private raw content via a credential-embedded URL.
 //
 // This section does the version check itself using GM_xmlhttpRequest, which CAN
 // send an explicit `Authorization: token <PAT>` header. When a newer @version
-// is found, it opens the authenticated @downloadURL in a new tab via
-// GM_openInTab. The browser's top-level navigation sends the URL-embedded
-// credentials as Basic auth (unlike fetch/XHR which strips them), GitHub
-// returns 200 with the script, and Tampermonkey intercepts the .user.js URL
-// pattern and shows its install dialog.
+// is found, it calls the GitHub Contents API (also via GM_xmlhttpRequest with
+// auth) to obtain a `download_url` — this URL contains a temporary signed token
+// as a query parameter (not URL-embedded credentials), works without auth, and
+// ends in .user.js so Tampermonkey intercepts the navigation and shows the
+// install dialog.
 //
 // The token + URLs are derived from the script's own @downloadURL (already
 // baked with the token at build time) so there is no second source of truth.
@@ -5745,19 +5748,49 @@ const SECTOR_DATA = {
     }
 
     function installUpdate(remoteVersion) {
-        console.log('[pardus-update] installUpdate v' + remoteVersion + ' — opening ' + scriptURL);
-        notify('Pardus Logistics', 'Opening install page for v' + remoteVersion + '...');
-        // Open the authenticated raw URL directly. The browser's top-level
-        // navigation sends the URL-embedded credentials as Basic auth, GitHub
-        // returns 200, and Tampermonkey intercepts the .user.js extension
-        // and shows the install dialog.
-        try {
-            GM_openInTab(scriptURL, { active: true });
-            GM_setValue(LAST_CHECK_KEY, Date.now());
-        } catch (e) {
-            console.error('[pardus-update] GM_openInTab failed:', e);
-            notify('Pardus Logistics', 'Install failed: ' + e.message);
-        }
+        console.log('[pardus-update] installUpdate v' + remoteVersion);
+        notify('Pardus Logistics', 'Fetching signed download link for v' + remoteVersion + '...');
+        // Browsers strip credentials from URL navigations, so we can't open
+        // the raw URL with token-in-URL. Instead, call the Contents API (which
+        // we CAN auth via GM_xmlhttpRequest headers) to get a signed
+        // download_url — a temporary URL with a token query parameter that
+        // works without auth and ends in .user.js so Tampermonkey intercepts it.
+        const apiUrl = 'https://api.github.com/repos/bepis1/p-trad/contents/trading.user.js?ref=main';
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: apiUrl,
+            headers: { Authorization: 'token ' + GH_TOKEN, Accept: 'application/vnd.github+json' },
+            timeout: 15000,
+            onload: function (r) {
+                if (r.status >= 200 && r.status < 300) {
+                    try {
+                        const data = JSON.parse(r.responseText);
+                        if (data.download_url) {
+                            console.log('[pardus-update] Got signed download_url:', data.download_url);
+                            GM_openInTab(data.download_url, { active: true });
+                            GM_setValue(LAST_CHECK_KEY, Date.now());
+                        } else {
+                            console.error('[pardus-update] No download_url in API response');
+                            notify('Pardus Logistics', 'Install failed: no download_url in API response.');
+                        }
+                    } catch (e) {
+                        console.error('[pardus-update] JSON parse failed:', e);
+                        notify('Pardus Logistics', 'Install failed: ' + e.message);
+                    }
+                } else {
+                    console.error('[pardus-update] Contents API HTTP', r.status, r.responseText);
+                    notify('Pardus Logistics', 'Install failed: API HTTP ' + r.status + '.');
+                }
+            },
+            onerror: function () {
+                console.error('[pardus-update] Contents API network error');
+                notify('Pardus Logistics', 'Install failed: network error.');
+            },
+            ontimeout: function () {
+                console.error('[pardus-update] Contents API timeout');
+                notify('Pardus Logistics', 'Install failed: API timeout.');
+            }
+        });
     }
 
     function announceUpdate(remoteVersion) {
