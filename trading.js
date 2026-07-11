@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.26
+// @version      6.27
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
+// @description  v6.27: Remove fwStashPending mechanism that caused F/W dump-to-TO-then-hub-reload loop. FWE fires directly with F/W in cargo.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -802,23 +803,6 @@
             // full hull.
             let shipEnergy = shipCargo['energy'] || 0;
             let fweNeeded = unmetEnergy >= maxC && !noStarbaseAvailable && (shipSpace > 0 || shipHasFW) && shipEnergy === 0;
-            // When FWE is needed but the ship still carries building-supply
-            // F/W (food/water that factories demand), that F/W must be stashed
-            // at the TO *before* the FWE run — otherwise the immutable starbase
-            // step sells ALL F/W for energy, starving the buildings that need
-            // it.  While stashing is pending the FWE branch yields to the TO
-            // (or factory) branch so the F/W is cleared first.  The fweNeeded
-            // flag already suppresses the hub-reload branch, so there is no
-            // stash→reload→stash loop risk.
-            let fwStashPending = false;
-            if (fweNeeded) {
-                for (let item in shipCargo) {
-                    let k = item.toLowerCase();
-                    if ((k === 'food' || k === 'water') && allowedSupplies.includes(k)) {
-                        if ((shipCargo[item] || 0) > 0 && (remainingDemand[k] || 0) > 0) { fwStashPending = true; break; }
-                    }
-                }
-            }
 
             let dumpableCargo = {};
             let totalDumpable = 0;
@@ -842,25 +826,13 @@
                 // just trigger a hub reload loop (stash -> demand still unmet ->
                 // hub buys more -> stash again). Only supply-chain items picked
                 // up from buildings (metal, gems, etc.) may be deferred to the TO.
-                //
-                // Exception: when fwStashPending, building-supply F/W MUST be
-                // stashed at the TO before the FWE run — otherwise the immutable
-                // starbase step sells ALL F/W for energy, starving buildings.
-                // The fweNeeded flag already suppresses hub reload, so no loop.
-                // We bypass the fill-threshold, stillProduced, and far guards
-                // for this case and stash the full amount (not just min(have,
-                // demand)) so a single TO visit clears all F/W.
                 let isHubSupply = allowedSupplies.includes(k);
-                let fweStashFW = fwStashPending && (k === 'food' || k === 'water') && isHubSupply;
-                let stashFillOK = fweStashFW || shipFillPercent > STASH_FILL_THRESHOLD;
-                if (stashFillOK && demand > 0 && (!isHubSupply || fweStashFW)) {
+                if (shipFillPercent > STASH_FILL_THRESHOLD && demand > 0 && !isHubSupply) {
                     // Don't stash needed-but-deferred cargo while unvisited
                     // factories still PRODUCE this item — stashing frees space
                     // which the ship then uses to pick up MORE of the same item
                     // at the next producer, creating an AM→TO→AM→TO accumulation
                     // loop. Only stash after all producers are visited.
-                    // (Bypassed for fweStashFW: the F/W is hub-supplied, not
-                    // factory-produced, so the accumulation loop can't happen.)
                     let stillProduced = false;
                     for (let n of unvisited) {
                         if (!n.pickups) continue;
@@ -869,11 +841,11 @@
                         }
                         if (stillProduced) break;
                     }
-                    if (stillProduced && !fweStashFW) continue;
+                    if (stillProduced) continue;
                     let nap = nearestDemanderAP[k] !== undefined ? nearestDemanderAP[k] : Infinity;
-                    let far = fweStashFW || ((nap >= STASH_FAR_AP) && (bestFactoryAP === Infinity || nap >= bestFactoryAP * STASH_FAR_RATIO));
+                    let far = (nap >= STASH_FAR_AP) && (bestFactoryAP === Infinity || nap >= bestFactoryAP * STASH_FAR_RATIO);
                     if (far) {
-                        let stashable = fweStashFW ? have : Math.min(have, demand);
+                        let stashable = Math.min(have, demand);
                         if (stashable > 0) {
                             dumpableCargo[item] = (dumpableCargo[item] || 0) + stashable;
                             totalDumpable += stashable;
@@ -1076,17 +1048,9 @@
                                 // and energyQty <= maxC, this branch is always
                                 // taken; the starbase gets Infinity score so it
                                 // always wins over hub/TO/factory candidates.
-                                //
-                                // When fwStashPending, the FWE branch yields —
-                                // bestSbCandidate is still set (so
-                                // noStarbaseAvailable doesn't misfire) but the
-                                // Infinity score is withheld, letting the TO
-                                // stash branch win so F/W is cleared first.
                                 bestSbCandidate = bestSbChoice;
-                                if (!fwStashPending) {
-                                    bestScore = Infinity;
-                                    destinationType = "starbase";
-                                }
+                                bestScore = Infinity;
+                                destinationType = "starbase";
                             }
                         }
                     }
