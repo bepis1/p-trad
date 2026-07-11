@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.38
+// @version      6.39
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -17,6 +17,7 @@
 // @description  v6.36: Cross-sector auto-fly from exports panel — clicking a starbase/planet name in another sector now routes through wormholes instead of doing nothing.
 // @description  v6.37: Fix same-sector route totalAP reporting 0 instead of actual terrain AP cost.
 // @description  v6.38: Remove backup pathfinding snap-to-nearest-tile fallback in flyToCoords — fail hard instead of wasting AP on a bad resync.
+// @description  v6.39: Hub reload now uses sweep lookahead scoring — always evaluates hub as candidate and scores by the full multi-factory sweep it enables, eliminating trailing microtrips from late partial reloads.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -921,49 +922,121 @@
             let bestSbCandidate = null; // { sb, eval } for the starbase energy run branch
 
             if (totalUnmetHubDemand > 0 && shipSpace > 0 && !fweNeeded) {
-                let needsRestock = currentSupplies < minTrade || shipFillPercent < 0.2;
+                let hubDist = simTravelAP(currentLoc, hubLoc, simSector, simDijCache);
+                let potentialLoad = Math.min(totalUnmetHubDemand, shipSpace);
 
-                if (needsRestock) {
-                    let hubDist = simTravelAP(currentLoc, hubLoc, simSector, simDijCache);
-                    let apCost = hubDist + 5;
-                    let potentialLoad = Math.min(totalUnmetHubDemand, shipSpace);
+                if (potentialLoad >= minTrade) {
+                    // Build the load plan: simulate a virtual pass through
+                    // factories sorted by distance from the hub, allocating
+                    // supplies to each factory's demand after consuming what
+                    // the ship already carries.
+                    hubLoadPlan = {};
+                    let loadTempSpace = shipSpace;
+                    let virtualCargo = JSON.parse(JSON.stringify(shipCargo));
+                    let sortedClone = JSON.parse(JSON.stringify(unvisited))
+                        .sort((a,b) => getDistance(hubLoc, parseCoords(a.location)) - getDistance(hubLoc, parseCoords(b.location)));
 
-                    if (potentialLoad >= minTrade) {
-                        let hubScore = Math.pow(potentialLoad, 1.5) / Math.pow(apCost, 1.2);
-                        if (hubDist === 0) hubScore *= 10;
+                    for (let n of sortedClone) {
+                        for (let rawK in n.dropoffs) {
+                            if (loadTempSpace <= 0) break;
+                            let k = rawK.toLowerCase();
+                            if (allowedSupplies.includes(k)) {
+                                let needed = n.dropoffs[rawK].amount;
+                                let consume = Math.min(needed, virtualCargo[k] || 0);
+                                virtualCargo[k] = (virtualCargo[k] || 0) - consume;
+                                let netNeeded = needed - consume;
 
-                        if (hubScore > bestScore) {
-                            bestScore = hubScore;
-                            destinationType = "hub";
-
-                            hubLoadPlan = {};
-                            let tempSpace = shipSpace;
-                            let virtualCargo = JSON.parse(JSON.stringify(shipCargo));
-                            let virtualUnvisited = JSON.parse(JSON.stringify(unvisited));
-                            let sortedUnvisited = virtualUnvisited.sort((a,b) => getDistance(hubLoc, parseCoords(a.location)) - getDistance(hubLoc, parseCoords(b.location)));
-
-                            for (let n of sortedUnvisited) {
-                                for (let rawK in n.dropoffs) {
-                                    if (tempSpace <= 0) break;
-                                    let k = rawK.toLowerCase();
-                                    if (allowedSupplies.includes(k)) {
-                                        let needed = n.dropoffs[rawK].amount;
-                                        let consume = Math.min(needed, virtualCargo[k] || 0);
-                                        virtualCargo[k] = (virtualCargo[k] || 0) - consume;
-                                        let netNeeded = needed - consume;
-
-                                        if (netNeeded > 0) {
-                                            let loadAmt = Math.min(netNeeded, tempSpace);
-                                            if (loadAmt > 0) {
-                                                hubLoadPlan[rawK] = (hubLoadPlan[rawK] || 0) + loadAmt;
-                                                tempSpace -= loadAmt;
-                                                n.dropoffs[rawK].amount -= (consume + loadAmt);
-                                            }
-                                        }
+                                if (netNeeded > 0) {
+                                    let loadAmt = Math.min(netNeeded, loadTempSpace);
+                                    if (loadAmt > 0) {
+                                        hubLoadPlan[rawK] = (hubLoadPlan[rawK] || 0) + loadAmt;
+                                        loadTempSpace -= loadAmt;
+                                        n.dropoffs[rawK].amount -= (consume + loadAmt);
                                     }
                                 }
                             }
                         }
+                    }
+
+                    // Sweep lookahead: simulate a nearest-neighbor walk from
+                    // the hub through factories, using the loaded supplies.
+                    // Score by total action (drops+picks) per total AP (hub
+                    // detour + sweep travel), so the hub wins when it enables
+                    // a multi-factory sweep and loses when a nearby factory
+                    // with current supplies is more efficient. This prevents
+                    // trailing microtrips by proactively loading a full hull
+                    // while the ship still has maximum free space.
+                    let sweepCargo = JSON.parse(JSON.stringify(shipCargo));
+                    for (let rk in hubLoadPlan) {
+                        let k = rk.toLowerCase();
+                        sweepCargo[k] = (sweepCargo[k] || 0) + hubLoadPlan[rk];
+                    }
+                    let sweepSpace = shipSpace - Object.values(hubLoadPlan).reduce((a,b)=>a+b, 0);
+                    let sweepRemainingDemand = {};
+                    for (let n of unvisited) {
+                        for (let rk in n.dropoffs) {
+                            let k = rk.toLowerCase();
+                            sweepRemainingDemand[k] = (sweepRemainingDemand[k] || 0) + n.dropoffs[rk].amount;
+                        }
+                    }
+                    let sweepNodes = unvisited.slice();
+                    let sweepLoc = hubLoc;
+                    let sweepAP = 0;
+                    let sweepAction = 0;
+                    let sweepMag = simMagScoopUsed;
+
+                    while (sweepNodes.length > 0) {
+                        let bestIdx = -1, bestDist = Infinity;
+                        for (let i = 0; i < sweepNodes.length; i++) {
+                            let d = simTravelAP(sweepLoc, parseCoords(sweepNodes[i].location), simSector, simDijCache);
+                            if (d < bestDist) { bestDist = d; bestIdx = i; }
+                        }
+                        if (bestIdx < 0) break;
+                        let node = sweepNodes[bestIdx];
+                        let nodeAction = 0;
+
+                        for (let rk in node.dropoffs) {
+                            let k = rk.toLowerCase();
+                            if (sweepCargo[k] > 0 && node.dropoffs[rk].amount > 0) {
+                                let drop = Math.min(node.dropoffs[rk].amount, sweepCargo[k]);
+                                sweepCargo[k] -= drop;
+                                sweepRemainingDemand[k] = (sweepRemainingDemand[k] || 0) - drop;
+                                let fromMag = Math.min(drop, sweepMag);
+                                sweepMag -= fromMag;
+                                sweepSpace += (drop - fromMag);
+                                sweepAction += drop;
+                                nodeAction += drop;
+                            }
+                        }
+                        for (let rk in node.pickups) {
+                            let k = rk.toLowerCase();
+                            let avail = node.pickups[rk].amount;
+                            let isExport = exportList.includes(k);
+                            let sectorStillNeeds = Math.max(0, (sweepRemainingDemand[k] || 0) - (sweepCargo[k] || 0));
+                            let maxTake = isExport ? avail : sectorStillNeeds;
+                            if (maxTake > 0 && sweepSpace > 0) {
+                                let take = Math.min(avail, sweepSpace, maxTake);
+                                sweepCargo[k] = (sweepCargo[k] || 0) + take;
+                                sweepSpace -= take;
+                                sweepAction += take;
+                                nodeAction += take;
+                            }
+                        }
+                        sweepNodes.splice(bestIdx, 1);
+                        if (nodeAction === 0) continue;
+                        sweepAP += bestDist + 5;
+                        sweepLoc = parseCoords(node.location);
+                    }
+
+                    let totalAP = hubDist + 5 + sweepAP;
+                    let hubScore = sweepAction > 0
+                        ? Math.pow(sweepAction, 1.5) / Math.pow(totalAP, 1.2)
+                        : 0;
+                    if (hubDist === 0) hubScore *= 1.5;
+
+                    if (hubScore > bestScore) {
+                        bestScore = hubScore;
+                        destinationType = "hub";
                     }
                 }
             }
