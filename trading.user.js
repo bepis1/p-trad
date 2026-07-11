@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.39
+// @version      6.40
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -18,6 +18,7 @@
 // @description  v6.37: Fix same-sector route totalAP reporting 0 instead of actual terrain AP cost.
 // @description  v6.38: Remove backup pathfinding snap-to-nearest-tile fallback in flyToCoords — fail hard instead of wasting AP on a bad resync.
 // @description  v6.39: Hub reload now uses sweep lookahead scoring — always evaluates hub as candidate and scores by the full multi-factory sweep it enables, eliminating trailing microtrips from late partial reloads.
+// @description  v6.40: Fix hub sweep overcounting — only count marginal action from hub-loaded supplies (not pre-existing cargo the ship could deliver without the detour), preventing the hub from winning when a far detour isn't worth it.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -959,17 +960,19 @@
                     }
 
                     // Sweep lookahead: simulate a nearest-neighbor walk from
-                    // the hub through factories, using the loaded supplies.
-                    // Score by total action (drops+picks) per total AP (hub
-                    // detour + sweep travel), so the hub wins when it enables
-                    // a multi-factory sweep and loses when a nearby factory
-                    // with current supplies is more efficient. This prevents
-                    // trailing microtrips by proactively loading a full hull
-                    // while the ship still has maximum free space.
-                    let sweepCargo = JSON.parse(JSON.stringify(shipCargo));
+                    // the hub through factories. Only count MARGINAL action —
+                    // drops from hub-loaded supplies and the pickups they
+                    // enable. Drops from pre-existing ship cargo are NOT
+                    // counted (the ship could deliver those without the hub
+                    // detour). Pickups at a factory count only if hub cargo was
+                    // dropped there; those pickups go into the hub-cargo pool
+                    // so chain deliveries (hub energy → metal pickup → metal
+                    // drop at next factory) count as hub-enabled action.
+                    let sweepOrigCargo = JSON.parse(JSON.stringify(shipCargo));
+                    let sweepHubCargo = {};
                     for (let rk in hubLoadPlan) {
                         let k = rk.toLowerCase();
-                        sweepCargo[k] = (sweepCargo[k] || 0) + hubLoadPlan[rk];
+                        sweepHubCargo[k] = (sweepHubCargo[k] || 0) + hubLoadPlan[rk];
                     }
                     let sweepSpace = shipSpace - Object.values(hubLoadPlan).reduce((a,b)=>a+b, 0);
                     let sweepRemainingDemand = {};
@@ -994,32 +997,42 @@
                         if (bestIdx < 0) break;
                         let node = sweepNodes[bestIdx];
                         let nodeAction = 0;
+                        let nodeHadHubDrop = false;
 
                         for (let rk in node.dropoffs) {
                             let k = rk.toLowerCase();
-                            if (sweepCargo[k] > 0 && node.dropoffs[rk].amount > 0) {
-                                let drop = Math.min(node.dropoffs[rk].amount, sweepCargo[k]);
-                                sweepCargo[k] -= drop;
+                            let total = (sweepOrigCargo[k] || 0) + (sweepHubCargo[k] || 0);
+                            if (total > 0 && node.dropoffs[rk].amount > 0) {
+                                let drop = Math.min(node.dropoffs[rk].amount, total);
+                                let origDrop = Math.min(drop, sweepOrigCargo[k] || 0);
+                                let hubDrop = drop - origDrop;
+                                sweepOrigCargo[k] = (sweepOrigCargo[k] || 0) - origDrop;
+                                sweepHubCargo[k] = (sweepHubCargo[k] || 0) - hubDrop;
                                 sweepRemainingDemand[k] = (sweepRemainingDemand[k] || 0) - drop;
                                 let fromMag = Math.min(drop, sweepMag);
                                 sweepMag -= fromMag;
                                 sweepSpace += (drop - fromMag);
-                                sweepAction += drop;
-                                nodeAction += drop;
+                                if (hubDrop > 0) {
+                                    sweepAction += hubDrop;
+                                    nodeAction += hubDrop;
+                                    nodeHadHubDrop = true;
+                                }
                             }
                         }
-                        for (let rk in node.pickups) {
-                            let k = rk.toLowerCase();
-                            let avail = node.pickups[rk].amount;
-                            let isExport = exportList.includes(k);
-                            let sectorStillNeeds = Math.max(0, (sweepRemainingDemand[k] || 0) - (sweepCargo[k] || 0));
-                            let maxTake = isExport ? avail : sectorStillNeeds;
-                            if (maxTake > 0 && sweepSpace > 0) {
-                                let take = Math.min(avail, sweepSpace, maxTake);
-                                sweepCargo[k] = (sweepCargo[k] || 0) + take;
-                                sweepSpace -= take;
-                                sweepAction += take;
-                                nodeAction += take;
+                        if (nodeHadHubDrop) {
+                            for (let rk in node.pickups) {
+                                let k = rk.toLowerCase();
+                                let avail = node.pickups[rk].amount;
+                                let isExport = exportList.includes(k);
+                                let sectorStillNeeds = Math.max(0, (sweepRemainingDemand[k] || 0) - (sweepOrigCargo[k] || 0) - (sweepHubCargo[k] || 0));
+                                let maxTake = isExport ? avail : sectorStillNeeds;
+                                if (maxTake > 0 && sweepSpace > 0) {
+                                    let take = Math.min(avail, sweepSpace, maxTake);
+                                    sweepHubCargo[k] = (sweepHubCargo[k] || 0) + take;
+                                    sweepSpace -= take;
+                                    sweepAction += take;
+                                    nodeAction += take;
+                                }
                             }
                         }
                         sweepNodes.splice(bestIdx, 1);
