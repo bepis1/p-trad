@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.54
+// @version      6.55
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -33,6 +33,7 @@
 // @description  v6.52: Fix auto-updater — embed read token directly as constant instead of extracting from @downloadURL (Tampermonkey strips URL credentials).
 // @description  v6.53: Fix fly-here cross-sector routing — normalize wormhole destination names (strip #suffix, underscores→spaces) so they match parsedMap sector keys. Previously underscore sectors like Ras Elased and #-suffixed wormholes like SZ 4-419#North silently dropped all wormhole edges, causing "No path found" for most cross-sector routes.
 // @description  v6.54: Equipment-aware terrain AP costs — port getTileCosts() from pardusapcalculator.uk so Dijkstra uses drive speed, nav level, amber stim, pathfinder, boost, exocrab, flux capacitors, viral persuader instead of hard-coded values. Wormhole-seal calendar (Asdwolf epoch logic) skips sealed wormholes. Configurable wormhole jump cost. Ship-config section in Fly Here panel. Sim engine (03-3) now respects configurable wormhole surcharge and seal calendar for route scoring.
+// @description  v6.55: Fix cross-sector routing crash on sub-sector sectors (Betelgeuse East/West, Pardus NE/West, etc.). parseStaticMap now merges sub-sector grid fragments into their parent sector (e.g. Betelgeuse East+West → Betelgeuse) and remaps wormhole destinations. Added getSectorData() fallback resolver for name mismatches (BL3961 vs "BL 3961", Wayaan vs Waayan, directional suffixes). Fixes "sd is undefined" crash when plotting routes through these sectors.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2211,6 +2212,40 @@ const SECTOR_DATA = {
      // loops now use getTerrainAP()).
      const terrainAP = { f: 5, e: 13, o: 18, g: 9, b: Infinity, v: 13, m: 11 };
      const parsedMap = {};
+
+     // >> Sector data resolver — resolves sub-sector and alternate-name lookups
+     // to their parent SECTOR_DATA entry.  static_ext.txt sometimes splits a
+     // single game sector into multiple grid fragments (e.g. "Betelgeuse_East"
+     // and "Betelgeuse_West") that share the same tile-ID range but have
+     // impassable walls between them.  It also uses slightly different name
+     // formatting ("BL3961" vs "BL 3961") and spellings ("Wayaan" vs
+     // "Waayan").  _resolveSectorName returns the canonical SECTOR_DATA key,
+     // or null.  getSectorData returns the {start, cols, rows} object.
+     const _SECTOR_NAME_ALIASES = {
+         'Wayaan': 'Waayan',
+         'Wayaan South': 'Waayan',
+     };
+     function _resolveSectorName(name) {
+         if (!name) return null;
+         let data;
+         try { data = SECTOR_DATA; } catch (e) { return null; }
+         if (!data) return null;
+         if (data[name]) return name;
+         if (_SECTOR_NAME_ALIASES[name] && data[_SECTOR_NAME_ALIASES[name]])
+             return _SECTOR_NAME_ALIASES[name];
+         const spaced = name.replace(/^([A-Za-z.-]+)(\d)/, '$1 $2');
+         if (spaced !== name && data[spaced]) return spaced;
+         const parent = name.replace(/ (East|West|North|South|Inner|NE|SE|NW|SW)$/, '');
+         if (parent !== name && data[parent]) return parent;
+         const parentSpaced = parent.replace(/^([A-Za-z.-]+)(\d)/, '$1 $2');
+         if (parentSpaced !== parent && data[parentSpaced]) return parentSpaced;
+         return null;
+     }
+     function getSectorData(name) {
+         const resolved = _resolveSectorName(name);
+         if (!resolved) return null;
+         try { return SECTOR_DATA[resolved]; } catch (e) { return null; }
+     }
     // --- 4. Main Execution Flow & Order of Operations ---
     const currentPath = window.location.pathname;
 
@@ -2681,20 +2716,87 @@ const SECTOR_DATA = {
             }
         }
 
+        // >> Merge sub-sectors into their parent sector.
+        // static_ext.txt splits some game sectors into multiple grid
+        // fragments (e.g. "Betelgeuse_East" + "Betelgeuse_West") that share
+        // the same tile-ID range.  The game shows the parent name ("Betelgeuse"),
+        // so parsedMap must have a single entry per parent.  We merge by
+        // overlaying each sub-sector's grid onto a full-size parent grid
+        // (non-'b' tiles win) and merging wormholes/beacons/starbases.
+        const toMerge = [];
+        for (const name in parsedMap) {
+            const resolved = _resolveSectorName(name);
+            if (resolved && resolved !== name) toMerge.push({ sub: name, parent: resolved });
+        }
+        for (const { sub, parent } of toMerge) {
+            const subSec = parsedMap[sub];
+            if (!subSec) continue;
+            const secInfo = getSectorData(parent);
+            if (!secInfo) continue;
+            if (!parsedMap[parent]) {
+                parsedMap[parent] = { grid: [], wormholes: {}, beacons: [], starbases: [] };
+            }
+            const par = parsedMap[parent];
+            const tRows = secInfo.rows, tCols = secInfo.cols;
+            while (par.grid.length < tRows) par.grid.push(new Array(tCols).fill('b'));
+            for (let i = 0; i < par.grid.length; i++) {
+                while (par.grid[i].length < tCols) par.grid[i].push('b');
+            }
+            for (let y = 0; y < subSec.grid.length && y < tRows; y++) {
+                for (let x = 0; x < subSec.grid[y].length && x < tCols; x++) {
+                    if (subSec.grid[y][x] !== 'b') par.grid[y][x] = subSec.grid[y][x];
+                }
+            }
+            for (const wd in subSec.wormholes) {
+                if (!par.wormholes[wd]) par.wormholes[wd] = subSec.wormholes[wd];
+            }
+            if (subSec.beacons) par.beacons.push(...subSec.beacons);
+            if (subSec.starbases) par.starbases.push(...subSec.starbases);
+            delete parsedMap[sub];
+        }
+        // Fix wormhole destinations that pointed to merged sub-sectors.
+        for (const secName in parsedMap) {
+            const sec = parsedMap[secName];
+            if (!sec.wormholes) continue;
+            const renames = [];
+            for (const wd in sec.wormholes) {
+                if (!parsedMap[wd]) {
+                    const resolved = _resolveSectorName(wd);
+                    if (resolved && parsedMap[resolved]) renames.push({ old: wd, nw: resolved });
+                }
+            }
+            for (const { old, nw } of renames) {
+                if (!sec.wormholes[nw]) sec.wormholes[nw] = sec.wormholes[old];
+                delete sec.wormholes[old];
+            }
+        }
+
         // Pad grids to match SECTOR_DATA rows (tile ID stride may exceed
         // the grid height in static_ext — missing rows are not in the file).
-        // Pad with 'f' (fuel, 5 AP) so tiles in missing rows are reachable.
-        let sd;
-        try { sd = SECTOR_DATA; } catch (e) { sd = null; }
-        if (sd) {
-            for (const name in parsedMap) {
-                const secInfo = sd[name];
-                if (!secInfo) continue;
-                const grid = parsedMap[name].grid;
-                const targetRows = secInfo.rows;
-                const cols = secInfo.cols;
+        // For full sectors with incomplete data, pad with 'f' (fuel) so tiles
+        // in missing rows are reachable.  For sub-sectors whose grid width
+        // differs from the parent's cols (e.g. "Pardus_West" is 37 wide but
+        // parent "Pardus" is 100), widen existing rows with 'b' (blocked)
+        // and pad missing rows with 'b' — those tiles belong to a different
+        // sub-region and must not be traversable.
+        for (const name in parsedMap) {
+            const secInfo = getSectorData(name);
+            if (!secInfo) continue;
+            const grid = parsedMap[name].grid;
+            const targetRows = secInfo.rows;
+            const targetCols = secInfo.cols;
+            if (grid.length === 0) continue;
+            const isSubSector = grid[0].length !== targetCols;
+            if (isSubSector) {
+                for (let i = 0; i < grid.length; i++) {
+                    while (grid[i].length < targetCols) grid[i].push('b');
+                }
                 while (grid.length < targetRows) {
-                    grid.push(new Array(cols).fill('f'));
+                    grid.push(new Array(targetCols).fill('b'));
+                }
+            } else {
+                while (grid.length < targetRows) {
+                    grid.push(new Array(targetCols).fill('f'));
                 }
             }
         }
@@ -2779,7 +2881,7 @@ const SECTOR_DATA = {
         let path = getSectorPath(sectorName, startX, startY, endX, endY);
         if (!path) return null;
         let sector = parsedMap[sectorName];
-        let secInfo = SECTOR_DATA[sectorName];
+        let secInfo = getSectorData(sectorName);
         let rows = secInfo ? secInfo.rows : sector.grid.length;
         let sectorStart = startTileId - (startX * rows + startY);
         let tileIds = path.map((p) => sectorStart + p.x * rows + p.y);
@@ -2805,10 +2907,7 @@ const SECTOR_DATA = {
     }
 
     function getLocalCoordsFromTileId(tileId, sectorName) {
-        let data;
-        try { data = SECTOR_DATA; } catch (e) { return null; }
-        if (!data) return null;
-        const sd = data[sectorName];
+        const sd = getSectorData(sectorName);
         if (!sd) return null;
         const offset = parseInt(tileId, 10) - sd.start;
         if (offset < 0 || offset >= sd.cols * sd.rows) return null;
@@ -3036,18 +3135,20 @@ const SECTOR_DATA = {
         for (const j of best.jumps) {
             const path = getSectorPath(curPos.sector, curPos.x, curPos.y, j.fromX, j.fromY);
             if (!path) return null;
-            const sd = SECTOR_DATA[curPos.sector];
+            const sd = getSectorData(curPos.sector);
             const rows = sd ? sd.rows : parsedMap[curPos.sector].grid.length;
-            const tileIds = path.map(p => sd.start + p.x * rows + p.y);
+            const sStart = sd ? sd.start : 0;
+            const tileIds = path.map(p => sStart + p.x * rows + p.y);
             legs.push({ sector: curPos.sector, path, tileIds });
             curPos = { sector: j.toSec, x: j.toX, y: j.toY };
         }
 
         const finalPath = getSectorPath(curPos.sector, curPos.x, curPos.y, toX, toY);
         if (!finalPath) return null;
-        const sd = SECTOR_DATA[curPos.sector];
+        const sd = getSectorData(curPos.sector);
         const rows = sd ? sd.rows : parsedMap[curPos.sector].grid.length;
-        const finalTileIds = finalPath.map(p => sd.start + p.x * rows + p.y);
+        const sStart = sd ? sd.start : 0;
+        const finalTileIds = finalPath.map(p => sStart + p.x * rows + p.y);
         legs.push({ sector: curPos.sector, path: finalPath, tileIds: finalTileIds });
 
         return { legs, totalAP: best.totalAP };
@@ -6872,7 +6973,7 @@ const SECTOR_DATA = {
         try { allSectors = Object.keys(SECTOR_DATA).sort(); } catch (e) { allSectors = []; }
 
         function updateSectorInfo() {
-            const sd = SECTOR_DATA[sectorSelect.value];
+            const sd = getSectorData(sectorSelect.value);
             if (sd) {
                 infoDiv.textContent = sectorSelect.value + ' \u00b7 ' + sd.cols + '\u00d7' + sd.rows +
                     ' (X:0-' + (sd.cols - 1) + ' Y:0-' + (sd.rows - 1) + ')';
@@ -6976,7 +7077,7 @@ const SECTOR_DATA = {
                 return;
             }
 
-            const sd = SECTOR_DATA[sector];
+            const sd = getSectorData(sector);
             if (sd && (tx < 0 || ty < 0 || tx >= sd.cols || ty >= sd.rows)) {
                 setStatus('Warning: [' + tx + ',' + ty + '] is out of bounds for ' + sector + ' (' + sd.cols + 'x' + sd.rows + ').', 'err');
             }
