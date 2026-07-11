@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.42
+// @version      6.43
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -21,6 +21,7 @@
 // @description  v6.40: Fix hub sweep overcounting — only count marginal action from hub-loaded supplies (not pre-existing cargo the ship could deliver without the detour), preventing the hub from winning when a far detour isn't worth it.
 // @description  v6.41: AP-efficiency guard — hub can't win when a factory with actual cargo drops has better linear action/AP ratio; prevents far hub detours that waste AP when nearby factories can be served with current cargo.
 // @description  v6.42: Starbase energy run no longer gets Infinity score — scored by energy items per AP (same exponent formula as factories/hub). Far starbases with low stock now lose to nearby factories instead of always winning.
+// @description  v6.43: FWE hub load fills entire hull with F/W in 123:84 ratio instead of tracker-clamped quantities — ship always carries max F/W to the starbase so the trip is worthwhile even if tracker data is stale.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -1315,11 +1316,19 @@
                 // will straighten their order/location as needed.
                 let evalRes = bestSbCandidate.eval;
                 let sbInfo = bestSbCandidate.sb;
-                // -- Step 1: load F/W at the hub.  Only load the shortfall
-                // (what the ship doesn't already carry) so a continuation of
-                // a previous FWE hub load doesn't double up or overflow.
-                let foodLoad = Math.max(0, evalRes.foodQty - (shipCargo['food'] || 0));
-                let waterLoad = Math.max(0, evalRes.waterQty - (shipCargo['water'] || 0));
+                // -- Step 1: load F/W at the hub in the 123:84 ratio to fill
+                // ALL available space.  We do NOT clamp by evalRes.foodQty /
+                // waterQty (tracker-projected starbase buy capacity) — those
+                // are conservative estimates for scoring only.  Loading the
+                // full hull ensures the trip is worthwhile even if tracker
+                // data is stale.  The runtime trade screen handles actual
+                // stock limits.
+                const FW_FOOD = 123, FW_WATER = 84, FW_SUM = FW_FOOD + FW_WATER;
+                let totalFWCap = (shipCargo['food'] || 0) + (shipCargo['water'] || 0) + shipSpace;
+                let desiredFood = Math.floor(totalFWCap * FW_FOOD / FW_SUM);
+                let desiredWater = totalFWCap - desiredFood;
+                let foodLoad = Math.max(0, desiredFood - (shipCargo['food'] || 0));
+                let waterLoad = Math.max(0, desiredWater - (shipCargo['water'] || 0));
                 if (foodLoad + waterLoad > shipSpace) {
                     let total = foodLoad + waterLoad;
                     if (total > 0 && shipSpace > 0) {
