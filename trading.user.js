@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.46
+// @version      6.49
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -25,6 +25,9 @@
 // @description  v6.44: FWE gate requires 80% hull capacity available for F/W — prevents starbase runs when the ship is mostly full of other cargo. Ship delivers its cargo first, then does FWE with a near-empty hull.
 // @description  v6.45: FWE override clearing phase — when energy demand requires a starbase run but the hull is full of other cargo, proactively delivers cargo to nearest demanding buildings and dumps leftovers at TO before firing FWE, instead of passively waiting.
 // @description  v6.46: Protect hydrogen fuel and phantom protection from being traded, stashed at TO, or cleared by FWE override — these permanent cargo items now occupy space without being treated as tradeable.
+// @description  v6.47: Monster guard for auto-fly — scans the nav screen for NPCs (navNpc class) before each jump and sidesteps around monsters blocking the path instead of flying into combat.
+// @description  v6.48: Auto-retreat from NPC ambushes — when a cloaked/hidden NPC ambushes during auto-fly, automatically retreats and resumes the flight, sidestepping the ambush tile. Toggle in control center.
+// @description  v6.49: Fly Here draggable panel — searchable sector list, plot path/AP cost preview (cross-sector via wormholes), and one-click auto-fly to any sector coordinate.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -32,6 +35,7 @@
 // @match        https://*.pardus.at/planet_trade.php*
 // @match        https://*.pardus.at/starbase_trade.php*
 // @match        https://*.pardus.at/building_management.php*
+// @match        https://*.pardus.at/ship2opponent_combat.php*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
@@ -2101,7 +2105,6 @@ const SECTOR_DATA = {
     } else if (currentPath === '/overview_buildings.php') {
         initBookkeeperParser();
     }
-
     if (GM_getValue('logistics_needs_recalc', false)) {
         GM_deleteValue('logistics_needs_recalc');
         let sectorState = GM_getValue('raw_bookkeeper_data', []);
@@ -2111,6 +2114,10 @@ const SECTOR_DATA = {
     if (currentPath === '/main.php') {
         injectNavHUD();
         injectDraggableUI();
+        try { injectFlyHerePanel(); }
+        catch (e) { console.error('[pardus-flyhere] panel inject failed:', e); }
+        try { resumeFlightAfterAmbush(); }
+        catch (e) { console.error('[pardus-ambush] resume failed:', e); }
         try { injectExportsCalculator(); }
         catch (e) { console.error('[pardus-exports] panel inject failed:', e); }
         try { injectTrackerPanel(); }
@@ -2137,6 +2144,18 @@ const SECTOR_DATA = {
             } catch (e) {
                 console.error('[pardus-tracker] capture/badge failed:', e);
             }
+        }
+    } else if (currentPath.includes('ship2opponent_combat.php')) {
+        if (GM_getValue('config_auto_retreat', true) && GM_getValue('logistics_ambush_resume', null)) {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed; top:0; left:0; width:100%; background:#550000; color:#fff; text-align:center; padding:6px; z-index:999999; font-weight:bold; font-size:13px; border-bottom:2px solid #ff0000;';
+            overlay.innerText = '\u26a0 Ambush during auto-fly \u2014 auto-retreating...';
+            document.body.appendChild(overlay);
+            setTimeout(() => {
+                const retreatBtn = document.getElementsByName('retreat')[0];
+                if (retreatBtn) retreatBtn.click();
+                else { overlay.innerText = '\u26a0 Retreat button not found \u2014 retreat manually.'; setTimeout(() => overlay.remove(), 5000); }
+            }, 500);
         }
     }
 
@@ -2237,6 +2256,7 @@ const SECTOR_DATA = {
         let savedMinTrade = GM_getValue('config_min_trade', '25');
         let savedExports = GM_getValue('config_export_items', '');
         let savedLiveCargo = GM_getValue('logistics_live_cargo', '');
+        let savedAutoRetreat = GM_getValue('config_auto_retreat', true);
 
         const activeData = GM_getValue('logistics_route_v5', { steps: [], toInventory: {}, history: [] });
         const safeSteps = activeData.steps || [];
@@ -2343,8 +2363,12 @@ const SECTOR_DATA = {
                     </div>
                 </div>
 
+                <div style="display: flex; align-items: center; gap: 4px; margin-top: 2px;">
+                    <input type="checkbox" id="nav-auto-retreat" ${savedAutoRetreat ? 'checked' : ''} style="cursor: pointer;">
+                    <label for="nav-auto-retreat" style="color: #88ccff; font-size: 10px; cursor: pointer;" title="Auto-retreat when ambushed by cloaked/hidden NPCs during auto-fly, then resume the flight.">Auto-retreat from ambush</label>
+                </div>
+
                 <div style="display: flex; justify-content: space-between;">
-                    <label>Hub Coords:</label>
                     <input type="text" id="nav-hub-coords" value="${savedHubCoords}" style="width: 50px; background: #111; color: #0f0; border: 1px solid #444;">
                 </div>
 
@@ -2450,6 +2474,13 @@ const SECTOR_DATA = {
             const disp = document.getElementById('nav-full-route-display');
             disp.style.display = disp.style.display === 'none' ? 'block' : 'none';
         });
+
+        const autoRetreatChk = document.getElementById('nav-auto-retreat');
+        if (autoRetreatChk) {
+            autoRetreatChk.addEventListener('change', (e) => {
+                GM_setValue('config_auto_retreat', e.target.checked);
+            });
+        }
 
         document.getElementById('nav-btn-sim').addEventListener('click', () => {
             GM_setValue('config_hub_coords', normalizeCoords(document.getElementById('nav-hub-coords').value));
@@ -2873,7 +2904,79 @@ const SECTOR_DATA = {
 
     // --- 9. Rich Nav HUD ---
 
+    // >> Ambush recovery state (module-level, survives across flyToCoords calls)
+    // knownAmbushTiles — tile IDs where cloaked/hidden NPCs ambushed us.
+    // resumingAfterAmbush — flag so flyToCoords doesn't clear ambush tiles on resume.
+    let knownAmbushTiles = new Set();
+    let resumingAfterAmbush = false;
+
+    function resumeFlightAfterAmbush() {
+        const saved = GM_getValue('logistics_ambush_resume', null);
+        if (!saved) return;
+        if (Date.now() - saved.timestamp > 5 * 60 * 1000) {
+            GM_deleteValue('logistics_ambush_resume');
+            return;
+        }
+        GM_deleteValue('logistics_ambush_resume');
+        if (saved.ambushTileId != null) {
+            knownAmbushTiles.add(saved.ambushTileId);
+        }
+        resumingAfterAmbush = true;
+        const ov = document.createElement('div');
+        ov.style.cssText = 'position:fixed; top:0; left:0; width:100%; background:#003355; color:#fff; text-align:center; padding:6px; z-index:999999; font-weight:bold; font-size:13px; border-bottom:2px solid #0088ff;';
+        ov.innerText = '\u2708 Resuming flight to ' + saved.destLabel + ' (avoiding ambush tile)...';
+        document.body.appendChild(ov);
+        setTimeout(() => ov.remove(), 3000);
+        setTimeout(() => {
+            flyToCoords(saved.target, saved.destLabel);
+        }, 500);
+    }
+
+    // >> Monster sidestep helpers
+    // The Pardus nav screen is an 11×11 grid (tdNavField0 … tdNavField120).
+    // The player is at the centre — tdNavField60 (row 5, col 5).
+    // Monsters / NPCs appear with class "navNpc" on the <td>.
+    // Tile IDs are embedded in the <a onclick="navAjax(tileId)"> attribute.
+
+    function scanNavForMonsters() {
+        const monsters = new Set();
+        for (let i = 0; i <= 120; i++) {
+            const td = document.getElementById('tdNavField' + i);
+            if (td && td.classList.contains('navNpc')) {
+                const a = td.querySelector('a');
+                if (a) {
+                    const m = (a.getAttribute('onclick') || '').match(/\d+/);
+                    if (m) monsters.add(parseInt(m[0], 10));
+                }
+            }
+        }
+        return monsters;
+    }
+
+    function getNavTileIdAt(dx, dy) {
+        const navIdx = 60 + dy * 11 + dx;
+        if (navIdx < 0 || navIdx > 120) return null;
+        const td = document.getElementById('tdNavField' + navIdx);
+        if (!td) return null;
+        const a = td.querySelector('a');
+        if (!a) return null;
+        const m = (a.getAttribute('onclick') || '').match(/\d+/);
+        return m ? parseInt(m[0], 10) : null;
+    }
+
+    function isNavTileClear(dx, dy) {
+        const navIdx = 60 + dy * 11 + dx;
+        if (navIdx < 0 || navIdx > 120) return false;
+        const td = document.getElementById('tdNavField' + navIdx);
+        return !!td && !td.classList.contains('navNpc');
+    }
+
     function flyToCoords(target, destLabel, onArrive) {
+        if (!resumingAfterAmbush) {
+            knownAmbushTiles.clear();
+        }
+        resumingAfterAmbush = false;
+        GM_deleteValue('logistics_ambush_resume');
         const tx = target.x, ty = target.y;
         const targetSector = target.sector || null;
         const coordsEl = document.getElementById('coords');
@@ -3033,12 +3136,95 @@ const SECTOR_DATA = {
                 return;
             }
 
+            // >> Monster guard — scan nav screen and sidestep if blocked
+            const monsterSet = scanNavForMonsters();
+            for (const at of knownAmbushTiles) { monsterSet.add(at); }
+            if (monsterSet.size > 0) {
+                for (let j = idx + 1; j <= targetIdx; j++) {
+                    if (monsterSet.has(tileIds[j])) {
+                        targetIdx = j - 1;
+                        break;
+                    }
+                }
+            }
+
+            if (targetIdx === idx) {
+                // Monster is on the very next tile — sidestep around it.
+                if (idx + 1 >= tileIds.length) {
+                    fail('\u26a0 Monster at destination. Stopping \u2014 fly manually.');
+                    return;
+                }
+
+                const perpOptions = [[-dirY, dirX], [dirY, -dirX]];
+                let sidestepped = false;
+
+                const moveAndWait = (tileId, afterMs, onSuccess, onFailMsg) => {
+                    GM_setValue('logistics_ambush_resume', {
+                        target: { x: tx, y: ty, sector: targetSector },
+                        destLabel: destLabel,
+                        ambushTileId: tileId,
+                        timestamp: Date.now()
+                    });
+                    const before = currentTileId();
+                    try { navFn(tileId); } catch (e) { GM_deleteValue('logistics_ambush_resume'); fail('\u26a0 nav() threw during sidestep: ' + e.message); return; }
+                    const dl = Date.now() + 6000;
+                    (function wait() {
+                        if (currentTileId() !== before) { GM_deleteValue('logistics_ambush_resume'); setTimeout(onSuccess, afterMs); return; }
+                        if (Date.now() > dl) { GM_deleteValue('logistics_ambush_resume'); fail(onFailMsg); return; }
+                        setTimeout(wait, 100);
+                    })();
+                };
+
+                for (const [pDx, pDy] of perpOptions) {
+                    if (!isNavTileClear(pDx, pDy)) continue;
+                    const sidestepId = getNavTileIdAt(pDx, pDy);
+                    if (!sidestepId) continue;
+                    sidestepped = true;
+                    const dirName = pDx > 0 ? 'east' : pDx < 0 ? 'west' : pDy > 0 ? 'south' : 'north';
+                    setOverlay('\u26a0 Monster in path \u2014 sidestepping ' + dirName + '...');
+
+                    moveAndWait(sidestepId, 150, () => {
+                        if (!isNavTileClear(dirX, dirY) || !isNavTileClear(dirX * 2, dirY * 2)) {
+                            fail('\u26a0 Another monster on sidestep forward path. Stopping.');
+                            return;
+                        }
+                        const fwdId = getNavTileIdAt(dirX * 2, dirY * 2);
+                        if (!fwdId) { fail('\u26a0 Cannot find forward tile after sidestep. Stopping.'); return; }
+                        setOverlay('\u26a0 Sidestep done \u2014 moving forward past monster...');
+
+                        moveAndWait(fwdId, 150, () => {
+                            const backId = getNavTileIdAt(-pDx, -pDy);
+                            if (!backId) { fail('\u26a0 Cannot find path-rejoin tile. Stopping.'); return; }
+                            setOverlay('\u26a0 Rejoining original path...');
+
+                            moveAndWait(backId, 150, () => {
+                                setOverlay('\u2708 Monster avoided \u2014 resuming flight to ' + destLabel + '...');
+                                flyNext();
+                            }, '\u26a0 Rejoin move did not complete. Stopping.');
+                        }, '\u26a0 Forward move after sidestep did not complete. Stopping.');
+                    }, '\u26a0 Sidestep move did not complete. Stopping.');
+                    break;
+                }
+
+                if (!sidestepped) {
+                    fail('\u26a0 Monster directly ahead and no sidestep tile available. Stopping \u2014 fly manually.');
+                }
+                return;
+            }
+
             const legInfo = legs.length > 1 ? ` (leg ${legIdx + 1}/${legs.length}, ${leg.sector})` : '';
             setOverlay(`\u2708 Flying to ${destLabel}${legInfo} (${tileIds.length - idx - 1} tiles left, jumping ${targetIdx - idx})...`);
             const beforeId = curId;
+            GM_setValue('logistics_ambush_resume', {
+                target: { x: tx, y: ty, sector: targetSector },
+                destLabel: destLabel,
+                ambushTileId: targetId,
+                timestamp: Date.now()
+            });
             try {
                 navFn(targetId);
             } catch (e) {
+                GM_deleteValue('logistics_ambush_resume');
                 fail(`\u26a0 nav() threw: ${e.message}. Stopping.`);
                 return;
             }
@@ -3046,10 +3232,12 @@ const SECTOR_DATA = {
             const deadline = Date.now() + 6000;
             (function waitForMove() {
                 if (currentTileId() !== beforeId) {
+                    GM_deleteValue('logistics_ambush_resume');
                     setTimeout(flyNext, 150);
                     return;
                 }
                 if (Date.now() > deadline) {
+                    GM_deleteValue('logistics_ambush_resume');
                     fail(`\u26a0 Nav did not update after moving to tile ${targetId}. Stopping.`);
                     return;
                 }
@@ -6340,3 +6528,295 @@ const SECTOR_DATA = {
 
     runCheck(false);
 })();
+    // --- 20. Fly Here Draggable Panel ---
+
+    function injectFlyHerePanel() {
+        const uiPos = GM_getValue('flyhere_ui_pos', { top: '50px', right: '6px' });
+
+        const wrap = document.createElement('div');
+        wrap.id = 'pardus-flyhere-panel';
+        wrap.style.cssText = [
+            'position:absolute',
+            'top:' + uiPos.top,
+            (uiPos.left != null ? 'left:' + uiPos.left : 'right:' + (uiPos.right || '6px')),
+            'width:260px',
+            'background-color:#00001C',
+            'border:1px solid #0088ff',
+            'font-family:Verdana,sans-serif',
+            'font-size:10px',
+            'color:#ccc',
+            'z-index:9998',
+            'box-shadow:2px 2px 10px rgba(0,0,0,0.8)'
+        ].join(';');
+
+        const header = document.createElement('div');
+        header.style.cssText = 'background:#003355;padding:5px 7px;cursor:move;font-weight:bold;color:#88ccff;border-bottom:1px solid #0088ff;user-select:none;display:flex;justify-content:space-between;align-items:center;';
+        header.innerHTML = '<span>\u2708 Fly Here</span><span id="flyhere-min-btn" style="cursor:pointer;color:#88ccff;">[-]</span>';
+        wrap.appendChild(header);
+
+        const body = document.createElement('div');
+        body.id = 'flyhere-body';
+        body.style.cssText = 'padding:6px 7px;display:flex;flex-direction:column;gap:5px;';
+        wrap.appendChild(body);
+
+        // >> Search input — filters the sector list as you type.
+        const searchInput = document.createElement('input');
+        searchInput.type = 'text';
+        searchInput.placeholder = 'search sectors...';
+        searchInput.style.cssText = 'width:100%;box-sizing:border-box;background:#111;color:#88ccff;border:1px solid #0088ff;font-size:10px;padding:2px 4px;';
+        body.appendChild(searchInput);
+
+        // >> Sector list (filtered listbox). A size=8 select gives a
+        // scrollable, searchable list of all ~250 sectors from SECTOR_DATA.
+        const sectorSelect = document.createElement('select');
+        sectorSelect.size = 8;
+        sectorSelect.style.cssText = 'width:100%;box-sizing:border-box;background:#111;color:#88ccff;border:1px solid #0088ff;font-size:10px;padding:2px;';
+        body.appendChild(sectorSelect);
+
+        // >> Sector info — shows selected sector's grid dimensions and the
+        // valid X/Y coord range so the user knows what coordinates to enter.
+        const infoDiv = document.createElement('div');
+        infoDiv.style.cssText = 'color:#666;font-size:9px;min-height:12px;';
+        body.appendChild(infoDiv);
+
+        // >> Coord inputs — separate X / Y number fields (clearer than a
+        // single "[x,y]" text field and matches the panel's form style).
+        const coordRow = document.createElement('div');
+        coordRow.style.cssText = 'display:flex;gap:4px;align-items:center;';
+        const xLabel = document.createElement('label');
+        xLabel.style.cssText = 'color:#aaa;width:14px;';
+        xLabel.textContent = 'X';
+        coordRow.appendChild(xLabel);
+        const xInput = document.createElement('input');
+        xInput.type = 'number';
+        xInput.min = '0';
+        xInput.style.cssText = 'width:55px;background:#111;color:#0f0;border:1px solid #444;font-size:10px;padding:2px;';
+        coordRow.appendChild(xInput);
+        const yLabel = document.createElement('label');
+        yLabel.style.cssText = 'color:#aaa;width:14px;margin-left:6px;';
+        yLabel.textContent = 'Y';
+        coordRow.appendChild(yLabel);
+        const yInput = document.createElement('input');
+        yInput.type = 'number';
+        yInput.min = '0';
+        yInput.style.cssText = 'width:55px;background:#111;color:#0f0;border:1px solid #444;font-size:10px;padding:2px;';
+        coordRow.appendChild(yInput);
+        body.appendChild(coordRow);
+
+        // >> Status display — shows the plotted path summary or errors.
+        const statusDiv = document.createElement('div');
+        statusDiv.style.cssText = 'color:#aaa;font-size:9px;min-height:26px;padding:3px;border:1px dashed #222;line-height:1.4;';
+        body.appendChild(statusDiv);
+
+        // >> Buttons: Plot Path & AP  +  Fly
+        const btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;gap:4px;';
+        const plotBtn = document.createElement('button');
+        plotBtn.type = 'button';
+        plotBtn.textContent = 'Plot Path & AP';
+        plotBtn.style.cssText = 'flex:1;cursor:pointer;font-size:10px;background:#332200;color:#ffaa55;border:1px solid #aa7744;padding:4px;';
+        const flyBtn = document.createElement('button');
+        flyBtn.type = 'button';
+        flyBtn.textContent = '\u2708 Fly';
+        flyBtn.disabled = true;
+        flyBtn.style.cssText = 'flex:1;cursor:pointer;font-size:10px;background:#003300;color:#88ff88;border:1px solid #0f0;padding:4px;opacity:0.5;';
+        btnRow.appendChild(plotBtn);
+        btnRow.appendChild(flyBtn);
+        body.appendChild(btnRow);
+
+        // >> Sector list population & filtering
+        let allSectors = [];
+        try { allSectors = Object.keys(SECTOR_DATA).sort(); } catch (e) { allSectors = []; }
+
+        function updateSectorInfo() {
+            const sd = SECTOR_DATA[sectorSelect.value];
+            if (sd) {
+                infoDiv.textContent = sectorSelect.value + ' \u00b7 ' + sd.cols + '\u00d7' + sd.rows +
+                    ' (X:0-' + (sd.cols - 1) + ' Y:0-' + (sd.rows - 1) + ')';
+            } else {
+                infoDiv.textContent = '';
+            }
+        }
+
+        function rebuildSectorList(filter) {
+            const f = (filter || '').toLowerCase().trim();
+            const prev = sectorSelect.value;
+            sectorSelect.innerHTML = '';
+            let count = 0;
+            for (const name of allSectors) {
+                if (f && !name.toLowerCase().includes(f)) continue;
+                const opt = document.createElement('option');
+                opt.value = name;
+                opt.textContent = name;
+                sectorSelect.appendChild(opt);
+                count++;
+            }
+            // Preserve the previous selection if it survived the filter.
+            if (prev && Array.from(sectorSelect.options).some(o => o.value === prev)) {
+                sectorSelect.value = prev;
+            }
+            if (!sectorSelect.value && count > 0) {
+                sectorSelect.selectedIndex = 0;
+            }
+            updateSectorInfo();
+        }
+
+        searchInput.addEventListener('input', () => rebuildSectorList(searchInput.value));
+        sectorSelect.addEventListener('change', updateSectorInfo);
+
+        // >> Restore saved state / pre-select current sector.
+        let savedSector = GM_getValue('flyhere_sector', '');
+        let savedX = GM_getValue('flyhere_x', '');
+        let savedY = GM_getValue('flyhere_y', '');
+        let curSectorName = null;
+        try {
+            const sel = document.getElementById('sector');
+            if (sel) curSectorName = sel.textContent.trim();
+        } catch (e) {}
+        rebuildSectorList('');
+        const initialSector = (curSectorName && allSectors.indexOf(curSectorName) >= 0)
+            ? curSectorName
+            : (savedSector && allSectors.indexOf(savedSector) >= 0 ? savedSector : (allSectors[0] || ''));
+        if (initialSector) sectorSelect.value = initialSector;
+        if (savedX !== '') xInput.value = savedX;
+        if (savedY !== '') yInput.value = savedY;
+        updateSectorInfo();
+
+        // >> Current-position reader (mirrors the nav reading in flyToCoords).
+        function getCurrentNavPosition() {
+            const coordsEl = document.getElementById('coords');
+            const sectorEl = document.getElementById('sector');
+            const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+            if (!coordsEl || !sectorEl) return null;
+            if (w.userloc === undefined || w.userloc === null) return null;
+            const cur = parseCoords(coordsEl.innerText);
+            const sectorName = sectorEl.textContent.trim();
+            const startTileId = parseInt(w.userloc.toString(), 10);
+            if (isNaN(startTileId)) return null;
+            return { x: cur.x, y: cur.y, sector: sectorName, tileId: startTileId };
+        }
+
+        function setStatus(text, kind) {
+            statusDiv.textContent = text;
+            statusDiv.style.color = kind === 'err' ? '#ff5555' : (kind === 'ok' ? '#88ff88' : '#aaa');
+        }
+
+        let pendingTarget = null;
+
+        function setFlyEnabled(on) {
+            flyBtn.disabled = !on;
+            flyBtn.style.opacity = on ? '1' : '0.5';
+        }
+
+        // >> Plot Path & AP Cost
+        // Uses getCrossSectorRoute which handles both same-sector (single
+        // leg via local Dijkstra) and cross-sector (multi-leg via wormholes)
+        // routing. Displays the total AP cost and wormhole-jump count so the
+        // user can confirm the path before committing to the flight.
+        plotBtn.addEventListener('click', () => {
+            const pos = getCurrentNavPosition();
+            if (!pos) { setStatus('Cannot read current position from the nav screen.', 'err'); return; }
+            const sector = sectorSelect.value;
+            const tx = parseInt(xInput.value, 10);
+            const ty = parseInt(yInput.value, 10);
+            if (!sector) { setStatus('Select a sector from the list.', 'err'); return; }
+            if (isNaN(tx) || isNaN(ty)) { setStatus('Enter valid X and Y coordinates.', 'err'); return; }
+
+            GM_setValue('flyhere_sector', sector);
+            GM_setValue('flyhere_x', String(tx));
+            GM_setValue('flyhere_y', String(ty));
+
+            if (!parseStaticMap(true)) {
+                setStatus('No sector map data in localStorage. Load static_ext.txt first.', 'err');
+                setFlyEnabled(false);
+                pendingTarget = null;
+                return;
+            }
+
+            const sd = SECTOR_DATA[sector];
+            if (sd && (tx < 0 || ty < 0 || tx >= sd.cols || ty >= sd.rows)) {
+                setStatus('Warning: [' + tx + ',' + ty + '] is out of bounds for ' + sector + ' (' + sd.cols + 'x' + sd.rows + ').', 'err');
+            }
+
+            const route = getCrossSectorRoute(pos.sector, pos.tileId, pos.x, pos.y, sector, tx, ty);
+            if (!route) {
+                setStatus('No path found from ' + pos.sector + ' [' + pos.x + ',' + pos.y + '] to ' + sector + ' [' + tx + ',' + ty + '].', 'err');
+                setFlyEnabled(false);
+                pendingTarget = null;
+                return;
+            }
+
+            const legs = route.legs.length;
+            const jumps = legs - 1;
+            const legTxt = legs === 1
+                ? 'same sector'
+                : jumps + ' wormhole jump(s), ' + legs + ' legs';
+            const fromTxt = (pos.sector === sector) ? '' : ('from ' + pos.sector + ' ');
+            setStatus(fromTxt + '\u2192 ' + sector + ' [' + tx + ',' + ty + ']: ' + legTxt + ' \u00b7 ' + route.totalAP + ' AP', 'ok');
+
+            pendingTarget = { x: tx, y: ty, sector: sector, label: sector + ' [' + tx + ',' + ty + ']' };
+            setFlyEnabled(true);
+        });
+
+        // >> Fly — delegates to flyToCoords (rich nav HUD), which reads the
+        // current position itself, builds the route, and drives navAjax one
+        // tile at a time with monster/ambush guards. The plot above is only a
+        // preview; flyToCoords recomputes the path at flight time so it stays
+        // correct even if the ship moved since plotting.
+        flyBtn.addEventListener('click', () => {
+            if (!pendingTarget) { setStatus('Plot a path first.', 'err'); return; }
+            setFlyEnabled(false);
+            setStatus('Flying to ' + pendingTarget.label + '...', 'ok');
+            const target = pendingTarget;
+            flyToCoords(
+                { x: target.x, y: target.y, sector: target.sector },
+                target.label,
+                (arrived) => {
+                    setFlyEnabled(true);
+                    setStatus(arrived ? 'Arrived at ' + target.label + '.' : 'Flight stopped.', arrived ? 'ok' : 'err');
+                }
+            );
+        });
+
+        // >> Drag logic (header drag to move; click without drag to do nothing)
+        let isDragging = false, dragMoved = false, startX = 0, startY = 0, initialX = 0, initialY = 0;
+        header.addEventListener('mousedown', (e) => {
+            if (e.target.id === 'flyhere-min-btn') return;
+            isDragging = true;
+            dragMoved = false;
+            startX = e.clientX; startY = e.clientY;
+            initialX = wrap.offsetLeft; initialY = wrap.offsetTop;
+            e.preventDefault();
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const dx = e.clientX - startX, dy = e.clientY - startY;
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMoved = true;
+            wrap.style.left = (initialX + dx) + 'px';
+            wrap.style.top = (initialY + dy) + 'px';
+            wrap.style.right = 'auto';
+        });
+        document.addEventListener('mouseup', () => {
+            if (!isDragging) return;
+            isDragging = false;
+            if (dragMoved) {
+                GM_setValue('flyhere_ui_pos', { top: wrap.style.top, left: wrap.style.left });
+            }
+        });
+
+        // >> Minimize / expand
+        document.getElementById('flyhere-min-btn').addEventListener('click', () => {
+            const minBtn = document.getElementById('flyhere-min-btn');
+            if (body.style.display === 'none') {
+                body.style.display = 'flex';
+                minBtn.textContent = '[-]';
+            } else {
+                body.style.display = 'none';
+                minBtn.textContent = '[+]';
+            }
+        });
+
+        const mount = document.body || document.documentElement;
+        if (mount) mount.appendChild(wrap);
+        console.log('[pardus-flyhere] panel injected on', window.location.pathname);
+    }
