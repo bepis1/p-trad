@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.41
+// @version      6.42
 // @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
 // @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
 // @description  v6.26: Version bump to test the auto-update flow.
@@ -20,6 +20,7 @@
 // @description  v6.39: Hub reload now uses sweep lookahead scoring — always evaluates hub as candidate and scores by the full multi-factory sweep it enables, eliminating trailing microtrips from late partial reloads.
 // @description  v6.40: Fix hub sweep overcounting — only count marginal action from hub-loaded supplies (not pre-existing cargo the ship could deliver without the detour), preventing the hub from winning when a far detour isn't worth it.
 // @description  v6.41: AP-efficiency guard — hub can't win when a factory with actual cargo drops has better linear action/AP ratio; prevents far hub detours that waste AP when nearby factories can be served with current cargo.
+// @description  v6.42: Starbase energy run no longer gets Infinity score — scored by energy items per AP (same exponent formula as factories/hub). Far starbases with low stock now lose to nearby factories instead of always winning.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -1135,40 +1136,40 @@
                                         simDijCache, simCrossCache, maxC
                                     );
                                     if (!fweEval || !fweEval.feasible) continue;
-                                    if (!bestInSec || (fweEval.ratio != null && (bestInSec.eval.ratio == null || fweEval.ratio > bestInSec.eval.ratio))) {
-                                        bestInSec = { sb: s, eval: fweEval };
+                                    let metric = fweEval.energyQty / (fweEval.oneWayAp + 10);
+                                    if (!bestInSec || metric > bestInSec.metric) {
+                                        bestInSec = { sb: s, eval: fweEval, metric: metric };
                                     }
                                 }
                                 if (bestInSec) bestSbPerSector[sec] = bestInSec;
                             }
 
-                            // Pick the overall-best starbase. Score by
-                            // profit/AP (the *real* credit metric the user
-                            // asked for). We scale it into the volume-based
-                            // scoring universe via an assumed per-unit
-                            // credit density (see CROSS_VOLUME_EQUIV below)
-                            // so it competes fairly with hub/TO/factory
-                            // candidates in bestScore. The chosen starbase
-                            // is stored in bestSbChoice for the executor
-                            // block at the bottom of the loop.
+                            // Pick the overall-best starbase by energy items
+                            // per AP (one-way travel + 2 trade actions).  This
+                            // is the same volume-per-AP principle used for
+                            // factory and hub candidates: a close starbase
+                            // with lots of stock wins; a far starbase with
+                            // little stock loses to nearby factories.
                             let bestSbChoice = null;
+                            let bestSbMetric = -1;
                             for (let sec in bestSbPerSector) {
                                 let cand = bestSbPerSector[sec];
                                 if (!cand) continue;
-                                if (!bestSbChoice || (cand.eval.ratio != null && (bestSbChoice.eval.ratio == null || cand.eval.ratio > bestSbChoice.eval.ratio))) {
+                                if (cand.metric > bestSbMetric) {
+                                    bestSbMetric = cand.metric;
                                     bestSbChoice = cand;
                                 }
                             }
 
                             if (bestSbChoice) {
-                                // FWE only fires for a full-cargo run.  Since
-                                // fweNeeded already requires unmetEnergy >= maxC
-                                // and energyQty <= maxC, this branch is always
-                                // taken; the starbase gets Infinity score so it
-                                // always wins over hub/TO/factory candidates.
-                                bestSbCandidate = bestSbChoice;
-                                bestScore = Infinity;
-                                destinationType = "starbase";
+                                let sbAction = bestSbChoice.eval.energyQty;
+                                let sbAP = bestSbChoice.eval.oneWayAp + 10;
+                                let sbScore = Math.pow(sbAction, 1.5) / Math.pow(sbAP, 1.2);
+                                if (sbScore > bestScore) {
+                                    bestSbCandidate = bestSbChoice;
+                                    bestScore = sbScore;
+                                    destinationType = "starbase";
+                                }
                             }
                         }
                     }
