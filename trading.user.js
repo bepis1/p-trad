@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.74
+// @version      6.75
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.70: Active run pinning — clicking a route in Opps pins it as an active run that persists across recalculates and tab switches, so the buyer location stays visible after you've bought the item. Clear manually when done.
 // @description  v6.71: Fix exports tab blank (undefined html var) — exports body was empty because sumHtml was built but never rendered. Opps tab no longer auto-computes on first open — shows placeholder until Recalculate is pressed.
 // @description  v6.72: Min cr/AP filter for Opps — input field sets a profit-per-AP floor. Low-profit pairs are skipped before AP pathfinding (pre-filter: profit/TRADE_AP < threshold), and remaining routes are post-filtered by actual cr/AP. Cuts computation and clutter.
 // @description  v6.73: Return exports in active run bar — shows the top 2 profitable commodities in the reverse direction (B→A), so you can see at a glance what's worth bringing back for a second run.
 // @description  v6.74: Return exports now shows combined cr/AP instead of per-item credit profit — cleaner single-value display of reverse-direction profitability.
+// @description  v6.75: Batch analysis in active run bar — shows how many full-hull trips possible before seller stock, buyer credits, or buyer room runs out. Return exports now list item names instead of just count.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3032,6 +3032,7 @@ const SECTOR_DATA = {
 
                     routes.push({
                         item: ci.name,
+                        resId: resId,
                         seller: seller.entry,
                         buyer: buyer.entry,
                         sellerCoords: seller.coords,
@@ -3213,11 +3214,13 @@ const SECTOR_DATA = {
                     Asector: A.sector,
                     Bsector: B.sector,
                     fwdItem: bestFwd.name,
+                    fwdResId: bestFwd.resId,
                     fwdQty: bestFwd.qty,
                     fwdProfit: bestFwd.profit,
                     fwdBuyPerUnit: bestFwd.buyPerUnit,
                     fwdSellPerUnit: bestFwd.sellPerUnit,
                     retItem: bestRet.name,
+                    retResId: bestRet.resId,
                     retQty: bestRet.qty,
                     retProfit: bestRet.profit,
                     retBuyPerUnit: bestRet.buyPerUnit,
@@ -3272,6 +3275,7 @@ const SECTOR_DATA = {
             if (profit <= 0) continue;
             results.push({
                 item: fc.name,
+                resId: resId,
                 qty: q,
                 profit: profit,
                 buyPerUnit: fb.perUnitAvg,
@@ -3280,6 +3284,50 @@ const SECTOR_DATA = {
         }
         results.sort((a, b) => b.profit - a.profit);
         return results;
+    }
+
+    // >> Opportunities: batch limit analysis
+    //
+    // Computes how many full-hull (maxCargo) batches are possible for a
+    // single trade leg (buy at seller, sell at buyer), limited by three
+    // constraints:
+    //   1. Seller stock  — buyable units (stock - min) before seller runs out
+    //   2. Buyer credits — how many batches buyer can pay for before money pool empties
+    //   3. Buyer room    — free space + per-commodity max capacity at buyer
+    //
+    // Returns { batches, limits: { stk, cr, room }, bottleneck }.
+    // Unknown constraints are omitted from limits; batches = min of known values.
+    function computeBatchLimits(sellerEntry, buyerEntry, resId, maxCargo, sellRevPerBatch) {
+        const limits = {};
+
+        if (sellerEntry && sellerEntry.commodities && sellerEntry.commodities[resId]) {
+            const sc = sellerEntry.commodities[resId];
+            const buyable = Math.max(0, sc.stock - (sc.min || 0));
+            limits.stk = Math.floor(buyable / maxCargo);
+        }
+
+        if (buyerEntry && buyerEntry.credits != null && sellRevPerBatch > 0) {
+            limits.cr = Math.floor(buyerEntry.credits / sellRevPerBatch);
+        }
+
+        if (buyerEntry && buyerEntry.commodities && buyerEntry.commodities[resId]) {
+            const bc = buyerEntry.commodities[resId];
+            const stackRoom = (bc.max > 0) ? Math.max(0, bc.max - bc.stock) : Infinity;
+            const spaceRoom = (buyerEntry.type === 'planet' || buyerEntry.freeSpace == null || buyerEntry.freeSpace === Infinity)
+                ? Infinity : Math.max(0, buyerEntry.freeSpace);
+            const room = Math.min(stackRoom, spaceRoom);
+            limits.room = (room === Infinity) ? Infinity : Math.floor(room / maxCargo);
+        }
+
+        const finite = Object.values(limits).filter(function(v) { return v !== Infinity; });
+        const batches = finite.length > 0 ? Math.min.apply(null, finite) : null;
+        let bottleneck = null;
+        if (batches != null) {
+            for (const key in limits) {
+                if (limits[key] === batches) { bottleneck = key; break; }
+            }
+        }
+        return { batches: batches, limits: limits, bottleneck: bottleneck };
     }
 
     function fmtCr(n) {
@@ -3713,11 +3761,44 @@ const SECTOR_DATA = {
                 inner += '<div style="color:#888;font-size:8px;margin-top:1px;">Fwd: ' + run.fwdQty + ' ' + run.fwdItem + ' (+' + fmtCr(run.fwdProfit) + ') \u00b7 Ret: ' + run.retQty + ' ' + run.retItem + ' (+' + fmtCr(run.retProfit) + ') \u00b7 Total: ' + fmtCr(run.profit) + ' cr</div>';
             }
 
-            // Return exports: top 2 profitable commodities in the reverse direction
-            // (B→A for one-way, B→A for two-way). Helps decide if a return trip
-            // is worthwhile. Looks up entries by userloc from the tracker store.
+            // Batch analysis: how many full-hull trips before a constraint runs out.
+            // Limited by seller stock, buyer credits (money pool), and buyer room.
             const maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
             const store = getTrackerStore();
+
+            if (run.subTab === 'oneway' && run.sellerLoc != null && run.buyerLoc != null && run.resId != null) {
+                const sellerEntry = store[String(run.sellerLoc)];
+                const buyerEntry = store[String(run.buyerLoc)];
+                const sellRevPerBatch = (run.sellPerUnit || 0) * maxCargo;
+                const bl = computeBatchLimits(sellerEntry, buyerEntry, run.resId, maxCargo, sellRevPerBatch);
+                if (bl.batches != null) {
+                    const parts = [];
+                    if (bl.limits.stk != null) parts.push((bl.bottleneck === 'stk' ? '<span style="color:#ff6644;font-weight:bold;">' : '<span style="color:#5a5a3a;">') + 'stk:' + bl.limits.stk + '</span>');
+                    if (bl.limits.cr != null) parts.push((bl.bottleneck === 'cr' ? '<span style="color:#ff6644;font-weight:bold;">' : '<span style="color:#5a5a3a;">') + 'cr:' + fmtCr(bl.limits.cr) + '</span>');
+                    if (bl.limits.room != null) parts.push((bl.bottleneck === 'room' ? '<span style="color:#ff6644;font-weight:bold;">' : '<span style="color:#5a5a3a;">') + 'room:' + (bl.limits.room === Infinity ? '\u221e' : bl.limits.room) + '</span>');
+                    inner += '<div style="font-size:8px;margin-top:1px;">Batches: <span style="color:#ffaa44;font-weight:bold;">' + bl.batches + '</span> ' + parts.join(' \u00b7 ') + '</div>';
+                }
+            } else if (run.subTab === 'twoway' && run.Aloc != null && run.Bloc != null && run.fwdResId != null && run.retResId != null) {
+                const aEntry = store[String(run.Aloc)];
+                const bEntry = store[String(run.Bloc)];
+                const fwdSellRev = (run.fwdSellPerUnit || 0) * maxCargo;
+                const retSellRev = (run.retSellPerUnit || 0) * maxCargo;
+                const fwdBL = computeBatchLimits(aEntry, bEntry, run.fwdResId, maxCargo, fwdSellRev);
+                const retBL = computeBatchLimits(bEntry, aEntry, run.retResId, maxCargo, retSellRev);
+                const vals = [];
+                if (fwdBL.batches != null) vals.push(fwdBL.batches);
+                if (retBL.batches != null) vals.push(retBL.batches);
+                if (vals.length > 0) {
+                    const batches = Math.min.apply(null, vals);
+                    const bnLabels = [];
+                    if (fwdBL.batches === batches && fwdBL.bottleneck) bnLabels.push('fwd ' + fwdBL.bottleneck);
+                    if (retBL.batches === batches && retBL.bottleneck) bnLabels.push('ret ' + retBL.bottleneck);
+                    inner += '<div style="font-size:8px;margin-top:1px;">Batches: <span style="color:#ffaa44;font-weight:bold;">' + batches + '</span> <span style="color:#5a5a3a;">' + (bnLabels.length ? bnLabels.join(', ') + '-limited' : '') + '</span></div>';
+                }
+            }
+
+            // Return exports: profitable commodities in the reverse direction
+            // (buyer→seller for one-way, B→A for two-way). Shows item names + cr/AP.
             let fromLoc = null, toLoc = null;
             if (run.subTab === 'oneway') {
                 fromLoc = run.buyerLoc;
@@ -3731,11 +3812,14 @@ const SECTOR_DATA = {
                 const toEntry = store[String(toLoc)];
                 const returns = findReturnExports(fromEntry, toEntry, maxCargo);
                 if (returns.length > 0 && run.apCost != null && run.apCost > 0) {
+                    let retNames = returns.map(function(r) { return r.item; });
+                    if (retNames.length > 3) retNames = retNames.slice(0, 3).concat(['+' + (retNames.length - 3) + ' more']);
                     const totalRetProfit = returns.reduce(function(s, r) { return s + r.profit; }, 0);
                     const crap = totalRetProfit / run.apCost;
-                    inner += '<div class="opps-return-exports" style="color:#8a6a3a;font-size:8px;margin-top:2px;">Return: <span style="color:#00ff88;font-weight:bold;">' + fmtRatio(crap) + '</span> cr/AP (' + returns.length + ' item' + (returns.length > 1 ? 's' : '') + ')</div>';
+                    inner += '<div class="opps-return-exports" style="color:#8a6a3a;font-size:8px;margin-top:2px;">Return: <span style="color:#ffcc77;">' + retNames.join(', ') + '</span> \u00b7 <span style="color:#00ff88;font-weight:bold;">' + fmtRatio(crap) + '</span> cr/AP</div>';
                 } else if (returns.length > 0) {
-                    inner += '<div class="opps-return-exports" style="color:#8a6a3a;font-size:8px;margin-top:2px;">Return: ' + returns.length + ' item' + (returns.length > 1 ? 's' : '') + ' (AP unknown)</div>';
+                    const retNames2 = returns.map(function(r) { return r.item; });
+                    inner += '<div class="opps-return-exports" style="color:#8a6a3a;font-size:8px;margin-top:2px;">Return: <span style="color:#ffcc77;">' + retNames2.join(', ') + '</span> (AP unknown)</div>';
                 } else {
                     inner += '<div class="opps-return-exports" style="color:#5a3a1a;font-size:8px;margin-top:2px;">Return: \u2014</div>';
                 }
@@ -3886,6 +3970,7 @@ const SECTOR_DATA = {
                 oppsActiveRun = {
                     subTab: 'oneway',
                     item: r.item,
+                    resId: r.resId,
                     sellerName: r.seller.name || '?',
                     sellerCoords: r.sellerCoords,
                     sellerSector: r.sellerSector,
@@ -4007,11 +4092,15 @@ const SECTOR_DATA = {
                     Bsector: r.Bsector,
                     Bloc: r.B.userloc,
                     fwdItem: r.fwdItem,
+                    fwdResId: r.fwdResId,
                     fwdQty: r.fwdQty,
                     fwdProfit: r.fwdProfit,
+                    fwdSellPerUnit: r.fwdSellPerUnit,
                     retItem: r.retItem,
+                    retResId: r.retResId,
                     retQty: r.retQty,
                     retProfit: r.retProfit,
+                    retSellPerUnit: r.retSellPerUnit,
                     profit: r.profit,
                     apCost: r.apCost
                 };
