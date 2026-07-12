@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.77
+// @version      6.78
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.73: Return exports in active run bar — shows the top 2 profitable commodities in the reverse direction (B→A), so you can see at a glance what's worth bringing back for a second run.
 // @description  v6.74: Return exports now shows combined cr/AP instead of per-item credit profit — cleaner single-value display of reverse-direction profitability.
 // @description  v6.75: Batch analysis in active run bar — shows how many full-hull trips possible before seller stock, buyer credits, or buyer room runs out. Return exports now list item names instead of just count.
 // @description  v6.76: Opps cache now persisted to GM storage — computed routes survive page navigation (flying, docking) instead of disappearing on every page reload. Hit Recalculate to refresh stale prices.
 // @description  v6.77: Exports tab auto-loads on panel open (no more "Click Recalculate" placeholder). Opps one-way and two-way tables now have a Laps column showing how many full-hull trips before the bottleneck (stk/cr/room).
+// @description  v6.78: Laps now show fractional values (e.g. 2.5 instead of 2). Pin button to set active run without flying. Active run bar is now a separate draggable floating window outside the exports panel.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3303,11 +3303,11 @@ const SECTOR_DATA = {
         if (sellerEntry && sellerEntry.commodities && sellerEntry.commodities[resId]) {
             const sc = sellerEntry.commodities[resId];
             const buyable = Math.max(0, sc.stock - (sc.min || 0));
-            limits.stk = Math.floor(buyable / maxCargo);
+            limits.stk = buyable / maxCargo;
         }
 
         if (buyerEntry && buyerEntry.credits != null && sellRevPerBatch > 0) {
-            limits.cr = Math.floor(buyerEntry.credits / sellRevPerBatch);
+            limits.cr = buyerEntry.credits / sellRevPerBatch;
         }
 
         if (buyerEntry && buyerEntry.commodities && buyerEntry.commodities[resId]) {
@@ -3316,17 +3316,18 @@ const SECTOR_DATA = {
             const spaceRoom = (buyerEntry.type === 'planet' || buyerEntry.freeSpace == null || buyerEntry.freeSpace === Infinity)
                 ? Infinity : Math.max(0, buyerEntry.freeSpace);
             const room = Math.min(stackRoom, spaceRoom);
-            limits.room = (room === Infinity) ? Infinity : Math.floor(room / maxCargo);
+            limits.room = (room === Infinity) ? Infinity : room / maxCargo;
         }
 
-        const finite = Object.values(limits).filter(function(v) { return v !== Infinity; });
-        const batches = finite.length > 0 ? Math.min.apply(null, finite) : null;
+        let batches = Infinity;
         let bottleneck = null;
-        if (batches != null) {
-            for (const key in limits) {
-                if (limits[key] === batches) { bottleneck = key; break; }
+        for (const key in limits) {
+            if (limits[key] < batches) {
+                batches = limits[key];
+                bottleneck = key;
             }
         }
+        if (batches === Infinity) batches = null;
         return { batches: batches, limits: limits, bottleneck: bottleneck };
     }
 
@@ -3337,6 +3338,11 @@ const SECTOR_DATA = {
     function fmtRatio(r) {
         if (r == null || isNaN(r)) return '?';
         return (r >= 100 ? Math.round(r) : r.toFixed(1));
+    }
+    function fmtBat(n) {
+        if (n == null) return '?';
+        if (n === Infinity) return '\u221e';
+        return n.toFixed(1);
     }
 
     function injectExportsCalculator() {
@@ -3495,7 +3501,81 @@ const SECTOR_DATA = {
             try { GM_setValue('opps_cache_v1', oppsCache); } catch (e) { /* too large */ }
         }
         let oppsActiveRun = GM_getValue('opps_active_run_v1', null);
+
+        // Floating active-run bar (separate from panel, draggable).
+        // Created once; renderActiveRunBar() updates its content/visibility.
+        const runBar = document.createElement('div');
+        runBar.id = 'pardus-opps-runbar';
+        const rbPos = GM_getValue('pardus_opps_runbar_pos', { top: '60px', left: '460px' });
+        runBar.style.cssText = [
+            'position:fixed',
+            'top:' + (rbPos.top || '60px'),
+            'left:' + (rbPos.left || '460px'),
+            'width:400px',
+            'background-color:#00001C',
+            'border:1px solid #2a5a2a',
+            'font-family:Verdana,sans-serif',
+            'font-size:10px',
+            'color:#ccc',
+            'z-index:10001',
+            'display:none'
+        ].join(';');
+
+        let rbDragging = false, rbMoved = false, rbStartX = 0, rbStartY = 0, rbInitX = 0, rbInitY = 0;
+        runBar.addEventListener('mousedown', function(e) {
+            if (e.target.closest('.opps-clear-run') || e.target.closest('.opps-active-fly')) return;
+            rbDragging = true;
+            rbMoved = false;
+            rbStartX = e.clientX; rbStartY = e.clientY;
+            rbInitX = runBar.offsetLeft; rbInitY = runBar.offsetTop;
+            e.preventDefault();
+        });
+        document.addEventListener('mousemove', function(e) {
+            if (!rbDragging) return;
+            var dx = e.clientX - rbStartX;
+            var dy = e.clientY - rbStartY;
+            if (Math.abs(dx) > 2 || Math.abs(dy) > 2) rbMoved = true;
+            runBar.style.left = (rbInitX + dx) + 'px';
+            runBar.style.top = (rbInitY + dy) + 'px';
+        });
+        document.addEventListener('mouseup', function() {
+            if (!rbDragging) return;
+            rbDragging = false;
+            if (rbMoved) {
+                GM_setValue('pardus_opps_runbar_pos', { top: runBar.style.top, left: runBar.style.left });
+            }
+        });
+
+        runBar.addEventListener('click', function(e) {
+            if (e.target.closest('.opps-clear-run')) {
+                oppsActiveRun = null;
+                GM_deleteValue('opps_active_run_v1');
+                renderActiveRunBar();
+                return;
+            }
+            var el = e.target.closest('.opps-active-fly');
+            if (!el) return;
+            var run = oppsActiveRun;
+            if (!run) return;
+            try {
+                if (run.subTab === 'oneway') {
+                    if (el.dataset.target === 'seller') {
+                        flyToCoords({ x: run.sellerCoords.x, y: run.sellerCoords.y, sector: run.sellerSector }, run.sellerName + ' [' + run.sellerCoords.x + ',' + run.sellerCoords.y + ']');
+                    } else {
+                        flyToCoords({ x: run.buyerCoords.x, y: run.buyerCoords.y, sector: run.buyerSector }, run.buyerName + ' [' + run.buyerCoords.x + ',' + run.buyerCoords.y + ']');
+                    }
+                } else {
+                    if (el.dataset.target === 'A') {
+                        flyToCoords({ x: run.Acoords.x, y: run.Acoords.y, sector: run.Asector }, run.Aname + ' [' + run.Acoords.x + ',' + run.Acoords.y + ']');
+                    } else {
+                        flyToCoords({ x: run.Bcoords.x, y: run.Bcoords.y, sector: run.Bsector }, run.Bname + ' [' + run.Bcoords.x + ',' + run.Bcoords.y + ']');
+                    }
+                }
+            } catch(ex) { console.error('[pardus-opps] fly error:', ex); }
+        });
+
         function renderBody(force) {
+            renderActiveRunBar();
             if (activeTab === 'fwe') renderFweBody();
             else if (activeTab === 'opps') renderOpportunitiesBody(force);
             else renderExportsBody();
@@ -3725,26 +3805,23 @@ const SECTOR_DATA = {
             body.appendChild(note);
         }
 
-        // >> Opportunities: active run bar
+        // >> Opportunities: active run bar (floating, draggable)
         //
-        // When the user clicks a route to fly, it gets pinned as the active
-        // run. The bar shows the full route (all locations clickable) at the
-        // top of the opps body, persisting across recalculates and tab
-        // switches until the user clears it. This solves the "bought the
-        // item, now the route is gone" problem — the buyer location stays
-        // visible.
+        // When the user pins a route (via "pin" button or clicking a name),
+        // it becomes the active run. The bar floats as a separate draggable
+        // window outside the exports panel, persisting across recalculates
+        // and tab switches until cleared.
         function renderActiveRunBar() {
-            const run = oppsActiveRun;
-            if (!run) return;
+            var run = oppsActiveRun;
+            if (!run) { runBar.style.display = 'none'; runBar.innerHTML = ''; return; }
+            runBar.style.display = 'block';
 
-            const bar = document.createElement('div');
-            bar.style.cssText = 'background:#0a1a0a;border:1px solid #2a5a2a;padding:5px 7px;margin-bottom:4px;';
-
-            let inner = '';
-            inner += '<div style="margin-bottom:2px;">' +
+            var inner = '';
+            inner += '<div style="cursor:move;padding:3px 7px;border-bottom:1px solid #2a5a2a;background:#0a1a0a;">' +
                 '<span style="color:#00ff88;font-weight:bold;">\uD83D\uDCCC Active Run</span>' +
                 '<button type="button" class="opps-clear-run" style="float:right;cursor:pointer;font-size:8px;background:#330000;color:#ff8866;border:1px solid #5a0000;padding:1px 5px;">Clear</button>' +
                 '</div>';
+            inner += '<div style="padding:5px 7px;">';
 
             if (run.subTab === 'oneway') {
                 inner += '<div style="color:#ccc;">' +
@@ -3766,45 +3843,41 @@ const SECTOR_DATA = {
                 inner += '<div style="color:#888;font-size:8px;margin-top:1px;">Fwd: ' + run.fwdQty + ' ' + run.fwdItem + ' (+' + fmtCr(run.fwdProfit) + ') \u00b7 Ret: ' + run.retQty + ' ' + run.retItem + ' (+' + fmtCr(run.retProfit) + ') \u00b7 Total: ' + fmtCr(run.profit) + ' cr</div>';
             }
 
-            // Batch analysis: how many full-hull trips before a constraint runs out.
-            // Limited by seller stock, buyer credits (money pool), and buyer room.
-            const maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
-            const store = getTrackerStore();
+            var maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
+            var store = getTrackerStore();
 
             if (run.subTab === 'oneway' && run.sellerLoc != null && run.buyerLoc != null && run.resId != null) {
-                const sellerEntry = store[String(run.sellerLoc)];
-                const buyerEntry = store[String(run.buyerLoc)];
-                const sellRevPerBatch = (run.sellPerUnit || 0) * maxCargo;
-                const bl = computeBatchLimits(sellerEntry, buyerEntry, run.resId, maxCargo, sellRevPerBatch);
+                var sellerEntry = store[String(run.sellerLoc)];
+                var buyerEntry = store[String(run.buyerLoc)];
+                var sellRevPerBatch = (run.sellPerUnit || 0) * maxCargo;
+                var bl = computeBatchLimits(sellerEntry, buyerEntry, run.resId, maxCargo, sellRevPerBatch);
                 if (bl.batches != null) {
-                    const parts = [];
-                    if (bl.limits.stk != null) parts.push((bl.bottleneck === 'stk' ? '<span style="color:#ff6644;font-weight:bold;">' : '<span style="color:#5a5a3a;">') + 'stk:' + bl.limits.stk + '</span>');
-                    if (bl.limits.cr != null) parts.push((bl.bottleneck === 'cr' ? '<span style="color:#ff6644;font-weight:bold;">' : '<span style="color:#5a5a3a;">') + 'cr:' + fmtCr(bl.limits.cr) + '</span>');
-                    if (bl.limits.room != null) parts.push((bl.bottleneck === 'room' ? '<span style="color:#ff6644;font-weight:bold;">' : '<span style="color:#5a5a3a;">') + 'room:' + (bl.limits.room === Infinity ? '\u221e' : bl.limits.room) + '</span>');
-                    inner += '<div style="font-size:8px;margin-top:1px;">Batches: <span style="color:#ffaa44;font-weight:bold;">' + bl.batches + '</span> ' + parts.join(' \u00b7 ') + '</div>';
+                    var parts = [];
+                    if (bl.limits.stk != null) parts.push((bl.bottleneck === 'stk' ? '<span style="color:#ff6644;font-weight:bold;">' : '<span style="color:#5a5a3a;">') + 'stk:' + fmtBat(bl.limits.stk) + '</span>');
+                    if (bl.limits.cr != null) parts.push((bl.bottleneck === 'cr' ? '<span style="color:#ff6644;font-weight:bold;">' : '<span style="color:#5a5a3a;">') + 'cr:' + fmtBat(bl.limits.cr) + '</span>');
+                    if (bl.limits.room != null) parts.push((bl.bottleneck === 'room' ? '<span style="color:#ff6644;font-weight:bold;">' : '<span style="color:#5a5a3a;">') + 'room:' + (bl.limits.room === Infinity ? '\u221e' : fmtBat(bl.limits.room)) + '</span>');
+                    inner += '<div style="font-size:8px;margin-top:1px;">Laps: <span style="color:#ffaa44;font-weight:bold;">' + fmtBat(bl.batches) + '</span> ' + parts.join(' \u00b7 ') + '</div>';
                 }
             } else if (run.subTab === 'twoway' && run.Aloc != null && run.Bloc != null && run.fwdResId != null && run.retResId != null) {
-                const aEntry = store[String(run.Aloc)];
-                const bEntry = store[String(run.Bloc)];
-                const fwdSellRev = (run.fwdSellPerUnit || 0) * maxCargo;
-                const retSellRev = (run.retSellPerUnit || 0) * maxCargo;
-                const fwdBL = computeBatchLimits(aEntry, bEntry, run.fwdResId, maxCargo, fwdSellRev);
-                const retBL = computeBatchLimits(bEntry, aEntry, run.retResId, maxCargo, retSellRev);
-                const vals = [];
+                var aEntry = store[String(run.Aloc)];
+                var bEntry = store[String(run.Bloc)];
+                var fwdSellRev = (run.fwdSellPerUnit || 0) * maxCargo;
+                var retSellRev = (run.retSellPerUnit || 0) * maxCargo;
+                var fwdBL = computeBatchLimits(aEntry, bEntry, run.fwdResId, maxCargo, fwdSellRev);
+                var retBL = computeBatchLimits(bEntry, aEntry, run.retResId, maxCargo, retSellRev);
+                var vals = [];
                 if (fwdBL.batches != null) vals.push(fwdBL.batches);
                 if (retBL.batches != null) vals.push(retBL.batches);
                 if (vals.length > 0) {
-                    const batches = Math.min.apply(null, vals);
-                    const bnLabels = [];
+                    var batches = Math.min.apply(null, vals);
+                    var bnLabels = [];
                     if (fwdBL.batches === batches && fwdBL.bottleneck) bnLabels.push('fwd ' + fwdBL.bottleneck);
                     if (retBL.batches === batches && retBL.bottleneck) bnLabels.push('ret ' + retBL.bottleneck);
-                    inner += '<div style="font-size:8px;margin-top:1px;">Batches: <span style="color:#ffaa44;font-weight:bold;">' + batches + '</span> <span style="color:#5a5a3a;">' + (bnLabels.length ? bnLabels.join(', ') + '-limited' : '') + '</span></div>';
+                    inner += '<div style="font-size:8px;margin-top:1px;">Laps: <span style="color:#ffaa44;font-weight:bold;">' + fmtBat(batches) + '</span> <span style="color:#5a5a3a;">' + (bnLabels.length ? bnLabels.join(', ') + '-limited' : '') + '</span></div>';
                 }
             }
 
-            // Return exports: profitable commodities in the reverse direction
-            // (buyer→seller for one-way, B→A for two-way). Shows item names + cr/AP.
-            let fromLoc = null, toLoc = null;
+            var fromLoc = null, toLoc = null;
             if (run.subTab === 'oneway') {
                 fromLoc = run.buyerLoc;
                 toLoc = run.sellerLoc;
@@ -3813,51 +3886,25 @@ const SECTOR_DATA = {
                 toLoc = run.Aloc;
             }
             if (fromLoc != null && toLoc != null) {
-                const fromEntry = store[String(fromLoc)];
-                const toEntry = store[String(toLoc)];
-                const returns = findReturnExports(fromEntry, toEntry, maxCargo);
+                var fromEntry = store[String(fromLoc)];
+                var toEntry = store[String(toLoc)];
+                var returns = findReturnExports(fromEntry, toEntry, maxCargo);
                 if (returns.length > 0 && run.apCost != null && run.apCost > 0) {
-                    let retNames = returns.map(function(r) { return r.item; });
+                    var retNames = returns.map(function(r) { return r.item; });
                     if (retNames.length > 3) retNames = retNames.slice(0, 3).concat(['+' + (retNames.length - 3) + ' more']);
-                    const totalRetProfit = returns.reduce(function(s, r) { return s + r.profit; }, 0);
-                    const crap = totalRetProfit / run.apCost;
+                    var totalRetProfit = returns.reduce(function(s, r) { return s + r.profit; }, 0);
+                    var crap = totalRetProfit / run.apCost;
                     inner += '<div class="opps-return-exports" style="color:#8a6a3a;font-size:8px;margin-top:2px;">Return: <span style="color:#ffcc77;">' + retNames.join(', ') + '</span> \u00b7 <span style="color:#00ff88;font-weight:bold;">' + fmtRatio(crap) + '</span> cr/AP</div>';
                 } else if (returns.length > 0) {
-                    const retNames2 = returns.map(function(r) { return r.item; });
+                    var retNames2 = returns.map(function(r) { return r.item; });
                     inner += '<div class="opps-return-exports" style="color:#8a6a3a;font-size:8px;margin-top:2px;">Return: <span style="color:#ffcc77;">' + retNames2.join(', ') + '</span> (AP unknown)</div>';
                 } else {
                     inner += '<div class="opps-return-exports" style="color:#5a3a1a;font-size:8px;margin-top:2px;">Return: \u2014</div>';
                 }
             }
 
-            bar.innerHTML = inner;
-
-            bar.addEventListener('click', function(e) {
-                if (e.target.closest('.opps-clear-run')) {
-                    oppsActiveRun = null;
-                    GM_deleteValue('opps_active_run_v1');
-                    renderBody(false);
-                    return;
-                }
-                const el = e.target.closest('.opps-active-fly');
-                if (!el) return;
-                const target = el.dataset.target;
-                if (run.subTab === 'oneway') {
-                    if (target === 'seller') {
-                        flyToCoords({ x: run.sellerCoords.x, y: run.sellerCoords.y, sector: run.sellerSector }, run.sellerName + ' [' + run.sellerCoords.x + ',' + run.sellerCoords.y + ']');
-                    } else {
-                        flyToCoords({ x: run.buyerCoords.x, y: run.buyerCoords.y, sector: run.buyerSector }, run.buyerName + ' [' + run.buyerCoords.x + ',' + run.buyerCoords.y + ']');
-                    }
-                } else {
-                    if (target === 'A') {
-                        flyToCoords({ x: run.Acoords.x, y: run.Acoords.y, sector: run.Asector }, run.Aname + ' [' + run.Acoords.x + ',' + run.Acoords.y + ']');
-                    } else {
-                        flyToCoords({ x: run.Bcoords.x, y: run.Bcoords.y, sector: run.Bsector }, run.Bname + ' [' + run.Bcoords.x + ',' + run.Bcoords.y + ']');
-                    }
-                }
-            });
-
-            body.appendChild(bar);
+            inner += '</div>';
+            runBar.innerHTML = inner;
         }
 
         // >> Opportunities tab renderer
@@ -3867,7 +3914,6 @@ const SECTOR_DATA = {
         function renderOpportunitiesBody(force) {
             body.innerHTML = '';
             updateSubTabStyle();
-            renderActiveRunBar();
             if (oppSubTab === 'twoway') {
                 if (force) { oppsCache.twoway = computeTwoWayArbitrage(); saveOppsCache(); }
                 if (oppsCache.twoway) renderTwoWayOpps(oppsCache.twoway);
@@ -3956,13 +4002,13 @@ const SECTOR_DATA = {
                 const bl = computeBatchLimits(sellerEntry, buyerEntry, r.resId, res.maxCargo, sellRevPerBatch);
                 let lapsTxt;
                 if (bl.batches != null) {
-                    lapsTxt = '<span style="color:#ffaa44;font-weight:bold;">' + bl.batches + '</span>' +
+                    lapsTxt = '<span style="color:#ffaa44;font-weight:bold;">' + fmtBat(bl.batches) + '</span>' +
                         '<br><span style="color:#ff6644;font-size:8px;">' + bl.bottleneck + '</span>';
                 } else {
                     lapsTxt = '<span style="color:#666;">?</span>';
                 }
                 tr.innerHTML =
-                    '<td>' + (i + 1) + '</td>' +
+                    '<td>' + (i + 1) + ' <span class="opps-pin" data-idx="' + i + '" style="cursor:pointer;color:#8a6a3a;font-size:8px;">pin</span></td>' +
                     '<td style="color:#ffcc77;">' + r.item + '</td>' +
                     '<td><span style="color:' + sColor + ';">' + sIcon + '</span> ' +
                         '<span class="export-fly-target" data-idx="' + i + '" data-target="seller" title="Click to fly to seller" style="color:' + sColor + ';cursor:pointer;text-decoration:underline;">' + (r.seller.name || '?') + '</span>' +
@@ -3981,10 +4027,37 @@ const SECTOR_DATA = {
                 t.appendChild(tr);
             });
             t.addEventListener('click', function(e) {
-                const el = e.target.closest('.export-fly-target');
+                var pinEl = e.target.closest('.opps-pin');
+                if (pinEl) {
+                    var idx = parseInt(pinEl.dataset.idx, 10);
+                    var r = res.routes[idx];
+                    if (!r) return;
+                    oppsActiveRun = {
+                        subTab: 'oneway',
+                        item: r.item,
+                        resId: r.resId,
+                        sellerName: r.seller.name || '?',
+                        sellerCoords: r.sellerCoords,
+                        sellerSector: r.sellerSector,
+                        sellerLoc: r.seller.userloc,
+                        buyerName: r.buyer.name || '?',
+                        buyerCoords: r.buyerCoords,
+                        buyerSector: r.buyerSector,
+                        buyerLoc: r.buyer.userloc,
+                        units: r.units,
+                        profit: r.profit,
+                        apCost: r.apCost,
+                        buyPerUnit: r.buyPerUnit,
+                        sellPerUnit: r.sellPerUnit
+                    };
+                    GM_setValue('opps_active_run_v1', oppsActiveRun);
+                    renderActiveRunBar();
+                    return;
+                }
+                var el = e.target.closest('.export-fly-target');
                 if (!el) return;
-                const idx = parseInt(el.dataset.idx, 10);
-                const r = res.routes[idx];
+                var idx = parseInt(el.dataset.idx, 10);
+                var r = res.routes[idx];
                 if (!r) return;
                 oppsActiveRun = {
                     subTab: 'oneway',
@@ -4018,7 +4091,7 @@ const SECTOR_DATA = {
 
             const note = document.createElement('div');
             note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
-            note.innerHTML = 'Buy at seller \u2192 travel \u2192 sell at buyer. Profitable routes only (profit &gt; 0). AP = travel (macro wormhole AP, asymmetric terrain) + 10 (buy 5 + sell 5). Buy/Sell = per-unit average (curve-aware for planets/starbases). Laps = full-hull trips before bottleneck (stk=seller stock, cr=buyer credits, room=buyer room). Click a name to auto-fly and pin as active run.';
+            note.innerHTML = 'Buy at seller \u2192 travel \u2192 sell at buyer. Profitable routes only (profit &gt; 0). AP = travel (macro wormhole AP, asymmetric terrain) + 10 (buy 5 + sell 5). Buy/Sell = per-unit average (curve-aware for planets/starbases). Laps = full-hull trips before bottleneck (stk=seller stock, cr=buyer credits, room=buyer room). Click <b>pin</b> to set as active run. Click a name to auto-fly and pin.';
             body.appendChild(note);
         }
 
@@ -4095,13 +4168,13 @@ const SECTOR_DATA = {
                     const bnLabels = [];
                     if (fwdBL.batches === laps && fwdBL.bottleneck) bnLabels.push('fwd ' + fwdBL.bottleneck);
                     if (retBL.batches === laps && retBL.bottleneck) bnLabels.push('ret ' + retBL.bottleneck);
-                    lapsTxt = '<span style="color:#ffaa44;font-weight:bold;">' + laps + '</span>' +
+                    lapsTxt = '<span style="color:#ffaa44;font-weight:bold;">' + fmtBat(laps) + '</span>' +
                         '<br><span style="color:#ff6644;font-size:8px;">' + bnLabels.join(', ') + '</span>';
                 } else {
                     lapsTxt = '<span style="color:#666;">?</span>';
                 }
                 tr.innerHTML =
-                    '<td>' + (i + 1) + '</td>' +
+                    '<td>' + (i + 1) + ' <span class="opps-pin" data-idx="' + i + '" style="cursor:pointer;color:#8a6a3a;font-size:8px;">pin</span></td>' +
                     '<td><span style="color:' + aColor + ';">' + aIcon + '</span> ' +
                         '<span class="export-fly-target" data-idx="' + i + '" data-target="A" title="Click to fly to A" style="color:' + aColor + ';cursor:pointer;text-decoration:underline;">' + (r.A.name || '?') + '</span>' +
                         ' <span style="color:#5a5a3a;">[' + r.Acoords.x + ',' + r.Acoords.y + ']</span>' +
@@ -4118,10 +4191,42 @@ const SECTOR_DATA = {
                 t.appendChild(tr);
             });
             t.addEventListener('click', function(e) {
-                const el = e.target.closest('.export-fly-target');
+                var pinEl = e.target.closest('.opps-pin');
+                if (pinEl) {
+                    var idx = parseInt(pinEl.dataset.idx, 10);
+                    var r = res.routes[idx];
+                    if (!r) return;
+                    oppsActiveRun = {
+                        subTab: 'twoway',
+                        Aname: r.A.name || '?',
+                        Acoords: r.Acoords,
+                        Asector: r.Asector,
+                        Aloc: r.A.userloc,
+                        Bname: r.B.name || '?',
+                        Bcoords: r.Bcoords,
+                        Bsector: r.Bsector,
+                        Bloc: r.B.userloc,
+                        fwdItem: r.fwdItem,
+                        fwdResId: r.fwdResId,
+                        fwdQty: r.fwdQty,
+                        fwdProfit: r.fwdProfit,
+                        fwdSellPerUnit: r.fwdSellPerUnit,
+                        retItem: r.retItem,
+                        retResId: r.retResId,
+                        retQty: r.retQty,
+                        retProfit: r.retProfit,
+                        retSellPerUnit: r.retSellPerUnit,
+                        profit: r.profit,
+                        apCost: r.apCost
+                    };
+                    GM_setValue('opps_active_run_v1', oppsActiveRun);
+                    renderActiveRunBar();
+                    return;
+                }
+                var el = e.target.closest('.export-fly-target');
                 if (!el) return;
-                const idx = parseInt(el.dataset.idx, 10);
-                const r = res.routes[idx];
+                var idx = parseInt(el.dataset.idx, 10);
+                var r = res.routes[idx];
                 if (!r) return;
                 oppsActiveRun = {
                     subTab: 'twoway',
@@ -4160,7 +4265,7 @@ const SECTOR_DATA = {
 
             const note = document.createElement('div');
             note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
-            note.innerHTML = 'Round-trip: buy X at A \u2192 travel A\u2192B \u2192 sell X, buy Y at B \u2192 travel B\u2192A \u2192 sell Y at A. AP = macro A\u2192B + macro B\u2192A (asymmetric) + 10 (combined sell+buy at each end, steady-state). Best forward (X) and return (Y) commodities chosen per pair (X\u2260Y). Laps = round-trips before bottleneck (fwd/ret stk/cr/room). Click a name to auto-fly and pin as active run.';
+            note.innerHTML = 'Round-trip: buy X at A \u2192 travel A\u2192B \u2192 sell X, buy Y at B \u2192 travel B\u2192A \u2192 sell Y at A. AP = macro A\u2192B + macro B\u2192A (asymmetric) + 10 (combined sell+buy at each end, steady-state). Best forward (X) and return (Y) commodities chosen per pair (X\u2260Y). Laps = round-trips before bottleneck (fwd/ret stk/cr/room). Click <b>pin</b> to set as active run. Click a name to auto-fly and pin.';
             body.appendChild(note);
         }
 
@@ -4199,7 +4304,10 @@ const SECTOR_DATA = {
 
         updateTabStyle();
         const mount = document.body || document.documentElement;
-        if (mount) mount.appendChild(wrap);
+        if (mount) {
+            mount.appendChild(wrap);
+            mount.appendChild(runBar);
+        }
         renderBody();
         console.log('[pardus-exports] panel injected on', currentPath);
     }
