@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.71
+// @version      6.72
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.67: Macro wormhole graph — pre-calculates all-pairs shortest path between every wormhole tile in the universe (Floyd-Warshall). Fast cross-sector AP lookup via getCrossSectorAPFast() using two local Dijkstra runs + macro lookup. Foundation for the opportunities panel.
 // @description  v6.68: Opportunities tab in exports panel — one-way arbitrage (buy low at A, sell high at B, cr/AP via macro AP) and two-way arbitrage (A↔B round-trip with best forward X + return Y commodities). Curve-aware pricing, asymmetric terrain AP.
 // @description  v6.69: Cache opportunities results — recompute only on Recalculate click, not on every tab switch. Exports/FWE tabs unchanged (auto-calculate, negligible cost).
 // @description  v6.70: Active run pinning — clicking a route in Opps pins it as an active run that persists across recalculates and tab switches, so the buyer location stays visible after you've bought the item. Clear manually when done.
 // @description  v6.71: Fix exports tab blank (undefined html var) — exports body was empty because sumHtml was built but never rendered. Opps tab no longer auto-computes on first open — shows placeholder until Recalculate is pressed.
+// @description  v6.72: Min cr/AP filter for Opps — input field sets a profit-per-AP floor. Low-profit pairs are skipped before AP pathfinding (pre-filter: profit/TRADE_AP < threshold), and remaining routes are post-filtered by actual cr/AP. Cuts computation and clutter.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2945,6 +2945,7 @@ const SECTOR_DATA = {
     function computeOpportunities() {
         const maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
         const TRADE_AP = 10;
+        const minCrAp = parseFloat(GM_getValue('opps_min_crap', '0')) || 0;
 
         parseStaticMap(true);
         const store = getTrackerStore();
@@ -2981,6 +2982,7 @@ const SECTOR_DATA = {
         const dijCache = {};
         const routes = [];
         const usedFallback = !macroGraph;
+        let preFiltered = 0;
 
         for (const resId in commodityIndex) {
             const ci = commodityIndex[resId];
@@ -3009,6 +3011,11 @@ const SECTOR_DATA = {
                     const profit = revenue - cost;
                     if (profit <= 0) continue;
 
+                    // Pre-filter: apCost >= TRADE_AP always, so if profit/TRADE_AP
+                    // is already below threshold, cr/AP can never qualify. Skips the
+                    // expensive getCrossSectorAPFast call entirely.
+                    if (minCrAp > 0 && profit / TRADE_AP < minCrAp) { preFiltered++; continue; }
+
                     let ap = null;
                     if (macroGraph) {
                         try {
@@ -3018,6 +3025,10 @@ const SECTOR_DATA = {
 
                     const apCost = (ap != null) ? ap + TRADE_AP : null;
                     const ratio = (apCost != null && apCost > 0) ? profit / apCost : null;
+
+                    // Post-filter: drop routes whose actual cr/AP is below threshold.
+                    // Keep null-ratio routes (AP unknown) so user still sees them with '?'.
+                    if (minCrAp > 0 && ratio != null && ratio < minCrAp) continue;
 
                     routes.push({
                         item: ci.name,
@@ -3052,7 +3063,9 @@ const SECTOR_DATA = {
             routes: routes,
             maxCargo: maxCargo,
             usedFallback: usedFallback,
-            commodityCount: Object.keys(commodityIndex).length
+            commodityCount: Object.keys(commodityIndex).length,
+            minCrAp: minCrAp,
+            preFiltered: preFiltered
         };
     }
 
@@ -3074,6 +3087,7 @@ const SECTOR_DATA = {
     function computeTwoWayArbitrage() {
         const maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
         const TRADE_AP = 10;
+        const minCrAp = parseFloat(GM_getValue('opps_min_crap', '0')) || 0;
 
         parseStaticMap(true);
         const store = getTrackerStore();
@@ -3096,6 +3110,7 @@ const SECTOR_DATA = {
         const dijCache = {};
         const routes = [];
         const usedFallback = !macroGraph;
+        let preFiltered = 0;
 
         for (let i = 0; i < locs.length; i++) {
             for (let j = i + 1; j < locs.length; j++) {
@@ -3171,6 +3186,10 @@ const SECTOR_DATA = {
                 }
                 if (!bestFwd || !bestRet) continue;
 
+                // Pre-filter: apCost >= TRADE_AP, so if bestTotal/TRADE_AP is
+                // below threshold, no point computing AP for this pair.
+                if (minCrAp > 0 && bestTotal / TRADE_AP < minCrAp) { preFiltered++; continue; }
+
                 // Macro AP both ways (Pardus terrain is asymmetric).
                 let apAB = null, apBA = null;
                 if (macroGraph) {
@@ -3182,6 +3201,9 @@ const SECTOR_DATA = {
 
                 const apCost = (apAB != null && apBA != null) ? apAB + apBA + TRADE_AP : null;
                 const ratio = (apCost != null && apCost > 0) ? bestTotal / apCost : null;
+
+                // Post-filter: drop routes below threshold (keep null-ratio).
+                if (minCrAp > 0 && ratio != null && ratio < minCrAp) continue;
 
                 routes.push({
                     A: A.entry,
@@ -3219,7 +3241,9 @@ const SECTOR_DATA = {
         return {
             routes: routes,
             maxCargo: maxCargo,
-            usedFallback: usedFallback
+            usedFallback: usedFallback,
+            minCrAp: minCrAp,
+            preFiltered: preFiltered
         };
     }
 
@@ -3358,6 +3382,28 @@ const SECTOR_DATA = {
         refreshBtn.style.cssText = 'cursor:pointer;font-size:10px;background:#332200;color:#ffcc77;border:1px solid #aa7744;padding:3px 8px;flex:1;';
         refreshBtn.addEventListener('click', () => renderBody(true));
         controls.appendChild(refreshBtn);
+
+        const minCrApLabel = document.createElement('span');
+        minCrApLabel.textContent = 'Min cr/AP:';
+        minCrApLabel.style.cssText = 'color:#8a6a3a;font-size:9px;';
+        controls.appendChild(minCrApLabel);
+
+        const minCrApInput = document.createElement('input');
+        minCrApInput.type = 'number';
+        minCrApInput.min = '0';
+        minCrApInput.placeholder = '0';
+        minCrApInput.title = 'Minimum credits per AP. Routes below this cr/AP are skipped during computation (saves pathfinding). 0 = no filter.';
+        minCrApInput.value = GM_getValue('opps_min_crap', '0');
+        minCrApInput.style.cssText = 'width:60px;background:#1a1000;color:#ffcc77;border:1px solid #5a3a1a;font-size:9px;padding:2px 4px;';
+        controls.appendChild(minCrApInput);
+        minCrApInput.addEventListener('change', () => {
+            const v = parseFloat(minCrApInput.value) || 0;
+            GM_setValue('opps_min_crap', String(v));
+            // Clear cache so Recalculate picks up the new threshold.
+            oppsCache.oneway = null;
+            oppsCache.twoway = null;
+            renderBody();
+        });
 
         let oppsCache = { oneway: null, twoway: null };
         let oppsActiveRun = GM_getValue('opps_active_run_v1', null);
@@ -3700,8 +3746,13 @@ const SECTOR_DATA = {
                 'One-way arbitrage: buy low \u2192 sell high. ' +
                 '<span style="color:#88ccff;">' + res.routes.length + '</span> profitable routes' +
                 ' across <span style="color:#88ccff;">' + res.commodityCount + '</span> tracked commodities' +
-                ' (cargo <span style="color:#ffcc77;">' + res.maxCargo + '</span>).' +
-                '</div>';
+                ' (cargo <span style="color:#ffcc77;">' + res.maxCargo + '</span>).';
+            if (res.minCrAp > 0) {
+                html += ' <span style="color:#8a6a3a;">Min cr/AP: <b style="color:#ffcc77;">' + res.minCrAp + '</b>' +
+                    (res.preFiltered > 0 ? ' (' + res.preFiltered + ' pairs skipped)' : '') +
+                    '</span>';
+            }
+            html += '</div>';
             if (res.usedFallback) {
                 html += '<div style="color:#8a6a3a;margin-bottom:4px;">\u26a0 No sector map data \u2014 AP unavailable (?). Load static_ext.txt.</div>';
             }
@@ -3809,8 +3860,13 @@ const SECTOR_DATA = {
             let html = '<div style="margin-bottom:4px;color:#aaa;">' +
                 'Two-way arbitrage: A\u2194B round-trip. ' +
                 '<span style="color:#88ccff;">' + res.routes.length + '</span> profitable pairs' +
-                ' (cargo <span style="color:#ffcc77;">' + res.maxCargo + '</span>).' +
-                '</div>';
+                ' (cargo <span style="color:#ffcc77;">' + res.maxCargo + '</span>).';
+            if (res.minCrAp > 0) {
+                html += ' <span style="color:#8a6a3a;">Min cr/AP: <b style="color:#ffcc77;">' + res.minCrAp + '</b>' +
+                    (res.preFiltered > 0 ? ' (' + res.preFiltered + ' pairs skipped)' : '') +
+                    '</span>';
+            }
+            html += '</div>';
             if (res.usedFallback) {
                 html += '<div style="color:#8a6a3a;margin-bottom:4px;">\u26a0 No sector map data \u2014 AP unavailable (?). Load static_ext.txt.</div>';
             }
