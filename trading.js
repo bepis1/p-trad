@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.64
+// @version      6.65
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.60: Revert of v6.59 native buildings parser — restores v6.58 behavior. Bump version to force Tampermonkey to pull the revert (it won't downgrade).
 // @description  v6.61: Fix monster sidestep in auto-fly — nav grid is 9×11 (99 tiles, center field 49), not 11×11 (121 tiles, center 60); sidestep now uses two 1-tile forward moves instead of one 2-tile move (Pardus only moves 1 tile per navAjax call).
 // @description  v6.62: Fix sidestep rejoin sending player into a second consecutive monster — rejoin now checks if the path tile is clear before moving; loop-based forward movement handles any number of consecutive monsters (max 5).
 // @description  v6.63: Add diagnostic console.log to sidestep logic (prefix [SIDESTEP]) to trace monster-avoidance failures. Open browser console (F12) to capture logs when reporting issues.
 // @description  v6.64: Enhanced sidestep diagnostics — dump full nav grid layout (5×5 around center), navSizeHor/Ver, and center tile ID to identify grid mismatches.
+// @description  v6.65: Fix root cause — compute tile IDs arithmetically from userloc + sector rows instead of reading from nav grid HTML (which had stale/wrong tile IDs after replaceHtml GC churn). Also checks navImpassable in isNavTileClear.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3893,10 +3893,13 @@ const SECTOR_DATA = {
     // navSizeVer=9 rows, navSizeHor=11 cols. The player is at the centre —
     // tdNavField49 (row 4, col 5).
     // Monsters / NPCs appear with class "navNpc" on the <td>.
-    // Tile IDs are embedded in the <a onclick="navAjax(tileId)"> attribute.
+    //
+    // Tile IDs are computed arithmetically from userloc and sector dimensions,
+    // NOT read from the nav grid HTML. The nav grid HTML can have stale or
+    // incorrect tile IDs (e.g. after replaceHtml GC churn, or when the center
+    // ship tile has no <a> tag). The formula: tileId = sectorStart + x*rows + y
+    // so east (dx=+1) = +rows, north (dy=-1) = -1.
 
-    const NAV_CENTER = 49;
-    const NAV_COLS = 11;
     const NAV_MAX_FIELD = 98;
 
     function scanNavForMonsters() {
@@ -3915,21 +3918,33 @@ const SECTOR_DATA = {
     }
 
     function getNavTileIdAt(dx, dy) {
-        const navIdx = NAV_CENTER + dy * NAV_COLS + dx;
-        if (navIdx < 0 || navIdx > NAV_MAX_FIELD) return null;
-        const td = document.getElementById('tdNavField' + navIdx);
-        if (!td) return null;
-        const a = td.querySelector('a');
-        if (!a) return null;
-        const m = (a.getAttribute('onclick') || '').match(/\d+/);
-        return m ? parseInt(m[0], 10) : null;
+        const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+        const uloc = w.userloc;
+        if (uloc === undefined || uloc === null) return null;
+        const baseTileId = parseInt(uloc.toString(), 10);
+        if (isNaN(baseTileId)) return null;
+        const sectorEl = document.getElementById('sector');
+        const sectorName = sectorEl ? sectorEl.textContent.trim() : null;
+        if (!sectorName) return null;
+        const secInfo = getSectorData(sectorName);
+        if (!secInfo) return null;
+        return baseTileId + dx * secInfo.rows + dy;
     }
 
     function isNavTileClear(dx, dy) {
-        const navIdx = NAV_CENTER + dy * NAV_COLS + dx;
-        if (navIdx < 0 || navIdx > NAV_MAX_FIELD) return false;
-        const td = document.getElementById('tdNavField' + navIdx);
-        return !!td && !td.classList.contains('navNpc');
+        const tileId = getNavTileIdAt(dx, dy);
+        if (tileId === null) return false;
+        for (let i = 0; i <= NAV_MAX_FIELD; i++) {
+            const td = document.getElementById('tdNavField' + i);
+            if (!td) continue;
+            const a = td.querySelector('a');
+            if (!a) continue;
+            const m = (a.getAttribute('onclick') || '').match(/\d+/);
+            if (m && parseInt(m[0], 10) === tileId) {
+                return !td.classList.contains('navNpc') && !td.classList.contains('navImpassable');
+            }
+        }
+        return false;
     }
 
     function flyToCoords(target, destLabel, onArrive) {
@@ -4107,25 +4122,12 @@ const SECTOR_DATA = {
                 targetIdx_before_guard: targetIdx,
                 monsters_scanned: [...monsterSet],
                 knownAmbushTiles: [...knownAmbushTiles],
-                nextTileIds: tileIds.slice(idx + 1, idx + 4)
+                nextTileIds: tileIds.slice(idx + 1, idx + 4),
+                computedNorth: getNavTileIdAt(0, -1),
+                computedSouth: getNavTileIdAt(0, 1),
+                computedEast: getNavTileIdAt(1, 0),
+                computedWest: getNavTileIdAt(-1, 0)
             });
-            // >> Diagnostic: dump the actual nav grid layout
-            const w2 = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-            const navSizeH = w2.navSizeHor;
-            const navSizeV = w2.navSizeVer;
-            const gridDump = {};
-            for (let dy = -2; dy <= 2; dy++) {
-                for (let dx = -2; dx <= 2; dx++) {
-                    const fi = NAV_CENTER + dy * NAV_COLS + dx;
-                    const td = document.getElementById('tdNavField' + fi);
-                    const cls = td ? td.className : 'MISSING';
-                    const a = td ? td.querySelector('a') : null;
-                    const m = a ? (a.getAttribute('onclick') || '').match(/\d+/) : null;
-                    const tid = m ? parseInt(m[0], 10) : null;
-                    gridDump[`${dx},${dy}`] = { field: fi, class: cls, tileId: tid };
-                }
-            }
-            console.log('[SIDESTEP] Nav grid dump', { navSizeHor: navSizeH, navSizeVer: navSizeV, NAV_CENTER, NAV_COLS, userloc: w2.userloc, centerTileId: getNavTileIdAt(0, 0), grid: gridDump });
             if (monsterSet.size > 0) {
                 for (let j = idx + 1; j <= targetIdx; j++) {
                     if (monsterSet.has(tileIds[j])) {
