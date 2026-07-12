@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.82
+// @version      6.83
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.78: Laps now show fractional values (e.g. 2.5 instead of 2). Pin button to set active run without flying. Active run bar is now a separate draggable floating window outside the exports panel.
 // @description  v6.79: Wormhole jumps now use warpAjax/warp instead of navAjax — fixes cross-sector auto-fly getting stuck on wormhole tiles.
 // @description  v6.80: 2-sector routes now use direct wormhole connections (no multi-hop detours). Fixed "Off local path" error after wormhole jumps by recomputing path from actual post-jump tile.
 // @description  v6.81: Cross-sector auto-fly now uses the same Floyd-Warshall macro graph as the opps estimator — flown routes match opps AP estimates, including multi-hop paths through intermediate sectors.
 // @description  v6.82: Cancel button in the flight overlay bar — stops auto-fly immediately in case of misclick or wrong destination.
+// @description  v6.83: Fix duplicate wormholes between same sector pair (e.g. Ras Elased↔Fornacis) — #sub-region suffix now preserved so all wormhole endpoints reach the pathfinder instead of last-write-wins overwrite.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
