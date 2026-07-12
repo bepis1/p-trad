@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.68
+// @version      6.69
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.64: Enhanced sidestep diagnostics — dump full nav grid layout (5×5 around center), navSizeHor/Ver, and center tile ID to identify grid mismatches.
 // @description  v6.65: Fix root cause — compute tile IDs arithmetically from userloc + sector rows instead of reading from nav grid HTML (which had stale/wrong tile IDs after replaceHtml GC churn). Also checks navImpassable in isNavTileClear.
 // @description  v6.66: Remove diagnostic console.log statements from sidestep logic — fix confirmed working. Clean stable release.
 // @description  v6.67: Macro wormhole graph — pre-calculates all-pairs shortest path between every wormhole tile in the universe (Floyd-Warshall). Fast cross-sector AP lookup via getCrossSectorAPFast() using two local Dijkstra runs + macro lookup. Foundation for the opportunities panel.
 // @description  v6.68: Opportunities tab in exports panel — one-way arbitrage (buy low at A, sell high at B, cr/AP via macro AP) and two-way arbitrage (A↔B round-trip with best forward X + return Y commodities). Curve-aware pricing, asymmetric terrain AP.
+// @description  v6.69: Cache opportunities results — recompute only on Recalculate click, not on every tab switch. Exports/FWE tabs unchanged (auto-calculate, negligible cost).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
