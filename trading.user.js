@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.78
+// @version      6.79
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.74: Return exports now shows combined cr/AP instead of per-item credit profit — cleaner single-value display of reverse-direction profitability.
 // @description  v6.75: Batch analysis in active run bar — shows how many full-hull trips possible before seller stock, buyer credits, or buyer room runs out. Return exports now list item names instead of just count.
 // @description  v6.76: Opps cache now persisted to GM storage — computed routes survive page navigation (flying, docking) instead of disappearing on every page reload. Hit Recalculate to refresh stale prices.
 // @description  v6.77: Exports tab auto-loads on panel open (no more "Click Recalculate" placeholder). Opps one-way and two-way tables now have a Laps column showing how many full-hull trips before the bottleneck (stk/cr/room).
 // @description  v6.78: Laps now show fractional values (e.g. 2.5 instead of 2). Pin button to set active run without flying. Active run bar is now a separate draggable floating window outside the exports panel.
+// @description  v6.79: Wormhole jumps now use warpAjax/warp instead of navAjax — fixes cross-sector auto-fly getting stuck on wormhole tiles.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -5244,6 +5244,12 @@ const SECTOR_DATA = {
             return null;
         }
 
+        function resolveWarpFn() {
+            if (typeof w.warpAjax === 'function') return w.warpAjax;
+            if (typeof w.warp === 'function') return w.warp;
+            return null;
+        }
+
         function currentTileId() {
             const v = w.userloc;
             return (v === undefined || v === null) ? -1 : parseInt(v.toString(), 10);
@@ -5306,16 +5312,17 @@ const SECTOR_DATA = {
                     if (onArrive) onArrive(true);
                     return;
                 }
-                // At a wormhole tile but the jump hasn't triggered yet
-                // (e.g., we started on the wormhole tile). Try to trigger it.
-                const navFn = resolveNavFn();
-                if (!navFn) {
-                    fail('\u26a0 Pardus nav function (navAjax/nav) not found on page. Stopping.');
+                // At a wormhole tile — trigger the jump via warpAjax/warp.
+                // Pardus uses a separate warp function for wormhole jumps;
+                // navAjax does nothing when already on the wormhole tile.
+                const warpFn = resolveWarpFn();
+                if (!warpFn) {
+                    fail('\u26a0 Pardus warp function (warpAjax/warp) not found on page. Stopping.');
                     return;
                 }
                 const beforeSector = curSector;
                 setOverlay(`\u2708 Triggering wormhole jump (leg ${legIdx + 1}/${legs.length})...`);
-                try { navFn(tileIds[idx]); } catch (e) { fail(`\u26a0 nav() threw: ${e.message}. Stopping.`); return; }
+                try { warpFn(tileIds[idx]); } catch (e) { fail(`\u26a0 warp() threw: ${e.message}. Stopping.`); return; }
 
                 const deadline = Date.now() + 8000;
                 (function waitForJump() {
