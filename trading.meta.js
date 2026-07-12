@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.71
+// @version      6.72
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.67: Macro wormhole graph — pre-calculates all-pairs shortest path between every wormhole tile in the universe (Floyd-Warshall). Fast cross-sector AP lookup via getCrossSectorAPFast() using two local Dijkstra runs + macro lookup. Foundation for the opportunities panel.
 // @description  v6.68: Opportunities tab in exports panel — one-way arbitrage (buy low at A, sell high at B, cr/AP via macro AP) and two-way arbitrage (A↔B round-trip with best forward X + return Y commodities). Curve-aware pricing, asymmetric terrain AP.
 // @description  v6.69: Cache opportunities results — recompute only on Recalculate click, not on every tab switch. Exports/FWE tabs unchanged (auto-calculate, negligible cost).
 // @description  v6.70: Active run pinning — clicking a route in Opps pins it as an active run that persists across recalculates and tab switches, so the buyer location stays visible after you've bought the item. Clear manually when done.
 // @description  v6.71: Fix exports tab blank (undefined html var) — exports body was empty because sumHtml was built but never rendered. Opps tab no longer auto-computes on first open — shows placeholder until Recalculate is pressed.
+// @description  v6.72: Min cr/AP filter for Opps — input field sets a profit-per-AP floor. Low-profit pairs are skipped before AP pathfinding (pre-filter: profit/TRADE_AP < threshold), and remaining routes are post-filtered by actual cr/AP. Cuts computation and clutter.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
