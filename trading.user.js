@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.59
+// @version      6.58
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v6.54: Equipment-aware terrain AP costs (drive speed, nav level, stims, pathfinder, flux, persuader), wormhole-seal calendar, configurable wormhole jump cost, ship-config UI in Fly Here panel.
 // @description  v6.55: Fix cross-sector routing crash on sub-sector sectors — merge grid fragments into parent sectors, remap wormhole destinations, add getSectorData() name resolver.
 // @description  v6.56: Refactor — merge split trade-screen DOM files, remove dead terrainAP legacy constant, fix UI version label and misleading indentation.
 // @description  v6.57: Cache-optimal part reordering (static data first, load-time dispatcher last — fixes ambush-resume TDZ bug); remove ALL Manhattan/Chebyshev distance-estimate fallbacks (Dijkstra only, hard fail with deferred recalc retry); dead-code purge (unused helpers, dead GM keys, per-pathfind diagnostic log spam); auto-updater skips headless harnesses.
 // @description  v6.58: Remove dangling GM_deleteValue('logistics_mag_scoop_size') from clear button (key no longer written since magscoop refactor); restore update-skip mechanism in auto-updater with "Skip this version" Tampermonkey menu command.
-// @description  v6.59: Native buildings overview parser — replaces Pardus Bookkeeper extension dependency. Reads trade tracker entries (res_upkeep/res_production captured from trade page JS) + native overview_buildings.php table, computes tick projections (min stock/rate), provides filtering UI by building type abbreviation (ef, rf, sm...), sector, or name. Merges tracker + native data, persists filter in GM storage.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -606,390 +606,7 @@ const SECTOR_DATA = {
 
 
     // --- 4. Buildings Tab: Bookkeeper Parser ---
-
-    // >> Static Pardus resource ID → name mapping (from page JS res_names)
-    const PARDUS_RES_NAMES = {
-        '1': 'Food', '2': 'Energy', '3': 'Water', '4': 'Animal embryos',
-        '5': 'Ore', '6': 'Metal', '7': 'Electronics', '8': 'Robots',
-        '9': 'Heavy plastics', '10': 'Hand weapons', '11': 'Medicines',
-        '12': 'Nebula gas', '13': 'Chemical supplies', '14': 'Gem stones',
-        '15': 'Liquor', '16': 'Hydrogen fuel', '17': 'Exotic matter',
-        '18': 'Optical components', '19': 'Radioactive cells',
-        '20': 'Droid modules', '21': 'Bio-waste', '22': 'Leech baby',
-        '23': 'Nutrient clods', '27': 'Battleweapon Parts',
-        '29': 'Stim Chip', '50': 'Slaves', '51': 'Drugs',
-        '102': 'Explosives', '105': 'Military Explosives',
-    };
-
-    // >> Building type abbreviation lookup
-    const BUILDING_TYPE_ABBR = {
-        'Allure Store': 'AS', 'Asteroid Mine': 'AM',
-        'Battleweapons Factory': 'BWF', 'Brewery': 'Br',
-        'Chemical Laboratory': 'CL', 'Drug Station': 'DS',
-        'Electronics Facility': 'EF', 'Energy Collector': 'EC',
-        'Farm': 'Fa', 'Fishery': 'Fi', 'Gas Collector': 'GC',
-        'Gas Refinery': 'GR', 'Medical Laboratory': 'ML',
-        'Nebula Plant': 'NP', 'Optical Research Center': 'ORC',
-        'Plastics Facility': 'PF', 'Recycling Facility': 'RC',
-        'Robot Factory': 'RF', 'Silo': 'Si', 'Slave Camp': 'SC',
-        'Smelting Facility': 'Sm', 'Space Farm': 'SF',
-        'Trade Outpost': 'TO',
-    };
-
-    function getBuildingAbbr(name) {
-        if (BUILDING_TYPE_ABBR[name]) return BUILDING_TYPE_ABBR[name];
-        return name.split(/\s+/).map(w => w[0]).join('').toUpperCase();
-    }
-
-    function _resName(resId, entry) {
-        if (entry && entry.commodities && entry.commodities[resId])
-            return entry.commodities[resId].name;
-        return PARDUS_RES_NAMES[resId] || ('res_' + resId);
-    }
-
-    function _resIdSlug(name) {
-        return String(name).toLowerCase().replace(/\s+/g, '_');
-    }
-
-    // >> Build building objects from the trade tracker store
-    // Reads every tracked building entry and extracts per-tick upkeep
-    // rates (entry.upkeep), per-tick production rates (entry.production),
-    // current stock (entry.commodities), and computes tick projections.
-    // Produces objects compatible with raw_bookkeeper_data format.
-    function parseTrackerBuildings() {
-        const store = (typeof getTrackerStore === 'function') ? getTrackerStore() : {};
-        const buildings = [];
-        for (const loc in store) {
-            const entry = store[loc];
-            if (!entry || entry.type !== 'building') continue;
-            if (!entry.coords) continue;
-
-            const abbr = getBuildingAbbr(entry.name || 'Building');
-
-            const pickups = {};
-            if (entry.production) {
-                for (const resId in entry.production) {
-                    const rate = parseInt(entry.production[resId], 10) || 0;
-                    if (rate <= 0) continue;
-                    const name = _resName(resId, entry);
-                    const stock = entry.commodities && entry.commodities[resId]
-                        ? (parseInt(entry.commodities[resId].stock, 10) || 0) : 0;
-                    if (stock > 0)
-                        pickups[name] = { amount: stock, id: _resIdSlug(name) };
-                }
-            }
-
-            const dropoffs = {};
-            if (entry.upkeep) {
-                for (const resId in entry.upkeep) {
-                    const rate = parseInt(entry.upkeep[resId], 10) || 0;
-                    if (rate <= 0) continue;
-                    const name = _resName(resId, entry);
-                    dropoffs[name] = { amount: rate, id: _resIdSlug(name) };
-                }
-            }
-
-            if (Object.keys(pickups).length === 0 && Object.keys(dropoffs).length === 0)
-                continue;
-
-            let ticks = Infinity;
-            if (entry.upkeep) {
-                for (const resId in entry.upkeep) {
-                    const rate = parseInt(entry.upkeep[resId], 10) || 0;
-                    if (rate <= 0) continue;
-                    const stock = entry.commodities && entry.commodities[resId]
-                        ? (parseInt(entry.commodities[resId].stock, 10) || 0) : 0;
-                    const t = Math.floor(stock / rate);
-                    if (t < ticks) ticks = t;
-                }
-            }
-
-            buildings.push({
-                location: entry.coords,
-                name: abbr,
-                fullName: entry.name || abbr,
-                sector: entry.sector || '',
-                userloc: entry.userloc,
-                pickups, dropoffs, ticks,
-                source: 'tracker',
-            });
-        }
-        return buildings;
-    }
-
-    // >> Parse a resource cell from the native overview_buildings table
-    // Each cell has a nested <table> with <td>s containing
-    // <img alt="ResourceName">: amount
-    function _parseNativeResourceCell(cell) {
-        const result = {};
-        const tds = cell.querySelectorAll('table td');
-        for (const td of tds) {
-            const img = td.querySelector('img');
-            if (!img) continue;
-            const name = img.getAttribute('alt') || img.getAttribute('title');
-            if (!name) continue;
-            const text = td.textContent.replace(/[^\d\-]/g, '');
-            if (text !== '' && text !== '-') {
-                const val = parseInt(text, 10);
-                if (!isNaN(val)) result[name] = val;
-            }
-        }
-        return result;
-    }
-
-    // >> Parse the native Pardus buildings table (overview_buildings.php)
-    // Extracts owned buildings with upkeep rates, production rates, and
-    // stock levels. Returns objects in the same format as tracker buildings.
-    function parseNativeBuildingsTable() {
-        const tables = document.querySelectorAll('table.messagestyle');
-        let nativeTable = null;
-        for (const t of tables) {
-            const th = t.querySelector('th');
-            if (th && th.textContent.includes('Building')) { nativeTable = t; break; }
-        }
-        if (!nativeTable) return [];
-
-        const rows = nativeTable.querySelectorAll(':scope > tbody > tr');
-        const buildings = [];
-
-        for (const row of rows) {
-            // Use direct children only — querySelectorAll('td') would
-            // pick up nested table cells inside upkeep/production columns.
-            const cells = Array.from(row.children).filter(c => c.tagName === 'TD');
-            if (cells.length < 10) continue;
-
-            const nameLink = cells[0].querySelector('a');
-            if (!nameLink) continue;
-            const buildingName = nameLink.textContent.trim();
-
-            const posText = cells[1].textContent.trim();
-            const posMatch = posText.match(/^(.+?):\s*(\d+),(\d+)$/);
-            if (!posMatch) continue;
-            const sectorName = posMatch[1].trim();
-            const location = '[' + posMatch[2] + ',' + posMatch[3] + ']';
-
-            const upkeepRates = _parseNativeResourceCell(cells[6]);
-            const productionRates = _parseNativeResourceCell(cells[7]);
-            const upkeepStock = _parseNativeResourceCell(cells[8]);
-            const commodityStock = _parseNativeResourceCell(cells[9]);
-
-            const abbr = getBuildingAbbr(buildingName);
-
-            const pickups = {};
-            for (const [name, rate] of Object.entries(productionRates)) {
-                if (rate > 0) {
-                    const stock = commodityStock[name] || 0;
-                    if (stock > 0)
-                        pickups[name] = { amount: stock, id: _resIdSlug(name) };
-                }
-            }
-
-            const dropoffs = {};
-            for (const [name, rate] of Object.entries(upkeepRates)) {
-                if (rate > 0)
-                    dropoffs[name] = { amount: rate, id: _resIdSlug(name) };
-            }
-
-            if (Object.keys(pickups).length === 0 && Object.keys(dropoffs).length === 0)
-                continue;
-
-            let ticks = Infinity;
-            for (const [name, rate] of Object.entries(upkeepRates)) {
-                if (rate <= 0) continue;
-                const stock = upkeepStock[name] !== undefined ? upkeepStock[name] : 0;
-                const t = Math.floor(stock / rate);
-                if (t < ticks) ticks = t;
-            }
-
-            buildings.push({
-                location, name: abbr, fullName: buildingName,
-                sector: sectorName, pickups, dropoffs, ticks,
-                source: 'native',
-            });
-        }
-        return buildings;
-    }
-
-    // >> Merge tracker + native buildings, deduplicating by location.
-    // Native table data (owned buildings) takes precedence since it has
-    // separate upkeep/commodity stock and is from the current page load.
-    function mergeBuildings(trackerB, nativeB) {
-        const byKey = {};
-        const order = [];
-        for (const b of trackerB) {
-            const key = b.sector + '|' + b.location;
-            if (!byKey[key]) { byKey[key] = b; order.push(key); }
-        }
-        for (const b of nativeB) {
-            const key = b.sector + '|' + b.location;
-            if (!byKey[key]) { byKey[key] = b; order.push(key); }
-            else byKey[key] = b;
-        }
-        return order.map(k => byKey[k]);
-    }
-
-    // >> Inject the buildings overview UI (filtering + tick display + sim trigger)
-    function injectBuildingsOverviewUI(buildings) {
-        if (!buildings || buildings.length === 0) {
-            const msg = document.createElement('div');
-            msg.style.cssText = 'width:672px;margin:10px auto;text-align:center;font-family:Verdana,sans-serif;font-size:12px;color:#aaa;';
-            msg.innerHTML = '<em>No tracked buildings. Visit building trade pages to populate the tracker, or check the native table below.</em>';
-            const nativeTable = document.querySelector('table.messagestyle');
-            if (nativeTable) nativeTable.parentNode.insertBefore(msg, nativeTable);
-            else document.body.appendChild(msg);
-            return;
-        }
-
-        const allCommodities = new Set();
-        for (const b of buildings) {
-            for (const k in b.pickups) allCommodities.add(k);
-            for (const k in b.dropoffs) allCommodities.add(k);
-        }
-        const commodityList = [...allCommodities].sort();
-        const savedFilter = GM_getValue('config_building_filter', '');
-
-        const container = document.createElement('div');
-        container.id = 'buildings-overview-ui';
-        container.style.cssText = 'width:672px;margin:10px auto;font-family:Verdana,sans-serif;font-size:11px;color:#ccc;';
-
-        container.innerHTML =
-            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;background:#00001C;padding:8px;border:1px solid #333;">' +
-              '<span style="color:#88aaff;font-weight:bold;white-space:nowrap;">Buildings Overview</span>' +
-              '<input id="bo-filter" type="text" placeholder="Filter: ef rf sm ..." value="' + savedFilter.replace(/"/g, '&quot;') + '"' +
-                ' style="flex:1;background:#001100;color:#00ff00;border:1px solid #0a0;padding:4px 8px;font-family:monospace;font-size:11px;">' +
-              '<button id="bo-clear" style="padding:4px 8px;background:#333;color:#aaa;border:1px solid #555;cursor:pointer;">Clear</button>' +
-              '<button id="bo-sim" style="padding:4px 12px;background:#004400;color:#0f0;border:1px solid #0f0;cursor:pointer;font-weight:bold;">\u25B6 Run Sim</button>' +
-            '</div>' +
-            '<p id="bo-summary" style="margin:4px 0;color:#aaa;padding:0 8px;"></p>' +
-            '<div style="max-height:400px;overflow-y:auto;border:1px solid #333;background:#00001C;">' +
-              '<table style="width:100%;border-collapse:collapse;font-size:11px;">' +
-                '<thead id="bo-thead" style="position:sticky;top:0;background:#0a0a2a;z-index:1;"></thead>' +
-                '<tbody id="bo-tbody"></tbody>' +
-              '</table>' +
-            '</div>';
-
-        const nativeTable = document.querySelector('table.messagestyle');
-        if (nativeTable) nativeTable.parentNode.insertBefore(container, nativeTable);
-        else document.body.appendChild(container);
-
-        const thead = container.querySelector('#bo-thead');
-        let hh = '<tr>';
-        hh += '<th style="padding:4px 6px;text-align:left;border-bottom:1px solid #333;">Loc</th>';
-        hh += '<th style="padding:4px 6px;text-align:left;border-bottom:1px solid #333;">Type</th>';
-        hh += '<th style="padding:4px 6px;text-align:left;border-bottom:1px solid #333;">Sector</th>';
-        for (const c of commodityList) {
-            const short = c.length <= 4 ? c : c.slice(0, 3) + '.';
-            hh += '<th style="padding:4px 4px;text-align:center;border-bottom:1px solid #333;" title="' + c + '">' + short + '</th>';
-        }
-        hh += '<th style="padding:4px 6px;text-align:center;border-bottom:1px solid #333;">Ticks</th>';
-        hh += '</tr>';
-        thead.innerHTML = hh;
-
-        const filterInput = container.querySelector('#bo-filter');
-        const summary = container.querySelector('#bo-summary');
-        const tbody = container.querySelector('#bo-tbody');
-
-        function applyFilter() {
-            const ft = filterInput.value.trim().toLowerCase();
-            GM_setValue('config_building_filter', filterInput.value.trim());
-            const terms = ft ? ft.split(/\s+/) : [];
-
-            const filtered = buildings.filter(b => {
-                if (terms.length === 0) return true;
-                return terms.some(term =>
-                    b.name.toLowerCase() === term ||
-                    b.fullName.toLowerCase().includes(term) ||
-                    b.sector.toLowerCase().includes(term)
-                );
-            });
-
-            let html = '';
-            for (const b of filtered) {
-                const tc = b.ticks === Infinity ? '#888' : b.ticks <= 5 ? '#f44' : b.ticks <= 10 ? '#fa0' : '#0f0';
-                const tt = b.ticks === Infinity ? '\u221E' : String(b.ticks);
-                html += '<tr style="border-bottom:1px solid #111;">';
-                html += '<td style="padding:3px 6px;">' + b.location + '</td>';
-                html += '<td style="padding:3px 6px;font-weight:bold;color:#88aaff;">' + b.name + '</td>';
-                html += '<td style="padding:3px 6px;color:#666;">' + b.sector + '</td>';
-                for (const c of commodityList) {
-                    let val = '', color = '#444';
-                    if (b.pickups[c]) { val = '+' + b.pickups[c].amount; color = '#0f0'; }
-                    else if (b.dropoffs[c]) { val = '-' + b.dropoffs[c].amount; color = '#f44'; }
-                    html += '<td style="padding:3px 4px;text-align:center;color:' + color + ';">' + val + '</td>';
-                }
-                html += '<td style="padding:3px 6px;text-align:center;color:' + tc + ';font-weight:bold;">' + tt + '</td>';
-                html += '</tr>';
-            }
-            tbody.innerHTML = html;
-
-            const types = [...new Set(filtered.map(b => b.name))].join(', ') || 'none';
-            summary.textContent = 'Showing ' + filtered.length + ' buildings: ' + types;
-            return filtered;
-        }
-
-        let currentFiltered = applyFilter();
-
-        filterInput.addEventListener('input', () => { currentFiltered = applyFilter(); });
-        container.querySelector('#bo-clear').addEventListener('click', () => {
-            filterInput.value = ''; currentFiltered = applyFilter();
-        });
-
-        function storeFilteredAndSim() {
-            const rawNodes = currentFiltered.map(b => ({
-                location: b.location, name: b.name,
-                pickups: b.pickups, dropoffs: b.dropoffs,
-            }));
-            GM_setValue('raw_bookkeeper_data', rawNodes);
-
-            if (GM_getValue('logistics_auto_sim', false)) {
-                GM_deleteValue('logistics_auto_sim');
-                const start = GM_getValue('config_hub_coords', '[7,16]');
-                const cap = GM_getValue('config_max_cargo', '200');
-                const toCoord = GM_getValue('config_to_coords', '');
-                const toCap = GM_getValue('config_to_cap', '');
-                const hubType = GM_getValue('config_hub_type', 'starbase');
-                const minTrade = GM_getValue('config_min_trade', '25');
-                const exports = GM_getValue('config_export_items', '');
-                const liveCargo = GM_getValue('logistics_live_cargo', '');
-                try {
-                    const optimizedData = calculateOptimalRoute(
-                        rawNodes, start, start, cap, toCoord, toCap,
-                        hubType, minTrade, exports, liveCargo
-                    );
-                    optimizedData.history = [];
-                    GM_setValue('logistics_route_v5', optimizedData);
-                } catch (e) {
-                    GM_setValue('logistics_needs_recalc', true);
-                    console.error('[pardus-sim] auto-sim failed (deferred to main.php):', e);
-                }
-                window.location.href = 'main.php';
-            }
-        }
-
-        container.querySelector('#bo-sim').addEventListener('click', () => {
-            storeFilteredAndSim();
-            GM_setValue('logistics_needs_recalc', true);
-            window.location.href = 'main.php';
-        });
-
-        if (GM_getValue('logistics_auto_sim', false)) {
-            storeFilteredAndSim();
-        }
-    }
-
-    // >> Main entry point — called from the dispatcher on overview_buildings.php.
-    // Primary path: tracker + native table. Fallback: bookkeeper extension.
     function initBookkeeperParser() {
-        const trackerBuildings = parseTrackerBuildings();
-        const nativeBuildings = parseNativeBuildingsTable();
-        const allBuildings = mergeBuildings(trackerBuildings, nativeBuildings);
-
-        if (allBuildings.length > 0) {
-            injectBuildingsOverviewUI(allBuildings);
-            return;
-        }
-
-        // Fallback: bookkeeper extension table (if installed)
         const checkTable = () => {
             const table = document.querySelector('.bookkeeper-overview table');
             if (table) {
@@ -997,6 +614,7 @@ const SECTOR_DATA = {
 
                 if (GM_getValue('logistics_auto_sim', false)) {
                     GM_deleteValue('logistics_auto_sim');
+
                     let rawData = GM_getValue('raw_bookkeeper_data', []);
                     if (rawData.length > 0) {
                         let start = GM_getValue('config_hub_coords', '[7,16]');
@@ -1007,6 +625,10 @@ const SECTOR_DATA = {
                         let minTrade = GM_getValue('config_min_trade', '25');
                         let exports = GM_getValue('config_export_items', '');
                         let liveCargo = GM_getValue('logistics_live_cargo', '');
+
+                        // Hard-fail policy: the sim throws without userloc/map
+                        // data. Defer to main.php (which always has userloc)
+                        // instead of dying silently mid-observer.
                         try {
                             let optimizedData = calculateOptimalRoute(rawData, start, start, cap, toCoord, toCap, hubType, minTrade, exports, liveCargo);
                             optimizedData.history = [];
@@ -1027,11 +649,10 @@ const SECTOR_DATA = {
             const observer = new MutationObserver((mutationsList, obs) => {
                 if (checkTable()) obs.disconnect();
             });
-            observer.observe(document.body, { childLists: true, subtree: true });
+            observer.observe(document.body, { childList: true, subtree: true });
         }
     }
 
-    // >> Legacy: parse bookkeeper extension table (kept for backward compat)
     function parseExtensionTable(table) {
         const rawNodes = [];
         const commodityIdMap = {};
@@ -1068,6 +689,7 @@ const SECTOR_DATA = {
         }
         GM_setValue('raw_bookkeeper_data', rawNodes);
     }
+
     // --- 5. Static UI (Fallback) ---
     function injectBuildingsUI() {
         let centerCell = document.querySelector('td[style*="background-color:#00001C"][align="center"]');
