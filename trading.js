@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.86
+// @version      6.87
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.82: Cancel button in the flight overlay bar — stops auto-fly immediately in case of misclick or wrong destination.
 // @description  v6.83: Fix duplicate wormholes between same sector pair (e.g. Ras Elased↔Fornacis) — #sub-region suffix now preserved so all wormhole endpoints reach the pathfinder instead of last-write-wins overwrite.
 // @description  v6.84: HPA* pathfinder (hpaCompile/hpaCrossSectorAP/hpaFindRoute) — fixes grid-merge bug (split sectors like Betelgeuse no longer dissolve walls), padding bug (phantom fuel tiles in Ras Elased nook), and recomputes all wormhole distances with ship-configured terrain costs. Wired into simCrossTravelAP, getCrossSectorRoute, getCrossSectorAPFast, and exports calculator.
 // @description  v6.85: Full HPA* cutover — legacy merged-grid model, duplicate macro-graph, and cross-sector Dijkstra deleted. simTravelAP now routes through HPA with fragment resolution (fixes Betelgeuse same-sector AP=0). No silent fallbacks — hard-fail on unknown sectors/unreachable targets.
 // @description  v6.86: Enforce hard-fail policy in simTravelAP/simCrossTravelAP/getCrossSectorAPFast — null coords and unknown sectors now throw instead of returning 0/Infinity/null. hpaGetTable logs compile errors. Added pathfinder facade test suite with bug-museum regressions and golden-master snapshot.
+// @description  v6.87: Persist HPA* macro graph across page loads via GM_setValue — eliminates ~5s Dijkstra+Floyd-Warshall recompile on every navigation. Compact typed-array format (Float32Array/Int32Array + base64). Cache key includes terrainAP, wjump, sealed, rawText.length, and schema version for auto-invalidation.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -4992,6 +4992,144 @@ const SECTOR_DATA = {
         return { sectors, macro, terrainAP, wjump: wjump || 10, dijCache: new Map() };
     }
 
+    // >> Persistence schema version — bump when serialize format changes.
+    const HPA_MACRO_SCHEMA = 1;
+
+    // >> Base64 helpers for typed array serialization (chunked to avoid
+    // call-stack limits on large arrays).
+    function hpaBytesToBase64(bytes) {
+        let binary = '';
+        const chunk = 8192;
+        for (let i = 0; i < bytes.length; i += chunk) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return btoa(binary);
+    }
+
+    function hpaBase64ToBytes(b64) {
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    }
+
+    // >> Serialize the HPA* table to a JSON string for GM_setValue.
+    // Converts Map-based dist/next to flat Float32Array/Int32Array (base64),
+    // reducing ~62 MB of JSON-with-string-keys to ~13 MB.
+    function hpaSerializeTable(table, cacheKey) {
+        const n = table.macro.nodeCount;
+        const nodes = table.macro.nodes;
+        const keyToIdx = new Map();
+        nodes.forEach((nd, i) => keyToIdx.set(nd.key, i));
+
+        const distFlat = new Float32Array(n * n);
+        const nextFlat = new Int32Array(n * n);
+        for (let i = 0; i < n; i++) {
+            const dm = table.macro.distMap.get(nodes[i].key);
+            const nm = table.macro.nextMap.get(nodes[i].key);
+            for (let j = 0; j < n; j++) {
+                if (i === j) {
+                    distFlat[i * n + j] = 0;
+                    nextFlat[i * n + j] = j;
+                } else if (dm) {
+                    const d = dm.get(nodes[j].key);
+                    distFlat[i * n + j] = (d !== undefined) ? d : Infinity;
+                    const nx = nm ? nm.get(nodes[j].key) : null;
+                    nextFlat[i * n + j] = (nx != null) ? (keyToIdx.has(nx) ? keyToIdx.get(nx) : -1) : -1;
+                } else {
+                    distFlat[i * n + j] = Infinity;
+                    nextFlat[i * n + j] = -1;
+                }
+            }
+        }
+
+        const distB64 = hpaBytesToBase64(new Uint8Array(distFlat.buffer));
+        const nextB64 = hpaBytesToBase64(new Uint8Array(nextFlat.buffer));
+
+        const wbArr = [];
+        for (const [k, v] of table.macro.wormholesBySector) {
+            wbArr.push([k, v.map(nd => [nd.key, nd.sec, nd.x, nd.y])]);
+        }
+
+        const dijArr = [];
+        for (const [k, v] of table.dijCache) {
+            dijArr.push([k, [...v.entries()]]);
+        }
+
+        return JSON.stringify({
+            schema: HPA_MACRO_SCHEMA,
+            key: cacheKey,
+            n: n,
+            nodes: nodes.map(nd => [nd.key, nd.sec, nd.x, nd.y]),
+            dist: distB64,
+            next: nextB64,
+            wormholesBySector: wbArr,
+            wjump: table.wjump,
+            dijCache: dijArr,
+        });
+    }
+
+    // >> Deserialize the HPA* table from a GM_getValue JSON string.
+    // Rebuilds Map-based dist/next from flat typed arrays, and re-parses
+    // sector grids from rawText (cheap — no Dijkstra/Floyd-Warshall).
+    // terrainAP is passed in (not deserialized) because JSON.stringify
+    // converts Infinity → null, which would make impassable tiles passable.
+    // Returns null when schema or cacheKey doesn't match.
+    function hpaDeserializeTable(storedJson, expectedKey, rawText, sectorMeta, terrainAP) {
+        const stored = JSON.parse(storedJson);
+        if (stored.schema !== HPA_MACRO_SCHEMA) return null;
+        if (stored.key !== expectedKey) return null;
+
+        const n = stored.n;
+        const nodes = stored.nodes.map(nd => ({ key: nd[0], sec: nd[1], x: nd[2], y: nd[3] }));
+
+        const distBytes = hpaBase64ToBytes(stored.dist);
+        const nextBytes = hpaBase64ToBytes(stored.next);
+        const distFlat = new Float32Array(distBytes.buffer);
+        const nextFlat = new Int32Array(nextBytes.buffer);
+
+        const distMap = new Map();
+        const nextMap = new Map();
+        for (let i = 0; i < n; i++) {
+            const fromKey = nodes[i].key;
+            const dm = new Map();
+            const nm = new Map();
+            for (let j = 0; j < n; j++) {
+                if (i !== j && isFinite(distFlat[i * n + j])) {
+                    dm.set(nodes[j].key, distFlat[i * n + j]);
+                    const nextIdx = nextFlat[i * n + j];
+                    if (nextIdx >= 0 && nextIdx < n) {
+                        nm.set(nodes[j].key, nodes[nextIdx].key);
+                    }
+                }
+            }
+            distMap.set(fromKey, dm);
+            nextMap.set(fromKey, nm);
+        }
+
+        const wormholesBySector = new Map();
+        for (const [k, v] of stored.wormholesBySector) {
+            wormholesBySector.set(k, v.map(nd => ({ key: nd[0], sec: nd[1], x: nd[2], y: nd[3] })));
+        }
+
+        const dijCache = new Map();
+        if (stored.dijCache) {
+            for (const [k, entries] of stored.dijCache) {
+                dijCache.set(k, new Map(entries));
+            }
+        }
+
+        const sectors = hpaParseMap(rawText, sectorMeta);
+
+        return {
+            sectors: sectors,
+            macro: { nodes, distMap, nextMap, wormholesBySector, nodeCount: n },
+            terrainAP: terrainAP,
+            wjump: stored.wjump,
+            dijCache: dijCache,
+        };
+    }
+
     // >> Cached local Dijkstra — avoids recomputing for the same (sector, tile).
     function hpaLocalDijkstraCached(table, secName, x, y) {
         const key = secName + '|' + x + ',' + y;
@@ -5195,7 +5333,10 @@ const SECTOR_DATA = {
     // >> Lazy-compile cache — bridges the pure HPA* core to the IIFE.
     // Compiles on first query, cached by terrainAP+wjump+sealed key so it
     // auto-invalidates when ship config or wormhole seals change.
-    // Returns null when map data is missing or compile fails.
+    // Persists the compiled macro graph to GM_setValue so subsequent page
+    // loads skip the ~5s Dijkstra+Floyd-Warshall compile. Falls back to full
+    // compile (with a console.warn) when the stored data is missing, stale,
+    // corrupt, or when GM_setValue quota is exceeded.
     let _hpaTable = null, _hpaTableKey = null;
     function hpaGetTable() {
         try {
@@ -5206,10 +5347,37 @@ const SECTOR_DATA = {
             const wjump = Number(shipOpt.wormhole_cost) || 10;
             let sealed;
             try { sealed = getWormholeSeals(); } catch (e) { sealed = new Set(); }
-            const key = JSON.stringify(terrainAP) + '|' + wjump + '|' + [...sealed].sort().join(',');
+            const key = JSON.stringify(terrainAP) + '|' + wjump + '|' + [...sealed].sort().join(',')
+                        + '|' + rawText.length + '|' + HPA_MACRO_SCHEMA;
             if (_hpaTableKey === key && _hpaTable) return _hpaTable;
+
+            // Try persistent cache (GM_setValue from a previous page load).
+            const storedJson = GM_getValue('pardus_hpa_macro_v1', null);
+            if (storedJson) {
+                try {
+                    const table = hpaDeserializeTable(storedJson, key, rawText, SECTOR_DATA, terrainAP);
+                    if (table && table.macro.nodeCount > 0) {
+                        _hpaTable = table;
+                        _hpaTableKey = key;
+                        return table;
+                    }
+                } catch (e) {
+                    console.warn('hpaGetTable: deserialize failed, recompiling:', e.message);
+                }
+            }
+
+            // Full compile (first load or cache miss).
             _hpaTable = hpaCompile(rawText, SECTOR_DATA, terrainAP, wjump, sealed);
             _hpaTableKey = key;
+
+            // Persist for next page load (non-fatal if quota exceeded).
+            try {
+                const serialized = hpaSerializeTable(_hpaTable, key);
+                GM_setValue('pardus_hpa_macro_v1', serialized);
+            } catch (e) {
+                console.warn('hpaGetTable: persist failed (non-fatal):', e.message);
+            }
+
             return _hpaTable;
         } catch (e) {
             console.error('hpaGetTable: compile failed:', e.message);
