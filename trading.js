@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.81
+// @version      6.82
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.77: Exports tab auto-loads on panel open (no more "Click Recalculate" placeholder). Opps one-way and two-way tables now have a Laps column showing how many full-hull trips before the bottleneck (stk/cr/room).
 // @description  v6.78: Laps now show fractional values (e.g. 2.5 instead of 2). Pin button to set active run without flying. Active run bar is now a separate draggable floating window outside the exports panel.
 // @description  v6.79: Wormhole jumps now use warpAjax/warp instead of navAjax — fixes cross-sector auto-fly getting stuck on wormhole tiles.
 // @description  v6.80: 2-sector routes now use direct wormhole connections (no multi-hop detours). Fixed "Off local path" error after wormhole jumps by recomputing path from actual post-jump tile.
 // @description  v6.81: Cross-sector auto-fly now uses the same Floyd-Warshall macro graph as the opps estimator — flown routes match opps AP estimates, including multi-hop paths through intermediate sectors.
+// @description  v6.82: Cancel button in the flight overlay bar — stops auto-fly immediately in case of misclick or wrong destination.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -5369,9 +5369,21 @@ const SECTOR_DATA = {
             legs = [{ sector: sectorName, path: result.path, tileIds: result.tileIds }];
         }
 
+        let cancelled = false;
         const overlay = document.createElement('div');
-        overlay.style.cssText = 'position:fixed; top:0; left:0; width:100%; background:#003355; color:#fff; text-align:center; padding:6px; z-index:999999; font-weight:bold; font-size:13px; border-bottom:2px solid #0088ff;';
+        overlay.style.cssText = 'position:fixed; top:0; left:0; width:100%; background:#003355; color:#fff; text-align:center; padding:6px; z-index:999999; font-weight:bold; font-size:13px; border-bottom:2px solid #0088ff; display:flex; align-items:center; justify-content:center; gap:12px;';
         document.body.appendChild(overlay);
+        const cancelBtn = document.createElement('button');
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.style.cssText = 'background:#882222; color:#fff; border:1px solid #ff4444; border-radius:3px; padding:2px 12px; font-weight:bold; font-size:12px; cursor:pointer; white-space:nowrap;';
+        cancelBtn.onclick = function() {
+            cancelled = true;
+            GM_deleteValue('logistics_ambush_resume');
+            setOverlay('\u2708 Flight cancelled.');
+            setTimeout(() => overlay.remove(), 2000);
+            if (onArrive) onArrive(false);
+        };
+        overlay.appendChild(cancelBtn);
 
         function resolveNavFn() {
             if (typeof w.navAjax === 'function') return w.navAjax;
@@ -5390,7 +5402,14 @@ const SECTOR_DATA = {
         }
 
         function setOverlay(text) {
-            overlay.innerText = text;
+            const span = overlay.querySelector('.fly-text') || (() => {
+                const s = document.createElement('span');
+                s.className = 'fly-text';
+                s.style.flex = '1';
+                overlay.insertBefore(s, overlay.firstChild);
+                return s;
+            })();
+            span.textContent = text;
         }
 
         function fail(msg) {
@@ -5402,6 +5421,7 @@ const SECTOR_DATA = {
         let legIdx = 0;
 
         function flyNext() {
+            if (cancelled) return;
             const curId = currentTileId();
             const curSector = getCurrentSector();
 
@@ -5469,6 +5489,7 @@ const SECTOR_DATA = {
 
                 const deadline = Date.now() + 8000;
                 (function waitForJump() {
+                    if (cancelled) return;
                     const newSector = getCurrentSector();
                     if (newSector !== beforeSector) {
                         setTimeout(flyNext, 200);
@@ -5535,6 +5556,7 @@ const SECTOR_DATA = {
                     try { navFn(tileId); } catch (e) { GM_deleteValue('logistics_ambush_resume'); fail('\u26a0 nav() threw during sidestep: ' + e.message); return; }
                     const dl = Date.now() + 6000;
                     (function wait() {
+                        if (cancelled) { GM_deleteValue('logistics_ambush_resume'); return; }
                         if (currentTileId() !== before) { GM_deleteValue('logistics_ambush_resume'); setTimeout(onSuccess, afterMs); return; }
                         if (Date.now() > dl) { GM_deleteValue('logistics_ambush_resume'); fail(onFailMsg); return; }
                         setTimeout(wait, 100);
@@ -5619,6 +5641,7 @@ const SECTOR_DATA = {
 
             const deadline = Date.now() + 6000;
             (function waitForMove() {
+                if (cancelled) { GM_deleteValue('logistics_ambush_resume'); return; }
                 if (currentTileId() !== beforeId) {
                     GM_deleteValue('logistics_ambush_resume');
                     setTimeout(flyNext, 150);
