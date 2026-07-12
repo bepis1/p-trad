@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.85
+// @version      6.86
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.81: Cross-sector auto-fly now uses the same Floyd-Warshall macro graph as the opps estimator — flown routes match opps AP estimates, including multi-hop paths through intermediate sectors.
 // @description  v6.82: Cancel button in the flight overlay bar — stops auto-fly immediately in case of misclick or wrong destination.
 // @description  v6.83: Fix duplicate wormholes between same sector pair (e.g. Ras Elased↔Fornacis) — #sub-region suffix now preserved so all wormhole endpoints reach the pathfinder instead of last-write-wins overwrite.
 // @description  v6.84: HPA* pathfinder (hpaCompile/hpaCrossSectorAP/hpaFindRoute) — fixes grid-merge bug (split sectors like Betelgeuse no longer dissolve walls), padding bug (phantom fuel tiles in Ras Elased nook), and recomputes all wormhole distances with ship-configured terrain costs. Wired into simCrossTravelAP, getCrossSectorRoute, getCrossSectorAPFast, and exports calculator.
 // @description  v6.85: Full HPA* cutover — legacy merged-grid model, duplicate macro-graph, and cross-sector Dijkstra deleted. simTravelAP now routes through HPA with fragment resolution (fixes Betelgeuse same-sector AP=0). No silent fallbacks — hard-fail on unknown sectors/unreachable targets.
+// @description  v6.86: Enforce hard-fail policy in simTravelAP/simCrossTravelAP/getCrossSectorAPFast — null coords and unknown sectors now throw instead of returning 0/Infinity/null. hpaGetTable logs compile errors. Added pathfinder facade test suite with bug-museum regressions and golden-master snapshot.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -4575,15 +4575,13 @@ const SECTOR_DATA = {
     // dijCache/macroGraph params are vestigial (HPA uses its own internal
     // cache) but kept for caller-signature compatibility.
     function getCrossSectorAPFast(fromCoords, fromSector, toCoords, toSector, dijCache, macroGraph) {
-        if (!fromCoords || !toCoords || !fromSector || !toSector) return null;
+        if (!fromCoords || !toCoords || !fromSector || !toSector) {
+            throw new Error('getCrossSectorAPFast: null coords or sector (from=' + fromSector + '/' + JSON.stringify(fromCoords) + ', to=' + toSector + '/' + JSON.stringify(toCoords) + ')');
+        }
         const table = hpaGetTable();
         if (!table) return null;
-        try {
-            const ap = hpaCrossSectorAP(table, fromSector, fromCoords, toSector, toCoords);
-            return (ap !== null && isFinite(ap)) ? ap : null;
-        } catch (e) {
-            return null;
-        }
+        const ap = hpaCrossSectorAP(table, fromSector, fromCoords, toSector, toCoords);
+        return (ap !== null && isFinite(ap)) ? ap : null;
     }
     // --- 14.5. HPA* Pathfinder ---
 
@@ -5214,6 +5212,7 @@ const SECTOR_DATA = {
             _hpaTableKey = key;
             return _hpaTable;
         } catch (e) {
+            console.error('hpaGetTable: compile failed:', e.message);
             _hpaTable = null;
             _hpaTableKey = null;
             return null;
@@ -7048,7 +7047,9 @@ const SECTOR_DATA = {
     // Dijkstra. NO estimation fallback: throws when the sector is unknown,
     // the static map isn't loaded, or the target is unreachable.
     function simTravelAP(fromCoords, toCoords, sectorName, dijCache) {
-        if (!fromCoords || !toCoords) return 0;
+        if (!fromCoords || !toCoords) {
+            throw new Error('simTravelAP: null coords (from=' + JSON.stringify(fromCoords) + ', to=' + JSON.stringify(toCoords) + ')');
+        }
         if (!sectorName) {
             throw new Error('simTravelAP: sector unknown (no userloc / static map not loaded)');
         }
@@ -7067,9 +7068,12 @@ const SECTOR_DATA = {
     // Public cross-sector AP. Memoizes per (fromSec|fromX,fromY|toSec|toX,toY).
     // Delegates to HPA* (hpaCrossSectorAP) which resolves fragments and routes
     // through the pre-compiled macro wormhole graph. Returns Infinity when
-    // unreachable (so the route engine can score it as infinite cost).
+    // the target is unreachable (terrain-blocked — a valid routing result).
+    // Throws on data errors (null coords, unknown sector, table unavailable).
     function simCrossTravelAP(fromCoords, fromSector, toCoords, toSector, dijCache, crossCache) {
-        if (!fromCoords || !toCoords) return 0;
+        if (!fromCoords || !toCoords) {
+            throw new Error('simCrossTravelAP: null coords (from=' + JSON.stringify(fromCoords) + ', to=' + JSON.stringify(toCoords) + ')');
+        }
         if (!fromSector || !toSector) {
             throw new Error('simCrossTravelAP: sector unknown (from=' + fromSector + ', to=' + toSector + ')');
         }
@@ -7077,13 +7081,10 @@ const SECTOR_DATA = {
                     toSector   + '|' + toCoords.x   + ',' + toCoords.y;
         if (crossCache && crossCache[key] !== undefined) return crossCache[key];
         const table = hpaGetTable();
-        if (!table) return Infinity;
-        let ap;
-        try {
-            ap = hpaCrossSectorAP(table, fromSector, fromCoords, toSector, toCoords);
-        } catch (e) {
-            ap = null;
+        if (!table) {
+            throw new Error('simCrossTravelAP: HPA table unavailable (static map not loaded)');
         }
+        const ap = hpaCrossSectorAP(table, fromSector, fromCoords, toSector, toCoords);
         const result = (ap !== null && isFinite(ap)) ? ap : Infinity;
         if (crossCache) crossCache[key] = result;
         return result;
