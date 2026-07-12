@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.83
+// @version      6.85
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.79: Wormhole jumps now use warpAjax/warp instead of navAjax — fixes cross-sector auto-fly getting stuck on wormhole tiles.
-// @description  v6.80: 2-sector routes now use direct wormhole connections (no multi-hop detours). Fixed "Off local path" error after wormhole jumps by recomputing path from actual post-jump tile.
 // @description  v6.81: Cross-sector auto-fly now uses the same Floyd-Warshall macro graph as the opps estimator — flown routes match opps AP estimates, including multi-hop paths through intermediate sectors.
 // @description  v6.82: Cancel button in the flight overlay bar — stops auto-fly immediately in case of misclick or wrong destination.
 // @description  v6.83: Fix duplicate wormholes between same sector pair (e.g. Ras Elased↔Fornacis) — #sub-region suffix now preserved so all wormhole endpoints reach the pathfinder instead of last-write-wins overwrite.
+// @description  v6.84: HPA* pathfinder (hpaCompile/hpaCrossSectorAP/hpaFindRoute) — fixes grid-merge bug (split sectors like Betelgeuse no longer dissolve walls), padding bug (phantom fuel tiles in Ras Elased nook), and recomputes all wormhole distances with ship-configured terrain costs. Wired into simCrossTravelAP, getCrossSectorRoute, getCrossSectorAPFast, and exports calculator.
+// @description  v6.85: Full HPA* cutover — legacy merged-grid model, duplicate macro-graph, and cross-sector Dijkstra deleted. simTravelAP now routes through HPA with fragment resolution (fixes Betelgeuse same-sector AP=0). No silent fallbacks — hard-fail on unknown sectors/unreachable targets.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2977,11 +2977,9 @@ const SECTOR_DATA = {
             }
         }
 
-        let macroGraph = null;
-        try { macroGraph = getMacroWormholeGraph(); } catch (e) { macroGraph = null; }
         const dijCache = {};
         const routes = [];
-        const usedFallback = !macroGraph;
+        const usedFallback = false;
         let preFiltered = 0;
 
         for (const resId in commodityIndex) {
@@ -3017,11 +3015,9 @@ const SECTOR_DATA = {
                     if (minCrAp > 0 && profit / TRADE_AP < minCrAp) { preFiltered++; continue; }
 
                     let ap = null;
-                    if (macroGraph) {
-                        try {
-                            ap = getCrossSectorAPFast(seller.coords, seller.sector, buyer.coords, buyer.sector, dijCache, macroGraph);
-                        } catch (e) { ap = null; }
-                    }
+                    try {
+                        ap = getCrossSectorAPFast(seller.coords, seller.sector, buyer.coords, buyer.sector, dijCache, null);
+                    } catch (e) { ap = null; }
 
                     const apCost = (ap != null) ? ap + TRADE_AP : null;
                     const ratio = (apCost != null && apCost > 0) ? profit / apCost : null;
@@ -3106,11 +3102,9 @@ const SECTOR_DATA = {
             locs.push({ entry: e, coords: rc.coords, sector: rc.sector });
         }
 
-        let macroGraph = null;
-        try { macroGraph = getMacroWormholeGraph(); } catch (e) { macroGraph = null; }
         const dijCache = {};
         const routes = [];
-        const usedFallback = !macroGraph;
+        const usedFallback = false;
         let preFiltered = 0;
 
         for (let i = 0; i < locs.length; i++) {
@@ -3193,12 +3187,10 @@ const SECTOR_DATA = {
 
                 // Macro AP both ways (Pardus terrain is asymmetric).
                 let apAB = null, apBA = null;
-                if (macroGraph) {
-                    try {
-                        apAB = getCrossSectorAPFast(A.coords, A.sector, B.coords, B.sector, dijCache, macroGraph);
-                        apBA = getCrossSectorAPFast(B.coords, B.sector, A.coords, A.sector, dijCache, macroGraph);
-                    } catch (e) { apAB = null; apBA = null; }
-                }
+                try {
+                    apAB = getCrossSectorAPFast(A.coords, A.sector, B.coords, B.sector, dijCache, null);
+                    apBA = getCrossSectorAPFast(B.coords, B.sector, A.coords, A.sector, dijCache, null);
+                } catch (e) { apAB = null; apBA = null; }
 
                 const apCost = (apAB != null && apBA != null) ? apAB + apBA + TRADE_AP : null;
                 const ratio = (apCost != null && apCost > 0) ? bestTotal / apCost : null;
@@ -4411,24 +4403,6 @@ const SECTOR_DATA = {
 
     // --- 14. Local Sector Pathfinder ---
 
-    // >> Pair wormhole endpoints by sub-region suffix.
-    // When multiple wormholes connect the same two sectors (e.g.
-    // "Fornacis#West" and "Fornacis#East" in Ras Elased), each source
-    // wormhole must be paired with the correct destination tile. The #suffix
-    // in the static_ext.txt wormhole name identifies the sub-region of the
-    // destination sector — matching by suffix gives the correct bidirectional
-    // pair. Falls back to 1:1 pairing when no suffixes are present.
-    function _pairWormholes(fromList, toList) {
-        const pairs = [];
-        for (const fw of fromList) {
-            let tw = toList.find(t => t.sub === fw.sub);
-            if (!tw && fromList.length === 1 && toList.length === 1) tw = toList[0];
-            if (!tw) continue;
-            pairs.push({ from: fw, to: tw });
-        }
-        return pairs;
-    }
-
     function parseStaticMap(silent = false) {
         let rawMapData = localStorage.getItem("pardus_static_map_data") || "PASTE_YOUR_STATICXT_TXT_HERE";
         if (!rawMapData || rawMapData.includes("PASTE_YOUR_STATICXT_TXT_HERE")) {
@@ -4472,167 +4446,33 @@ const SECTOR_DATA = {
             }
         }
 
-        // >> Merge sub-sectors into their parent sector.
-        // static_ext.txt splits some game sectors into multiple grid
-        // fragments (e.g. "Betelgeuse_East" + "Betelgeuse_West") that share
-        // the same tile-ID range.  The game shows the parent name ("Betelgeuse"),
-        // so parsedMap must have a single entry per parent.  We merge by
-        // overlaying each sub-sector's grid onto a full-size parent grid
-        // (non-'b' tiles win) and merging wormholes/beacons/starbases.
-        const toMerge = [];
-        for (const name in parsedMap) {
-            const resolved = _resolveSectorName(name);
-            if (resolved && resolved !== name) toMerge.push({ sub: name, parent: resolved });
-        }
-        for (const { sub, parent } of toMerge) {
-            const subSec = parsedMap[sub];
-            if (!subSec) continue;
-            const secInfo = getSectorData(parent);
-            if (!secInfo) continue;
-            if (!parsedMap[parent]) {
-                parsedMap[parent] = { grid: [], wormholes: {}, beacons: [], starbases: [] };
-            }
-            const par = parsedMap[parent];
-            const tRows = secInfo.rows, tCols = secInfo.cols;
-            while (par.grid.length < tRows) par.grid.push(new Array(tCols).fill('b'));
-            for (let i = 0; i < par.grid.length; i++) {
-                while (par.grid[i].length < tCols) par.grid[i].push('b');
-            }
-            for (let y = 0; y < subSec.grid.length && y < tRows; y++) {
-                for (let x = 0; x < subSec.grid[y].length && x < tCols; x++) {
-                    if (subSec.grid[y][x] !== 'b') par.grid[y][x] = subSec.grid[y][x];
-                }
-            }
-            for (const wd in subSec.wormholes) {
-                if (!par.wormholes[wd]) par.wormholes[wd] = [];
-                par.wormholes[wd].push(...subSec.wormholes[wd]);
-            }
-            if (subSec.beacons) par.beacons.push(...subSec.beacons);
-            if (subSec.starbases) par.starbases.push(...subSec.starbases);
-            delete parsedMap[sub];
-        }
-        // Fix wormhole destinations that pointed to merged sub-sectors.
-        for (const secName in parsedMap) {
-            const sec = parsedMap[secName];
-            if (!sec.wormholes) continue;
-            const renames = [];
-            for (const wd in sec.wormholes) {
-                if (!parsedMap[wd]) {
-                    const resolved = _resolveSectorName(wd);
-                    if (resolved && parsedMap[resolved]) renames.push({ old: wd, nw: resolved });
-                }
-            }
-            for (const { old, nw } of renames) {
-                if (!sec.wormholes[nw]) sec.wormholes[nw] = [];
-                sec.wormholes[nw].push(...sec.wormholes[old]);
-                delete sec.wormholes[old];
-            }
-        }
-
-        // Pad grids to match SECTOR_DATA rows (tile ID stride may exceed
-        // the grid height in static_ext — missing rows are not in the file).
-        // For full sectors with incomplete data, pad with 'f' (fuel) so tiles
-        // in missing rows are reachable.  For sub-sectors whose grid width
-        // differs from the parent's cols (e.g. "Pardus_West" is 37 wide but
-        // parent "Pardus" is 100), widen existing rows with 'b' (blocked)
-        // and pad missing rows with 'b' — those tiles belong to a different
-        // sub-region and must not be traversable.
+        // Pad grids to SECTOR_DATA dimensions with 'b' (blocked, NEVER 'f').
+        // HPA's hpaParseMap does the same — this keeps parsedMap consistent
+        // for callers that read it directly (pardusGetSectorPath fallback,
+        // test harnesses). No merge: fragments stay as separate entries.
         for (const name in parsedMap) {
             const secInfo = getSectorData(name);
             if (!secInfo) continue;
+            const tRows = secInfo.rows, tCols = secInfo.cols;
             const grid = parsedMap[name].grid;
-            const targetRows = secInfo.rows;
-            const targetCols = secInfo.cols;
             if (grid.length === 0) continue;
-            const isSubSector = grid[0].length !== targetCols;
-            if (isSubSector) {
-                for (let i = 0; i < grid.length; i++) {
-                    while (grid[i].length < targetCols) grid[i].push('b');
-                }
-                while (grid.length < targetRows) {
-                    grid.push(new Array(targetCols).fill('b'));
-                }
-            } else {
-                while (grid.length < targetRows) {
-                    grid.push(new Array(targetCols).fill('f'));
-                }
+            while (grid.length < tRows) grid.push(new Array(tCols).fill('b'));
+            for (let i = 0; i < grid.length; i++) {
+                while (grid[i].length < tCols) grid[i].push('b');
             }
         }
         return Object.keys(parsedMap).length > 0;
     }
 
     function getSectorPath(sectorName, startX, startY, endX, endY) {
-        if (Object.keys(parsedMap).length === 0) parseStaticMap(true);
-        let sector = parsedMap[sectorName];
-        if (!sector) return null;
-        let grid = sector.grid;
-        if (!grid || grid.length === 0) return null;
-        let rows = grid.length;
-        let cols = grid[0].length;
-        if (startX < 0 || startY < 0 || startX >= cols || startY >= rows) return null;
-        if (endX < 0 || endY < 0 || endX >= cols || endY >= rows) return null;
-
-        const tap = getTerrainAP();
-
-        // Dijkstra over AP costs. Diagonal and orthogonal moves cost the same
-        // AP in Pardus, so many equal-cost paths exist. We break ties by
-        // preferring paths with fewer direction changes (turns): this keeps the
-        // route minimal-AP while making it as straight as possible, which lets
-        // the flight loop extend each click to the full navscreen viewing range.
-        let distances = {};
-        let turns = {};
-        let prev = {};
-        let pq = [];
-        let startKey = `${startX},${startY}`;
-        distances[startKey] = 0;
-        turns[startKey] = 0;
-        pq.push({ x: startX, y: startY, cost: 0, turns: 0, dirKey: null });
-
-        while (pq.length > 0) {
-            pq.sort((a, b) => (a.cost - b.cost) || (a.turns - b.turns));
-            let current = pq.shift();
-            let cKey = `${current.x},${current.y}`;
-            if (current.cost > (distances[cKey] !== void 0 ? distances[cKey] : Infinity)) continue;
-            if (current.turns > (turns[cKey] !== void 0 ? turns[cKey] : Infinity)) continue;
-            if (current.x === endX && current.y === endY) break;
-            for (let dx = -1; dx <= 1; dx++) {
-                for (let dy = -1; dy <= 1; dy++) {
-                    if (dx === 0 && dy === 0) continue;
-                    let nx = current.x + dx;
-                    let ny = current.y + dy;
-                    if (ny >= 0 && ny < rows && nx >= 0 && nx < cols) {
-                        let terrain = grid[ny][nx];
-                        let moveCost = tap[terrain] !== void 0 ? tap[terrain] : 9;
-                        let newCost = current.cost + moveCost;
-                        let dirKey = `${dx},${dy}`;
-                        let newTurns = (current.dirKey && current.dirKey !== dirKey) ? current.turns + 1 : current.turns;
-                        let nKey = `${nx},${ny}`;
-                        let bestTurns = turns[nKey] !== void 0 ? turns[nKey] : Infinity;
-                        let better = false;
-                        if (newCost < (distances[nKey] !== void 0 ? distances[nKey] : Infinity)) better = true;
-                        else if (newCost === distances[nKey] && newTurns < bestTurns) better = true;
-                        if (better) {
-                            distances[nKey] = newCost;
-                            turns[nKey] = newTurns;
-                            prev[nKey] = cKey;
-                            pq.push({ x: nx, y: ny, cost: newCost, turns: newTurns, dirKey: dirKey });
-                        }
-                    }
-                }
-            }
-        }
-
-        let endKey = `${endX},${endY}`;
-        if (distances[endKey] === void 0) return null;
-
-        let path = [];
-        let cur = endKey;
-        while (cur) {
-            let parts = cur.split(",");
-            path.unshift({ x: parseInt(parts[0], 10), y: parseInt(parts[1], 10) });
-            cur = prev[cur];
-        }
-        return path;
+        const table = hpaGetTable();
+        if (!table) return null;
+        const fromFrag = hpaResolveFragment(table.sectors, sectorName, startX, startY);
+        const toFrag = hpaResolveFragment(table.sectors, sectorName, endX, endY);
+        if (fromFrag !== toFrag) return null;
+        const sec = table.sectors.get(fromFrag);
+        if (!sec || sec.grid.length === 0) return null;
+        return hpaLocalAStar(sec.grid, table.terrainAP, startX, startY, endX, endY);
     }
 
     function pardusGetSectorPath(sectorName, startTileId, startX, startY, endX, endY) {
@@ -4675,44 +4515,12 @@ const SECTOR_DATA = {
     // Single-source Dijkstra: returns a { "x,y": apCost } map for every
     // reachable tile in the sector, starting from (startX, startY).  Runs
     // once instead of N times when we need distances to many targets.
+    // Delegates to HPA* (hpaSectorAllDistances) which resolves the fragment
+    // and runs the terrain-aware Dijkstra on the correct fragment grid.
     function getSectorAllDistances(sectorName, startX, startY) {
-        if (Object.keys(parsedMap).length === 0) parseStaticMap(true);
-        let sector = parsedMap[sectorName];
-        if (!sector) return null;
-        let grid = sector.grid;
-        if (!grid || grid.length === 0) return null;
-        let rows = grid.length;
-        let cols = grid[0].length;
-        if (startX < 0 || startY < 0 || startX >= cols || startY >= rows) return null;
-
-        const tap = getTerrainAP();
-
-        let distances = {};
-        let pq = [{ x: startX, y: startY, cost: 0 }];
-        distances[startX + ',' + startY] = 0;
-
-        while (pq.length > 0) {
-            pq.sort((a, b) => a.cost - b.cost);
-            let current = pq.shift();
-            let cKey = current.x + ',' + current.y;
-            if (current.cost > distances[cKey]) continue;
-            for (let dx = -1; dx <= 1; dx++) {
-                for (let dy = -1; dy <= 1; dy++) {
-                    if (dx === 0 && dy === 0) continue;
-                    let nx = current.x + dx, ny = current.y + dy;
-                    if (ny < 0 || ny >= rows || nx < 0 || nx >= cols) continue;
-                    let terrain = grid[ny][nx];
-                    let moveCost = tap[terrain] !== void 0 ? tap[terrain] : 9;
-                    let newCost = current.cost + moveCost;
-                    let nKey = nx + ',' + ny;
-                    if (newCost < (distances[nKey] !== void 0 ? distances[nKey] : Infinity)) {
-                        distances[nKey] = newCost;
-                        pq.push({ x: nx, y: ny, cost: newCost });
-                    }
-                }
-            }
-        }
-        return distances;
+        const table = hpaGetTable();
+        if (!table) return null;
+        return hpaSectorAllDistances(table, sectorName, startX, startY);
     }
 
     // >> Wormhole seal calendar (ported from pardusapcalculator.uk, credit Asdwolf)
@@ -4751,344 +4559,330 @@ const SECTOR_DATA = {
     //
     // Returns: { legs: [{ sector, path: [{x,y}...], tileIds: [...] }], totalAP }
     // or null if no route is found.
+    // Delegates to HPA* (hpaFindRouteLegacy) which resolves fragments and
+    // routes through the pre-compiled macro wormhole graph.
     function getCrossSectorRoute(fromSector, fromTileId, fromX, fromY, toSector, toX, toY) {
-        if (Object.keys(parsedMap).length === 0) parseStaticMap(true);
+        const table = hpaGetTable();
+        if (!table) return null;
+        return hpaFindRouteLegacy(table, fromSector, { x: fromX, y: fromY }, toSector, { x: toX, y: toY });
+    }
 
-        // Same sector — single leg via the existing local pathfinder.
-        if (fromSector === toSector) {
-            const result = pardusGetSectorPath(fromSector, fromTileId, fromX, fromY, toX, toY);
-            if (!result) return null;
-            let ap = 0;
-            const grid = parsedMap[fromSector].grid;
-            const tap = getTerrainAP();
-            for (let i = 1; i < result.path.length; i++) {
-                const p = result.path[i];
-                const ch = grid[p.y][p.x];
-                ap += tap[ch] !== undefined ? tap[ch] : 9;
-            }
-            return { legs: [{ sector: fromSector, path: result.path, tileIds: result.tileIds }], totalAP: ap };
+    // Fast cross-sector AP using the HPA* table.
+    // Same-sector: direct Dijkstra lookup (with fragment resolution).
+    // Cross-sector: min over (wh1 in fromSec, wh2 in toSec) of
+    //   distFromA[wh1] + macroDist[wh1][wh2] + distFromWh2[dest]
+    // Returns null if no route is found (NO estimate — hard-fail policy).
+    // dijCache/macroGraph params are vestigial (HPA uses its own internal
+    // cache) but kept for caller-signature compatibility.
+    function getCrossSectorAPFast(fromCoords, fromSector, toCoords, toSector, dijCache, macroGraph) {
+        if (!fromCoords || !toCoords || !fromSector || !toSector) return null;
+        const table = hpaGetTable();
+        if (!table) return null;
+        try {
+            const ap = hpaCrossSectorAP(table, fromSector, fromCoords, toSector, toCoords);
+            return (ap !== null && isFinite(ap)) ? ap : null;
+        } catch (e) {
+            return null;
         }
+    }
+    // --- 14.5. HPA* Pathfinder ---
 
-        // Build wormhole edges from parsedMap (same logic as the sim engine's
-        // _simEnumerateWormholeEdges). Each edge: from (sec,x,y) to (sec,x,y).
-        // Skip wormholes whose endpoint sector is currently sealed.
-        const sealed = getWormholeSeals();
-        const edges = [];
-        for (const secName in parsedMap) {
-            const sec = parsedMap[secName];
-            if (!sec || !sec.wormholes) continue;
-            for (const destName in sec.wormholes) {
-                const fromList = sec.wormholes[destName];
-                if (!fromList || fromList.length === 0) continue;
-                if (sealed.has(secName.toLowerCase()) || sealed.has(destName.toLowerCase())) continue;
-                const destSec = parsedMap[destName];
-                if (!destSec || !destSec.wormholes) continue;
-                const toList = destSec.wormholes[secName];
-                if (!toList || toList.length === 0) continue;
-                for (const pair of _pairWormholes(fromList, toList)) {
-                    edges.push({
-                        fromSec: secName, fromX: pair.from.x, fromY: pair.from.y,
-                        toSec: destName, toX: pair.to.x, toY: pair.to.y
-                    });
-                }
+    // >> Design overview
+    // Two-tier pathfinding that replaces the brute-force cross-sector Dijkstra
+    // in part 14/19 with a pre-compiled hierarchical graph:
+    //
+    //   Macro graph: wormhole tiles as nodes. Edges = wormhole jumps (cost =
+    //     wjump) + intra-sector Dijkstra distances (recomputed with the
+    //     caller-supplied terrainAP, NOT the vanilla matrices in static_ext).
+    //     All-pairs shortest path via Floyd-Warshall. Cached per seal-cycle.
+    //
+    //   Micro graph: local A* within a single sector grid fragment. Only
+    //     runs for: start → first exit wormhole, last entry wormhole → dest.
+    //
+    // Fragmentation: static_ext.txt sub-sectors (Betelgeuse East, Betelgeuse
+    //   West, Pardus West, Pardus NE, etc.) are kept as SEPARATE clusters.
+    //   No grid merging. Wormholes in different fragments of the same nominal
+    //   sector have no intra-sector edge — the macro graph routes around them
+    //   via other sectors. This structurally eliminates the Betelgeuse
+    //   split-sector routing bug without hardcoding sector names.
+    //
+    // Padding: grids are padded to SECTOR_DATA dimensions with 'b' (blocked),
+    //   never 'f' (fuel). This fixes the Ras Elased nook bug where phantom
+    //   fuel tiles in padded rows created false paths around the flask-shaped
+    //   wall at [27,33].
+    //
+    // AP accuracy: the pre-computed wormhole matrices in static_ext.txt
+    //   (e.g. "226/19 167/14") use vanilla terrain costs (f=11, e=20, etc.)
+    //   and ignore ship equipment (drive speed, nav level, pathfinder, boost,
+    //   stim, gas/energy flux, viral persuader). Non-uniform terrain means
+    //   you cannot scale them by a ratio. This module ignores them entirely
+    //   and recomputes all intra-sector wormhole distances via Dijkstra with
+    //   the caller-supplied terrainAP table (output of computeTileCosts()).
+    //
+    // Purity: all core functions below are pure — no closures over IIFE
+    //   globals (no GM_*, no parsedMap, no SECTOR_DATA). Every dependency is
+    //   passed as an argument. Compile is synchronous via hpaGetTable()
+    //   (lazy, cached by terrainAP|wjump|sealed key).
+    //
+    // Hard-fail policy: unknown sector → throw. Unreachable target → null.
+    //   No Manhattan/Chebyshev estimate fallbacks (per AGENTS.md).
+
+    // >> Name resolver — resolves sub-sector/alternate-name lookups to their
+    // canonical SECTOR_DATA key. Ports _resolveSectorName from part 01.
+    function hpaResolveSectorName(name, sectorMeta) {
+        if (!name || !sectorMeta) return null;
+        if (sectorMeta[name]) return sectorMeta[name];
+        const parent = name.replace(/ (East|West|North|South|Inner|NE|SE|NW|SW)$/, '');
+        if (parent !== name && sectorMeta[parent]) return sectorMeta[parent];
+        const spaced = name.replace(/^([A-Za-z.-]+)(\d)/, '$1 $2');
+        if (spaced !== name && sectorMeta[spaced]) return sectorMeta[spaced];
+        const parentSpaced = parent.replace(/^([A-Za-z.-]+)(\d)/, '$1 $2');
+        if (parentSpaced !== parent && sectorMeta[parentSpaced]) return sectorMeta[parentSpaced];
+        return null;
+    }
+
+    // >> Fragment resolver — given a canonical sector name + (x,y), find which
+    // parsed fragment actually contains that tile (non-'b'). This is the key
+    // to handling Betelgeuse: "Betelgeuse" + (5,10) → "Betelgeuse West",
+    // "Betelgeuse" + (30,1) → "Betelgeuse East". If the tile is 'b' in all
+    // fragments, the first fragment is returned (A*/Dijkstra will return null
+    // for blocked tiles, which is correct behavior).
+    function hpaResolveFragment(sectors, canonicalName, x, y) {
+        if (sectors.has(canonicalName)) return canonicalName;
+        const dirs = ['East', 'West', 'North', 'South', 'Inner', 'NE', 'SE', 'NW', 'SW'];
+        for (const dir of dirs) {
+            const fragName = canonicalName + ' ' + dir;
+            if (!sectors.has(fragName)) continue;
+            const sec = sectors.get(fragName);
+            if (sec.grid.length === 0) continue;
+            if (y >= 0 && y < sec.grid.length && x >= 0 && x < sec.grid[0].length && sec.grid[y][x] !== 'b') {
+                return fragName;
             }
         }
+        for (const dir of dirs) {
+            const fragName = canonicalName + ' ' + dir;
+            if (sectors.has(fragName)) return fragName;
+        }
+        return canonicalName;
+    }
 
-        // >> Macro-graph optimal route (matches opps estimation)
-        // Use the same Floyd-Warshall macro wormhole graph as
-        // getCrossSectorAPFast (used by the opps calculator) to find the
-        // optimal wormhole sequence. This guarantees the flown route matches
-        // the opps AP estimate, including multi-hop routes through
-        // intermediate sectors that a direct-wormhole-only shortcut would
-        // miss. Falls through to the multi-hop Dijkstra below on failure.
-        const macroGraph = getMacroWormholeGraph();
-        if (macroGraph) {
-            const fromWhs = macroGraph.wormholesBySector[fromSector];
-            const toWhs = macroGraph.wormholesBySector[toSector];
-            if (fromWhs && toWhs) {
-                const dijCacheM = {};
-                let distFrom = getSectorAllDistances(fromSector, fromX, fromY);
-                dijCacheM[fromSector + '|' + fromX + ',' + fromY] = distFrom;
+    // >> Wormhole pairing — match source wormholes to destination wormholes
+    // by #sub-region suffix (e.g. Fornacis#West ↔ Fornacis#West). Falls back
+    // to 1:1 when both sides have exactly one entry and no suffix.
+    function hpaPairWormholes(fromList, toList) {
+        const pairs = [];
+        for (const fw of fromList) {
+            let tw = toList.find(t => t.sub === fw.sub);
+            if (!tw && fromList.length === 1 && toList.length === 1) tw = toList[0];
+            if (!tw) continue;
+            pairs.push({ from: fw, to: tw });
+        }
+        return pairs;
+    }
 
-                let bestPair = null;
-                if (distFrom) {
-                    for (const w1 of fromWhs) {
-                        const d1 = distFrom[w1.x + ',' + w1.y];
-                        if (d1 === undefined || !isFinite(d1)) continue;
-                        const macro = macroGraph.distMap[w1.key];
-                        if (!macro) continue;
-                        for (const w2 of toWhs) {
-                            const macroLeg = macro[w2.key];
-                            if (macroLeg === undefined) continue;
-                            const w2Key = toSector + '|' + w2.x + ',' + w2.y;
-                            let distFromW2 = dijCacheM[w2Key];
-                            if (!distFromW2) {
-                                distFromW2 = getSectorAllDistances(toSector, w2.x, w2.y);
-                                dijCacheM[w2Key] = distFromW2;
-                            }
-                            if (!distFromW2) continue;
-                            const d2 = distFromW2[toX + ',' + toY];
-                            if (d2 === undefined || !isFinite(d2)) continue;
-                            const total = d1 + macroLeg + d2;
-                            if (!bestPair || total < bestPair.total) {
-                                bestPair = { w1, w2, total };
-                            }
-                        }
-                    }
+    // >> Parser — parse static_ext.txt into separate sector fragments.
+    // NO merging. Each `sector Name:cols,rows` block becomes one entry in
+    // the returned Map. Grids are padded to SECTOR_DATA dimensions with 'b'.
+    function hpaParseMap(rawText, sectorMeta) {
+        const sectors = new Map();
+        const lines = rawText.split(/[\r\n]+/);
+        let cur = null;
+
+        for (let line of lines) {
+            line = line.trim();
+            if (!line) continue;
+
+            if (line.startsWith('sector ')) {
+                const parts = line.substring(7).split(':');
+                cur = parts[0].replace(/_/g, ' ');
+                sectors.set(cur, { name: cur, grid: [], wormholes: [], beacons: [] });
+            } else if (line.startsWith('wh ') && cur) {
+                const parts = line.split(/\s+/);
+                let dest = parts[1].replace(/_/g, ' ');
+                const hashIdx = dest.indexOf('#');
+                let sub = null;
+                if (hashIdx >= 0) {
+                    sub = dest.substring(hashIdx + 1);
+                    dest = dest.substring(0, hashIdx);
                 }
-
-                if (bestPair) {
-                    // Reconstruct the wormhole tile sequence from w1 to w2
-                    // using the Floyd-Warshall distMap. At each step, find
-                    // the next tile on a shortest path to the target.
-                    const targetKey = bestPair.w2.key;
-                    const seq = [bestPair.w1.key];
-                    let cur = bestPair.w1.key;
-                    let guard = 0;
-                    while (cur !== targetKey && guard++ < 200) {
-                        const curDist = macroGraph.distMap[cur];
-                        if (!curDist) break;
-                        const curToTarget = curDist[targetKey];
-                        if (curToTarget === undefined) break;
-                        let bestNext = null;
-                        let bestLegCost = Infinity;
-                        for (const nextKey in curDist) {
-                            const legCost = curDist[nextKey];
-                            const nextDist = macroGraph.distMap[nextKey];
-                            if (!nextDist) continue;
-                            const nextToTarget = nextDist[targetKey];
-                            if (nextToTarget === undefined) continue;
-                            if (legCost + nextToTarget === curToTarget) {
-                                if (legCost < bestLegCost) {
-                                    bestLegCost = legCost;
-                                    bestNext = nextKey;
-                                }
-                            }
-                        }
-                        if (!bestNext) break;
-                        seq.push(bestNext);
-                        cur = bestNext;
-                    }
-
-                    if (cur === targetKey) {
-                        // Extract the jump sequence: consecutive tiles in
-                        // different sectors are wormhole jumps.
-                        const jumps = [];
-                        for (let si = 0; si < seq.length - 1; si++) {
-                            const cp = seq[si].split('|');
-                            const np = seq[si + 1].split('|');
-                            if (cp[0] !== np[0]) {
-                                const fc = cp[1].split(',').map(Number);
-                                const nc = np[1].split(',').map(Number);
-                                jumps.push({ fromSec: cp[0], fromX: fc[0], fromY: fc[1], toSec: np[0], toX: nc[0], toY: nc[1] });
-                            }
-                        }
-
-                        // Build legs from the jump sequence.
-                        const legs = [];
-                        let curPos = { sector: fromSector, x: fromX, y: fromY };
-                        let valid = true;
-                        for (const j of jumps) {
-                            const path = getSectorPath(curPos.sector, curPos.x, curPos.y, j.fromX, j.fromY);
-                            if (!path) { valid = false; break; }
-                            const sd = getSectorData(curPos.sector);
-                            const rows = sd ? sd.rows : parsedMap[curPos.sector].grid.length;
-                            const sStart = sd ? sd.start : 0;
-                            const tileIds = path.map(p => sStart + p.x * rows + p.y);
-                            legs.push({ sector: curPos.sector, path, tileIds });
-                            curPos = { sector: j.toSec, x: j.toX, y: j.toY };
-                        }
-
-                        if (valid) {
-                            const finalPath = getSectorPath(curPos.sector, curPos.x, curPos.y, toX, toY);
-                            if (finalPath) {
-                                const sd = getSectorData(curPos.sector);
-                                const rows = sd ? sd.rows : parsedMap[curPos.sector].grid.length;
-                                const sStart = sd ? sd.start : 0;
-                                const finalTileIds = finalPath.map(p => sStart + p.x * rows + p.y);
-                                legs.push({ sector: curPos.sector, path: finalPath, tileIds: finalTileIds });
-
-                                const shipOpt = getShipOptions();
-                                const WJUMP = Number(shipOpt.wormhole_cost) || 10;
-                                const tap = getTerrainAP();
-                                let totalAP = 0;
-                                for (let li = 0; li < legs.length; li++) {
-                                    const leg = legs[li];
-                                    const grid = parsedMap[leg.sector].grid;
-                                    for (let i = 1; i < leg.path.length; i++) {
-                                        const ch = grid[leg.path[i].y][leg.path[i].x];
-                                        totalAP += tap[ch] !== undefined ? tap[ch] : 9;
-                                    }
-                                    if (li < legs.length - 1) totalAP += WJUMP;
-                                }
-                                return { legs, totalAP };
-                            }
-                        }
-                    }
+                const x = parseInt(parts[2], 10);
+                const y = parseInt(parts[3], 10);
+                const matrices = [];
+                for (let i = 4; i < parts.length; i++) {
+                    const m = parts[i].match(/^(\d+)\/(\d+)$/);
+                    if (m) matrices.push({ ap: +m[1], fuel: +m[2] });
                 }
+                sectors.get(cur).wormholes.push({ dest, x, y, sub, matrices });
+            } else if (line.startsWith('beacon ') && cur) {
+                const parts = line.split(/\s+/);
+                sectors.get(cur).beacons.push({
+                    x: parseInt(parts[parts.length - 2], 10),
+                    y: parseInt(parts[parts.length - 1], 10),
+                });
+            } else if (cur && /^\S{4,}$/.test(line) && !/^(sector|wh|beacon|starbase)\b/i.test(line)) {
+                sectors.get(cur).grid.push(line.toLowerCase().split(''));
             }
         }
 
-        // Index: wormhole exits reachable from a given (sec, x, y) tile.
-        const outByKey = {};
-        for (const e of edges) {
-            const k = e.fromSec + '|' + e.fromX + ',' + e.fromY;
-            (outByKey[k] = outByKey[k] || []).push(e);
+        // Pad grids to SECTOR_DATA dimensions with 'b' (blocked, NEVER 'f').
+        // This fixes the Ras Elased nook bug where padded 'f' rows created
+        // phantom fuel tiles around the flask-shaped wall at [27,33].
+        for (const [name, sec] of sectors) {
+            if (sec.grid.length === 0) continue;
+            const meta = hpaResolveSectorName(name, sectorMeta);
+            if (!meta) continue;
+            const tRows = meta.rows;
+            const tCols = meta.cols;
+            while (sec.grid.length < tRows) sec.grid.push(new Array(tCols).fill('b'));
+            for (const row of sec.grid) {
+                while (row.length < tCols) row.push('b');
+            }
         }
-        // Index: all wormhole exit tiles per sector (for intra-sector expansion).
-        const exitsBySector = {};
-        for (const e of edges) {
-            if (!exitsBySector[e.fromSec]) exitsBySector[e.fromSec] = [];
-            exitsBySector[e.fromSec].push(e);
-        }
 
-        const shipOpt = getShipOptions();
-        const WJUMP = Number(shipOpt.wormhole_cost) || 10;
-        const startKey = fromSector + '|' + fromX + ',' + fromY;
+        return sectors;
+    }
 
-        const dist = {};
-        dist[startKey] = 0;
+    // >> Single-source Dijkstra over a sector grid.
+    // Returns a Map<"x,y", apCost> for every reachable tile. Pardus terrain
+    // is ASYMMETRIC: entering a tile costs that tile's terrainAP, so a
+    // Dijkstra FROM X gives distances FROM X (not TO X). To get distance TO
+    // a destination, run Dijkstra FROM the source you're measuring from.
+    function hpaLocalDijkstra(grid, terrainAP, sx, sy) {
+        const rows = grid.length;
+        if (rows === 0) return null;
+        const cols = grid[0].length;
+        if (sx < 0 || sy < 0 || sx >= cols || sy >= rows) return null;
 
-        // PQ entries carry the wormhole-jump sequence taken so far.
-        const pq = [{ key: startKey, sec: fromSector, x: fromX, y: fromY, cost: 0, jumps: [] }];
-        const dijCache = {};
-        let best = null;
+        const dist = new Map();
+        const pq = [];
+        dist.set(sx + ',' + sy, 0);
+        pq.push({ x: sx, y: sy, cost: 0 });
 
         while (pq.length > 0) {
             pq.sort((a, b) => a.cost - b.cost);
             const cur = pq.shift();
-            if (cur.cost > (dist[cur.key] !== undefined ? dist[cur.key] : Infinity)) continue;
+            const cKey = cur.x + ',' + cur.y;
+            if (cur.cost > dist.get(cKey)) continue;
 
-            // Check if we can reach the target from here (intra-sector).
-            if (cur.sec === toSector) {
-                const ck = cur.sec + '|' + cur.x + ',' + cur.y;
-                let intra = dijCache[ck];
-                if (!intra) { intra = getSectorAllDistances(cur.sec, cur.x, cur.y); dijCache[ck] = intra; }
-                if (intra) {
-                    const intraAP = intra[toX + ',' + toY];
-                    if (intraAP !== undefined && isFinite(intraAP)) {
-                        const total = cur.cost + intraAP;
-                        if (!best || total < best.totalAP) {
-                            best = { jumps: cur.jumps, totalAP: total };
-                        }
-                    }
-                }
-            }
-
-            // Expand: wormhole jumps from this exact tile.
-            const out = outByKey[cur.key] || [];
-            for (const e of out) {
-                const nk = e.toSec + '|' + e.toX + ',' + e.toY;
-                const nc = cur.cost + WJUMP;
-                if (nc < (dist[nk] !== undefined ? dist[nk] : Infinity)) {
-                    dist[nk] = nc;
-                    pq.push({ key: nk, sec: e.toSec, x: e.toX, y: e.toY, cost: nc, jumps: [...cur.jumps, e] });
-                }
-            }
-
-            // Expand: intra-sector moves to all wormhole exit tiles in cur.sec.
-            const exits = exitsBySector[cur.sec] || [];
-            if (exits.length > 0) {
-                const ck = cur.sec + '|' + cur.x + ',' + cur.y;
-                let intra = dijCache[ck];
-                if (!intra) { intra = getSectorAllDistances(cur.sec, cur.x, cur.y); dijCache[ck] = intra; }
-                if (intra) {
-                    for (const e of exits) {
-                        if (e.fromX === cur.x && e.fromY === cur.y) continue;
-                        const intraAP = intra[e.fromX + ',' + e.fromY];
-                        if (intraAP === undefined || !isFinite(intraAP)) continue;
-                        const nk = cur.sec + '|' + e.fromX + ',' + e.fromY;
-                        const nc = cur.cost + intraAP;
-                        if (nc < (dist[nk] !== undefined ? dist[nk] : Infinity)) {
-                            dist[nk] = nc;
-                            pq.push({ key: nk, sec: cur.sec, x: e.fromX, y: e.fromY, cost: nc, jumps: cur.jumps });
-                        }
+            for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    if (dx === 0 && dy === 0) continue;
+                    const nx = cur.x + dx, ny = cur.y + dy;
+                    if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+                    const terrain = grid[ny][nx];
+                    const moveCost = terrainAP[terrain];
+                    if (moveCost === undefined || !isFinite(moveCost)) continue;
+                    const newCost = cur.cost + moveCost;
+                    const nKey = nx + ',' + ny;
+                    if (!dist.has(nKey) || newCost < dist.get(nKey)) {
+                        dist.set(nKey, newCost);
+                        pq.push({ x: nx, y: ny, cost: newCost });
                     }
                 }
             }
         }
-
-        if (!best) return null;
-
-        // Build legs from the wormhole-jump sequence.
-        const legs = [];
-        let curPos = { sector: fromSector, x: fromX, y: fromY };
-
-        for (const j of best.jumps) {
-            const path = getSectorPath(curPos.sector, curPos.x, curPos.y, j.fromX, j.fromY);
-            if (!path) return null;
-            const sd = getSectorData(curPos.sector);
-            const rows = sd ? sd.rows : parsedMap[curPos.sector].grid.length;
-            const sStart = sd ? sd.start : 0;
-            const tileIds = path.map(p => sStart + p.x * rows + p.y);
-            legs.push({ sector: curPos.sector, path, tileIds });
-            curPos = { sector: j.toSec, x: j.toX, y: j.toY };
-        }
-
-        const finalPath = getSectorPath(curPos.sector, curPos.x, curPos.y, toX, toY);
-        if (!finalPath) return null;
-        const sd = getSectorData(curPos.sector);
-        const rows = sd ? sd.rows : parsedMap[curPos.sector].grid.length;
-        const sStart = sd ? sd.start : 0;
-        const finalTileIds = finalPath.map(p => sStart + p.x * rows + p.y);
-        legs.push({ sector: curPos.sector, path: finalPath, tileIds: finalTileIds });
-
-        return { legs, totalAP: best.totalAP };
+        return dist;
     }
 
-    // >> Macro wormhole graph (pre-calculated all-pairs shortest path)
-    //
-    // Pardus terrain is static — the AP cost between any two wormhole tiles
-    // within the same sector never changes. Wormhole connections are also
-    // static (which sector links to which); only the seal calendar rotates
-    // every 2 days. This means we can pre-compute the "macro" AP cost between
-    // every pair of wormhole tiles in the universe once per session (or per
-    // seal-cycle change) and reuse it for O(wormholes_A × wormholes_B) lookups
-    // instead of a full cross-sector Dijkstra per query.
-    //
-    // Macro graph:
-    //   Nodes  = wormhole tiles: (sector, x, y) — typically 2-4 per sector
-    //   Edges  = (a) Wormhole jumps: one-directional, cost = WJUMP
-    //            (b) Intra-sector: bidirectional (terrain AP is symmetric),
-    //                cost = Dijkstra distance between wormhole tiles in the
-    //                same sector
-    //
-    // All-pairs shortest path via Floyd-Warshall. Node count is ~50-100 so
-    // O(n³) is trivial. Result: distMap[whKeyA][whKeyB] = min AP.
-    //
-    // For a location-to-location query (e.g. starbase A → starbase B across
-    // sectors), the total AP is:
-    //   min over wh1 in A's sector, wh2 in B's sector of:
-    //     distFromA[wh1] + macroDist[wh1][wh2] + distFromB[wh2]
-    // where distFromA/distFromB are single Dijkstra runs within each sector
-    // (terrain is symmetric, so Dijkstra from B gives costs TO B as well).
+    // >> Local A* with turn-minimization tiebreaker.
+    // Heuristic: Chebyshev distance × min terrain cost (admissible — diagonal
+    // moves cost the same as orthogonal in Pardus, and min cost is a lower
+    // bound on per-tile cost). Turn minimization produces straighter paths,
+    // which lets the flight loop extend each click to the full nav range.
+    function hpaLocalAStar(grid, terrainAP, sx, sy, ex, ey) {
+        const rows = grid.length;
+        if (rows === 0) return null;
+        const cols = grid[0].length;
+        if (sx < 0 || sy < 0 || sx >= cols || sy >= rows) return null;
+        if (ex < 0 || ey < 0 || ex >= cols || ey >= rows) return null;
 
-    let _macroWormholeGraph = null;
+        let minCost = Infinity;
+        for (const v of Object.values(terrainAP)) {
+            if (isFinite(v) && v < minCost) minCost = v;
+        }
 
-    function buildMacroWormholeGraph() {
-        if (Object.keys(parsedMap).length === 0) parseStaticMap(true);
-        if (Object.keys(parsedMap).length === 0) return null;
+        const gScore = new Map();
+        const turns = new Map();
+        const prev = new Map();
+        const open = [];
 
-        const sealed = getWormholeSeals();
-        const sealHash = Array.from(sealed).sort().join(',');
-        const WJUMP = Number(getShipOptions().wormhole_cost) || 10;
+        const startKey = sx + ',' + sy;
+        gScore.set(startKey, 0);
+        turns.set(startKey, 0);
+        open.push({
+            x: sx, y: sy, g: 0, t: 0, dir: null,
+            f: Math.max(Math.abs(sx - ex), Math.abs(sy - ey)) * minCost
+        });
 
+        while (open.length > 0) {
+            open.sort((a, b) => (a.f - b.f) || (a.t - b.t));
+            const cur = open.shift();
+            const cKey = cur.x + ',' + cur.y;
+            if (cur.g > gScore.get(cKey)) continue;
+            if (cur.x === ex && cur.y === ey) break;
+
+            for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    if (dx === 0 && dy === 0) continue;
+                    const nx = cur.x + dx, ny = cur.y + dy;
+                    if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+                    const terrain = grid[ny][nx];
+                    const moveCost = terrainAP[terrain];
+                    if (moveCost === undefined || !isFinite(moveCost)) continue;
+                    const nKey = nx + ',' + ny;
+                    const tentativeG = cur.g + moveCost;
+                    const dirKey = dx + ',' + dy;
+                    const newTurns = (cur.dir && cur.dir !== dirKey) ? cur.t + 1 : cur.t;
+                    const existingG = gScore.get(nKey);
+                    if (existingG === undefined || tentativeG < existingG ||
+                        (tentativeG === existingG && newTurns < turns.get(nKey))) {
+                        gScore.set(nKey, tentativeG);
+                        turns.set(nKey, newTurns);
+                        prev.set(nKey, cKey);
+                        const h = Math.max(Math.abs(nx - ex), Math.abs(ny - ey)) * minCost;
+                        open.push({ x: nx, y: ny, g: tentativeG, t: newTurns, dir: dirKey, f: tentativeG + h });
+                    }
+                }
+            }
+        }
+
+        const endKey = ex + ',' + ey;
+        if (!gScore.has(endKey)) return null;
+
+        const path = [];
+        let cur = endKey;
+        while (cur) {
+            const [px, py] = cur.split(',').map(Number);
+            path.unshift({ x: px, y: py });
+            cur = prev.get(cur);
+        }
+        return path;
+    }
+
+    // >> Macro graph builder — Floyd-Warshall over wormhole tiles.
+    // Nodes = wormhole tiles (keyed "sector|x,y"). Edges = wormhole jumps
+    // (directed, cost=wjump) + intra-sector Dijkstra distances (directed,
+    // cost=A* path cost). Sealed sectors' wormholes are excluded.
+    // Returns { nodes, distMap, nextMap, wormholesBySector, nodeCount }.
+    function hpaBuildMacroGraph(sectors, terrainAP, wjump, sealed) {
         const nodes = [];
         const nodeSet = new Set();
         const jumpEdges = [];
 
-        for (const secName in parsedMap) {
-            const sec = parsedMap[secName];
-            if (!sec || !sec.wormholes) continue;
-            for (const destName in sec.wormholes) {
-                const fromList = sec.wormholes[destName];
-                if (!fromList || fromList.length === 0) continue;
+        for (const [secName, sec] of sectors) {
+            if (!sec.wormholes || sec.wormholes.length === 0) continue;
+            const byDest = new Map();
+            for (const wh of sec.wormholes) {
+                if (!byDest.has(wh.dest)) byDest.set(wh.dest, []);
+                byDest.get(wh.dest).push(wh);
+            }
+            for (const [destName, fromList] of byDest) {
                 if (sealed.has(secName.toLowerCase()) || sealed.has(destName.toLowerCase())) continue;
-                const destSec = parsedMap[destName];
+                const destSec = sectors.get(destName);
                 if (!destSec || !destSec.wormholes) continue;
-                const toList = destSec.wormholes[secName];
-                if (!toList || toList.length === 0) continue;
-                for (const pair of _pairWormholes(fromList, toList)) {
+                const toList = destSec.wormholes.filter(w => w.dest === secName);
+                if (toList.length === 0) continue;
+                for (const pair of hpaPairWormholes(fromList, toList)) {
                     const fromKey = secName + '|' + pair.from.x + ',' + pair.from.y;
                     const toKey = destName + '|' + pair.to.x + ',' + pair.to.y;
                     if (!nodeSet.has(fromKey)) {
@@ -5099,36 +4893,32 @@ const SECTOR_DATA = {
                         nodeSet.add(toKey);
                         nodes.push({ key: toKey, sec: destName, x: pair.to.x, y: pair.to.y });
                     }
-                    jumpEdges.push({ from: fromKey, to: toKey, cost: WJUMP });
+                    jumpEdges.push({ from: fromKey, to: toKey, cost: wjump });
                 }
             }
         }
 
-        if (nodes.length === 0) return null;
-
-        const nodesBySector = {};
-        for (const n of nodes) {
-            if (!nodesBySector[n.sec]) nodesBySector[n.sec] = [];
-            nodesBySector[n.sec].push(n);
+        if (nodes.length === 0) {
+            return { nodes, distMap: new Map(), nextMap: new Map(), wormholesBySector: new Map(), nodeCount: 0 };
         }
 
-        // Pre-compute intra-sector distances between all wormhole tiles.
-        // For a sector with k wormholes, we need k Dijkstra runs.
-        const dijCache = {};
+        const nodesBySector = new Map();
+        for (const n of nodes) {
+            if (!nodesBySector.has(n.sec)) nodesBySector.set(n.sec, []);
+            nodesBySector.get(n.sec).push(n);
+        }
+
+        // Intra-sector directed edges via Dijkstra from each wormhole tile.
         const intraEdges = [];
-        for (const secName in nodesBySector) {
-            const secNodes = nodesBySector[secName];
+        for (const [secName, secNodes] of nodesBySector) {
+            const sec = sectors.get(secName);
+            if (!sec || sec.grid.length === 0) continue;
             for (const src of secNodes) {
-                const cacheKey = secName + '|' + src.x + ',' + src.y;
-                let dist = dijCache[cacheKey];
-                if (!dist) {
-                    dist = getSectorAllDistances(secName, src.x, src.y);
-                    dijCache[cacheKey] = dist;
-                }
+                const dist = hpaLocalDijkstra(sec.grid, terrainAP, src.x, src.y);
                 if (!dist) continue;
                 for (const dst of secNodes) {
                     if (src.key === dst.key) continue;
-                    const d = dist[dst.x + ',' + dst.y];
+                    const d = dist.get(dst.x + ',' + dst.y);
                     if (d !== undefined && isFinite(d)) {
                         intraEdges.push({ from: src.key, to: dst.key, cost: d });
                     }
@@ -5136,23 +4926,32 @@ const SECTOR_DATA = {
             }
         }
 
-        // Floyd-Warshall all-pairs shortest path.
-        const idx = {};
-        nodes.forEach((n, i) => idx[n.key] = i);
+        // Floyd-Warshall on directed graph.
         const n = nodes.length;
+        const idx = new Map();
+        nodes.forEach((node, i) => idx.set(node.key, i));
 
         const dist = new Array(n);
+        const next = new Array(n);
         for (let i = 0; i < n; i++) {
             dist[i] = new Array(n).fill(Infinity);
+            next[i] = new Array(n).fill(null);
             dist[i][i] = 0;
+            next[i][i] = i;
         }
         for (const e of jumpEdges) {
-            const i = idx[e.from], j = idx[e.to];
-            if (i != null && j != null && e.cost < dist[i][j]) dist[i][j] = e.cost;
+            const i = idx.get(e.from), j = idx.get(e.to);
+            if (i != null && j != null && e.cost < dist[i][j]) {
+                dist[i][j] = e.cost;
+                next[i][j] = j;
+            }
         }
         for (const e of intraEdges) {
-            const i = idx[e.from], j = idx[e.to];
-            if (i != null && j != null && e.cost < dist[i][j]) dist[i][j] = e.cost;
+            const i = idx.get(e.from), j = idx.get(e.to);
+            if (i != null && j != null && e.cost < dist[i][j]) {
+                dist[i][j] = e.cost;
+                next[i][j] = j;
+            }
         }
         for (let k = 0; k < n; k++) {
             for (let i = 0; i < n; i++) {
@@ -5160,106 +4959,304 @@ const SECTOR_DATA = {
                 for (let j = 0; j < n; j++) {
                     if (dist[i][k] + dist[k][j] < dist[i][j]) {
                         dist[i][j] = dist[i][k] + dist[k][j];
+                        next[i][j] = next[i][k];
                     }
                 }
             }
         }
 
-        const wormholesBySector = {};
-        for (const n of nodes) {
-            if (!wormholesBySector[n.sec]) wormholesBySector[n.sec] = [];
-            wormholesBySector[n.sec].push(n);
-        }
-
-        const distMap = {};
+        // Build Map-based distMap + nextMap for query functions.
+        const distMap = new Map();
+        const nextMap = new Map();
         for (let i = 0; i < n; i++) {
             const fromKey = nodes[i].key;
-            distMap[fromKey] = {};
+            const dm = new Map();
+            const nm = new Map();
             for (let j = 0; j < n; j++) {
                 if (i !== j && dist[i][j] !== Infinity) {
-                    distMap[fromKey][nodes[j].key] = dist[i][j];
+                    dm.set(nodes[j].key, dist[i][j]);
+                    nm.set(nodes[j].key, next[i][j] !== null ? nodes[next[i][j]].key : null);
                 }
             }
+            distMap.set(fromKey, dm);
+            nextMap.set(fromKey, nm);
         }
 
-        return {
-            distMap: distMap,
-            wormholesBySector: wormholesBySector,
-            sealHash: sealHash,
-            nodeCount: n
-        };
+        return { nodes, distMap, nextMap, wormholesBySector: nodesBySector, nodeCount: n };
     }
 
-    function getMacroWormholeGraph() {
-        if (_macroWormholeGraph) {
-            const sealHash = Array.from(getWormholeSeals()).sort().join(',');
-            if (_macroWormholeGraph.sealHash === sealHash) return _macroWormholeGraph;
+    // >> Compile — one-time build. Pure function (no IIFE globals).
+    // Called synchronously by hpaGetTable() on first query.
+    // Returns a table with Map/Set (structured-clone safe if ever offloaded).
+    function hpaCompile(rawText, sectorMeta, terrainAP, wjump, sealed) {
+        const sectors = hpaParseMap(rawText, sectorMeta);
+        const macro = hpaBuildMacroGraph(sectors, terrainAP, wjump || 10, sealed || new Set());
+        return { sectors, macro, terrainAP, wjump: wjump || 10, dijCache: new Map() };
+    }
+
+    // >> Cached local Dijkstra — avoids recomputing for the same (sector, tile).
+    function hpaLocalDijkstraCached(table, secName, x, y) {
+        const key = secName + '|' + x + ',' + y;
+        if (table.dijCache.has(key)) return table.dijCache.get(key);
+        const sec = table.sectors.get(secName);
+        if (!sec) return null;
+        const dist = hpaLocalDijkstra(sec.grid, table.terrainAP, x, y);
+        table.dijCache.set(key, dist);
+        return dist;
+    }
+
+    // >> Fast cross-sector AP query — no path reconstruction.
+    // Same sector: single Dijkstra lookup.
+    // Cross-sector: min over (wh1 in fromSec, wh2 in toSec) of
+    //   distFromStart[wh1] + macroDist[wh1][wh2] + distFromWh2[dest]
+    // Terrain is asymmetric, so distFromWh2 is Dijkstra FROM wh2 (gives
+    // distances FROM wh2, including TO dest).
+    // Returns null if unreachable. Throws if sector not in map.
+    function hpaCrossSectorAP(table, fromSec, fromXY, toSec, toXY) {
+        if (!fromSec || !toSec) {
+            throw new Error('hpaCrossSectorAP: sector unknown (from=' + fromSec + ', to=' + toSec + ')');
         }
-        _macroWormholeGraph = buildMacroWormholeGraph();
-        return _macroWormholeGraph;
-    }
 
-    // Fast cross-sector AP using the pre-built macro wormhole graph.
-    // Same-sector: direct Dijkstra lookup.
-    // Cross-sector: min over (wh1 in fromSector, wh2 in toSector) of
-    //   distFromA[wh1] + macroDist[wh1][wh2] + distFromWh2[dest]
-    // Pardus terrain is ASYMMETRIC: moving onto a tile costs that tile's
-    // terrain AP, so dist(A→B) ≠ dist(B→A). A Dijkstra from X gives
-    // distances FROM X; we need distances TO dest, so we must run Dijkstra
-    // from each wormhole tile in the destination sector (typically 2-4),
-    // not from the destination itself.
-    // Returns null if no route is found (NO estimate — hard-fail policy).
-    function getCrossSectorAPFast(fromCoords, fromSector, toCoords, toSector, dijCache, macroGraph) {
-        if (!fromCoords || !toCoords || !fromSector || !toSector || !macroGraph) return null;
+        fromSec = hpaResolveFragment(table.sectors, fromSec, fromXY.x, fromXY.y);
+        toSec = hpaResolveFragment(table.sectors, toSec, toXY.x, toXY.y);
 
-        if (fromSector === toSector) {
-            const key = fromSector + '|' + fromCoords.x + ',' + fromCoords.y;
-            let d = dijCache[key];
-            if (!d) {
-                d = getSectorAllDistances(fromSector, fromCoords.x, fromCoords.y);
-                dijCache[key] = d;
-            }
-            if (!d) return null;
-            const v = d[toCoords.x + ',' + toCoords.y];
+        if (!table.sectors.has(fromSec)) {
+            throw new Error('hpaCrossSectorAP: sector not in map: ' + fromSec);
+        }
+        if (!table.sectors.has(toSec)) {
+            throw new Error('hpaCrossSectorAP: sector not in map: ' + toSec);
+        }
+
+        if (fromSec === toSec) {
+            const dist = hpaLocalDijkstraCached(table, fromSec, fromXY.x, fromXY.y);
+            if (!dist) return null;
+            const v = dist.get(toXY.x + ',' + toXY.y);
             return (v !== undefined && isFinite(v)) ? v : null;
         }
 
-        const fromWhs = macroGraph.wormholesBySector[fromSector];
-        const toWhs = macroGraph.wormholesBySector[toSector];
+        const fromWhs = table.macro.wormholesBySector.get(fromSec);
+        const toWhs = table.macro.wormholesBySector.get(toSec);
         if (!fromWhs || !toWhs) return null;
 
-        const fromKey = fromSector + '|' + fromCoords.x + ',' + fromCoords.y;
-        let distFrom = dijCache[fromKey];
-        if (!distFrom) {
-            distFrom = getSectorAllDistances(fromSector, fromCoords.x, fromCoords.y);
-            dijCache[fromKey] = distFrom;
-        }
-        if (!distFrom) return null;
+        const fromDist = hpaLocalDijkstraCached(table, fromSec, fromXY.x, fromXY.y);
+        if (!fromDist) return null;
 
         let best = Infinity;
         for (const w1 of fromWhs) {
-            const d1 = distFrom[w1.x + ',' + w1.y];
+            const d1 = fromDist.get(w1.x + ',' + w1.y);
             if (d1 === undefined || !isFinite(d1)) continue;
-            const macro = macroGraph.distMap[w1.key];
-            if (!macro) continue;
+            const macroDist = table.macro.distMap.get(w1.key);
+            if (!macroDist) continue;
             for (const w2 of toWhs) {
-                const macroLeg = macro[w2.key];
+                const macroLeg = macroDist.get(w2.key);
                 if (macroLeg === undefined) continue;
-                const w2Key = toSector + '|' + w2.x + ',' + w2.y;
-                let distFromW2 = dijCache[w2Key];
-                if (!distFromW2) {
-                    distFromW2 = getSectorAllDistances(toSector, w2.x, w2.y);
-                    dijCache[w2Key] = distFromW2;
-                }
-                if (!distFromW2) continue;
-                const d2 = distFromW2[toCoords.x + ',' + toCoords.y];
+                const toDist = hpaLocalDijkstraCached(table, toSec, w2.x, w2.y);
+                if (!toDist) continue;
+                const d2 = toDist.get(toXY.x + ',' + toXY.y);
                 if (d2 === undefined || !isFinite(d2)) continue;
                 const total = d1 + macroLeg + d2;
                 if (total < best) best = total;
             }
         }
-
         return isFinite(best) ? best : null;
+    }
+
+    // >> Full route with path reconstruction — HPA* hand-off.
+    // 1. Find optimal (w1, w2) pair via the same formula as hpaCrossSectorAP.
+    // 2. Reconstruct macro wormhole sequence via nextMap (Floyd-Warshall
+    //    next-hop chain).
+    // 3. Build legs: local A* for each intra-sector segment between
+    //    consecutive wormhole tiles in the same sector. Wormhole jumps
+    //    are implicit (between legs).
+    // 4. Total AP = sum of leg AP costs + wjump × (number of jumps).
+    // Returns { legs: [{sector, path: [{x,y}...]}], totalAP } or null.
+    function hpaFindRoute(table, fromSec, fromXY, toSec, toXY) {
+        if (!fromSec || !toSec) {
+            throw new Error('hpaFindRoute: sector unknown (from=' + fromSec + ', to=' + toSec + ')');
+        }
+
+        fromSec = hpaResolveFragment(table.sectors, fromSec, fromXY.x, fromXY.y);
+        toSec = hpaResolveFragment(table.sectors, toSec, toXY.x, toXY.y);
+
+        if (!table.sectors.has(fromSec)) {
+            throw new Error('hpaFindRoute: sector not in map: ' + fromSec);
+        }
+        if (!table.sectors.has(toSec)) {
+            throw new Error('hpaFindRoute: sector not in map: ' + toSec);
+        }
+
+        const fromSecData = table.sectors.get(fromSec);
+        const toSecData = table.sectors.get(toSec);
+
+        // Same sector — single A* leg.
+        if (fromSec === toSec) {
+            const path = hpaLocalAStar(toSecData.grid, table.terrainAP, fromXY.x, fromXY.y, toXY.x, toXY.y);
+            if (!path) return null;
+            let ap = 0;
+            for (let i = 1; i < path.length; i++) {
+                ap += table.terrainAP[toSecData.grid[path[i].y][path[i].x]];
+            }
+            return { legs: [{ sector: fromSec, path }], totalAP: ap };
+        }
+
+        const fromWhs = table.macro.wormholesBySector.get(fromSec);
+        const toWhs = table.macro.wormholesBySector.get(toSec);
+        if (!fromWhs || !toWhs) return null;
+
+        const fromDist = hpaLocalDijkstraCached(table, fromSec, fromXY.x, fromXY.y);
+        if (!fromDist) return null;
+
+        // Find optimal (w1, w2) pair.
+        let bestPair = null;
+        for (const w1 of fromWhs) {
+            const d1 = fromDist.get(w1.x + ',' + w1.y);
+            if (d1 === undefined || !isFinite(d1)) continue;
+            const macroDist = table.macro.distMap.get(w1.key);
+            if (!macroDist) continue;
+            for (const w2 of toWhs) {
+                const macroLeg = macroDist.get(w2.key);
+                if (macroLeg === undefined) continue;
+                const toDist = hpaLocalDijkstraCached(table, toSec, w2.x, w2.y);
+                if (!toDist) continue;
+                const d2 = toDist.get(toXY.x + ',' + toXY.y);
+                if (d2 === undefined || !isFinite(d2)) continue;
+                const total = d1 + macroLeg + d2;
+                if (!bestPair || total < bestPair.total) {
+                    bestPair = { w1, w2, total };
+                }
+            }
+        }
+        if (!bestPair) return null;
+
+        // Reconstruct macro wormhole sequence via nextMap.
+        const macroPath = [bestPair.w1.key];
+        let curKey = bestPair.w1.key;
+        let guard = 0;
+        while (curKey !== bestPair.w2.key && guard++ < 500) {
+            const nm = table.macro.nextMap.get(curKey);
+            if (!nm) return null;
+            const nextKey = nm.get(bestPair.w2.key);
+            if (!nextKey) return null;
+            macroPath.push(nextKey);
+            curKey = nextKey;
+        }
+        if (curKey !== bestPair.w2.key) return null;
+
+        // Parse macro path nodes into {sec, x, y}.
+        const parsedPath = macroPath.map(k => {
+            const [sec, coords] = k.split('|');
+            const [x, y] = coords.split(',').map(Number);
+            return { sec, x, y };
+        });
+
+        // Build legs: A* for each intra-sector segment, skip wormhole jumps.
+        // Degenerate legs (single-tile, already at wormhole) are emitted so
+        // callers see the full sector sequence and wjump count stays correct.
+        const legs = [];
+        let curPos = { sec: fromSec, x: fromXY.x, y: fromXY.y };
+
+        for (const node of parsedPath) {
+            if (node.sec === curPos.sec) {
+                if (node.x === curPos.x && node.y === curPos.y) {
+                    legs.push({ sector: curPos.sec, path: [{ x: curPos.x, y: curPos.y }] });
+                } else {
+                    const sec = table.sectors.get(curPos.sec);
+                    const path = hpaLocalAStar(sec.grid, table.terrainAP, curPos.x, curPos.y, node.x, node.y);
+                    if (!path) return null;
+                    legs.push({ sector: curPos.sec, path });
+                }
+            }
+            curPos = { sec: node.sec, x: node.x, y: node.y };
+        }
+
+        // Final leg: from last wormhole to destination.
+        const finalSec = table.sectors.get(curPos.sec);
+        const finalPath = hpaLocalAStar(finalSec.grid, table.terrainAP, curPos.x, curPos.y, toXY.x, toXY.y);
+        if (!finalPath) return null;
+        legs.push({ sector: curPos.sec, path: finalPath });
+
+        // Total AP = leg terrain costs + wjump per wormhole jump.
+        // Jump count comes from the macro path (sector transitions), NOT
+        // from legs.length — degenerate legs occupy a slot but don't jump.
+        let numJumps = 0;
+        for (let i = 1; i < parsedPath.length; i++) {
+            if (parsedPath[i].sec !== parsedPath[i - 1].sec) numJumps++;
+        }
+        let totalAP = 0;
+        for (const leg of legs) {
+            const grid = table.sectors.get(leg.sector).grid;
+            for (let j = 1; j < leg.path.length; j++) {
+                totalAP += table.terrainAP[grid[leg.path[j].y][leg.path[j].x]];
+            }
+        }
+        totalAP += numJumps * table.wjump;
+
+        return { legs, totalAP };
+    }
+
+    // >> Lazy-compile cache — bridges the pure HPA* core to the IIFE.
+    // Compiles on first query, cached by terrainAP+wjump+sealed key so it
+    // auto-invalidates when ship config or wormhole seals change.
+    // Returns null when map data is missing or compile fails.
+    let _hpaTable = null, _hpaTableKey = null;
+    function hpaGetTable() {
+        try {
+            const rawText = localStorage.getItem("pardus_static_map_data");
+            if (!rawText || rawText.includes("PASTE_YOUR_STATICXT_TXT_HERE")) return null;
+            const terrainAP = getTerrainAP();
+            const shipOpt = getShipOptions();
+            const wjump = Number(shipOpt.wormhole_cost) || 10;
+            let sealed;
+            try { sealed = getWormholeSeals(); } catch (e) { sealed = new Set(); }
+            const key = JSON.stringify(terrainAP) + '|' + wjump + '|' + [...sealed].sort().join(',');
+            if (_hpaTableKey === key && _hpaTable) return _hpaTable;
+            _hpaTable = hpaCompile(rawText, SECTOR_DATA, terrainAP, wjump, sealed);
+            _hpaTableKey = key;
+            return _hpaTable;
+        } catch (e) {
+            _hpaTable = null;
+            _hpaTableKey = null;
+            return null;
+        }
+    }
+
+    // >> Route adapter — converts HPA* route to legacy {legs, totalAP} format.
+    // Maps fragment names back to canonical (e.g. "Betelgeuse East" →
+    // "Betelgeuse") and adds tileIds to each leg. Returns null when HPA*
+    // says unreachable.
+    function hpaFindRouteLegacy(table, fromSector, fromXY, toSector, toXY) {
+        if (!table) return null;
+        const route = hpaFindRoute(table, fromSector, fromXY, toSector, toXY);
+        if (!route) return null;
+        for (const leg of route.legs) {
+            const canonical = _resolveSectorName(leg.sector);
+            if (canonical) leg.sector = canonical;
+            const sd = getSectorData(leg.sector);
+            if (sd) {
+                leg.tileIds = leg.path.map(p => sd.start + p.x * sd.rows + p.y);
+            } else {
+                leg.tileIds = [];
+            }
+        }
+        return route;
+    }
+
+    // >> Same-sector all-distances adapter — bridges HPA's Map-returning
+    // hpaLocalDijkstraCached to the plain-object shape legacy callers
+    // (getSectorAllDistances, simTravelAP via dijCache) expect.
+    // Resolves the fragment for (sectorName, x, y) so Betelgeuse West
+    // queries hit the West fragment's grid, not a merged grid.
+    // Returns { "x,y": apCost } or null when the table/sector is missing.
+    function hpaSectorAllDistances(table, sectorName, x, y) {
+        if (!table) return null;
+        const frag = hpaResolveFragment(table.sectors, sectorName, x, y);
+        const dist = hpaLocalDijkstraCached(table, frag, x, y);
+        if (!dist) return null;
+        const out = {};
+        for (const [k, v] of dist) {
+            if (isFinite(v)) out[k] = v;
+        }
+        return out;
     }
 
     // --- 15. Rich Nav HUD ---
@@ -7044,216 +7041,52 @@ const SECTOR_DATA = {
         } catch (e) { return null; }
     }
 
-    // Terrain-aware travel AP between two local-sector coords. Runs Dijkstra
-    // from the source (cached per source in dijCache) and looks up the target.
-    // NO estimation fallback: when the sector is unknown, the static map is
-    // not loaded, or the target is unreachable, this THROWS instead of
-    // returning a guess — inaccurate AP would silently corrupt route scoring.
+    // Terrain-aware travel AP between two local-sector coords. Routes through
+    // HPA* (hpaCrossSectorAP) which resolves fragments independently — so a
+    // query from Betelgeuse West (5,10) to Betelgeuse East (30,1) correctly
+    // routes through the macro wormhole graph instead of a broken merged-grid
+    // Dijkstra. NO estimation fallback: throws when the sector is unknown,
+    // the static map isn't loaded, or the target is unreachable.
     function simTravelAP(fromCoords, toCoords, sectorName, dijCache) {
         if (!fromCoords || !toCoords) return 0;
         if (!sectorName) {
             throw new Error('simTravelAP: sector unknown (no userloc / static map not loaded)');
         }
-        const key = sectorName + '|' + fromCoords.x + ',' + fromCoords.y;
-        let map = dijCache[key];
-        if (map === undefined) {
-            map = getSectorAllDistances(sectorName, fromCoords.x, fromCoords.y);
-            dijCache[key] = map;
+        const table = hpaGetTable();
+        if (!table) {
+            throw new Error('simTravelAP: HPA table unavailable (static map not loaded)');
         }
-        if (!map) {
-            throw new Error('simTravelAP: no map data for sector "' + sectorName + '" — load static_ext.txt');
-        }
-        const v = map[toCoords.x + ',' + toCoords.y];
-        if (v === undefined || !isFinite(v)) {
+        const ap = hpaCrossSectorAP(table, sectorName, fromCoords, sectorName, toCoords);
+        if (ap === null || !isFinite(ap)) {
             throw new Error('simTravelAP: target ' + toCoords.x + ',' + toCoords.y +
                 ' unreachable from ' + fromCoords.x + ',' + fromCoords.y + ' in ' + sectorName);
         }
-        return v;
-    }
-
-    // -- Cross-sector pathfinding (wormhole graph) ---------------------------
-    // Pardus sectors are connected by one-way wormholes declared in static_ext.txt.
-    // Jumping through a wormhole costs AP on top of the terrain cost of moving
-    // onto the wormhole tile (configurable via config_ship_wormhole_cost, default
-    // 10). We model the universe as a graph: nodes = (sector, local (x,y));
-    // edges = intra-sector (terrain AP, from getSectorAllDistances) and
-    // inter-sector (wormhole destination local (x,y), configurable AP surcharge).
-    // Wormholes whose endpoint sector is currently sealed (see getWormholeSeals)
-    // are excluded from the edge set.
-    //
-    // simCrossTravelAP(fromCoords, fromSector, toCoords, toSector, dijCache)
-    // returns the minimum-AP path between two (coords, sector) pairs. Uses a
-    // per-call memo `crossCache` (passed in by the route engine) keyed by
-    // 'fromSec|fromX,fromY|toSec|toX,toY'. Same-sector case falls through to
-    // simTravelAP. Cross-sector case expands both wormhole endpoints as graph
-    // nodes and runs Dijkstra over (sector, local) pairs, lazy-evaluating
-    // intra-sector distances as needed.
-    //
-    // The cache survives across the route engine's main loop iterations, so
-    // back-to-back calls for the same pair (e.g. evaluating a starbase run
-    // across multiple iterations) reuse work.
-    function _simWormholeJumpAP() {
-        try { return Number(getShipOptions().wormhole_cost) || 10; }
-        catch (e) { return 10; }
-    }
-    function _simWormholeSealedSet() {
-        try { return getWormholeSeals(); }
-        catch (e) { return new Set(); }
-    }
-
-    // Pull parsedMap into scope (declared in the sector-map static-data part
-    // and populated by parseStaticMap in the local-sector pathfinder part).
-    // Guarded defensively: returns null instead of throwing when unavailable.
-    function _simGetParsedMap() {
-        try { return parsedMap; } catch (e) { return null; }
-    }
-    function _simGetSectorData() {
-        try { return SECTOR_DATA; } catch (e) { return null; }
-    }
-
-    // Enumerate all (sector, x, y) wormhole endpoints in the universe. Returns
-    // [{ from: {sec,x,y}, to: {sec,x,y} }, ...] (one entry per wormhole line).
-    function _simEnumerateWormholeEdges() {
-        const pm = _simGetParsedMap();
-        if (!pm) return [];
-        // Build sec->sectorStart lookup for cycle detection.
-        const sd = _simGetSectorData();
-        const sealed = _simWormholeSealedSet();
-        const out = [];
-        for (const secName in pm) {
-            const sec = pm[secName];
-            if (!sec || !sec.wormholes) continue;
-            for (const destName in sec.wormholes) {
-                const fromList = sec.wormholes[destName];
-                if (!fromList || fromList.length === 0) continue;
-                if (sealed.has(secName.toLowerCase()) || sealed.has(destName.toLowerCase())) continue;
-                const destSec = pm[destName];
-                if (!destSec || !destSec.wormholes) continue;
-                const toList = destSec.wormholes[secName];
-                if (!toList || toList.length === 0) continue;
-                for (const pair of _pairWormholes(fromList, toList)) {
-                    out.push({
-                        from: { sec: secName, x: pair.from.x, y: pair.from.y },
-                        to:   { sec: destName,  x: pair.to.x,   y: pair.to.y   }
-                    });
-                }
-            }
-        }
-        return out;
-    }
-
-    // Dijkstra over the (sector, x, y) graph. `from` and `to` are
-    // {sec, x, y}; `edges` is the result of _simEnumerateWormholeEdges.
-    // State: { 'sec|x,y': bestCost }. Expands neighbors: every wormhole edge
-    // whose `from` matches the current node is a hop of WORMHOLE_JUMP_AP. To
-    // expand intra-sector moves, we use a per-source Dijkstra map (cached in
-    // `dijCache` for same-sector lookups) to query "cost from current to
-    // every other (sector, x, y) pair reachable intra-sector". For the first
-    // iteration we compute the from-node's dijkstra map directly; subsequent
-    // intra-sector jumps to new sectors compute the dest sector's map lazily.
-    function _simCrossDijkstra(from, to, edges, dijCache, crossCache) {
-        const startKey = from.sec + '|' + from.x + ',' + from.y;
-        const goalKey  = to.sec   + '|' + to.x   + ',' + to.y;
-        if (startKey === goalKey) return 0;
-
-        const WORMHOLE_JUMP_AP = _simWormholeJumpAP();
-
-        // Standard priority queue via array sort (small graphs, fine).
-        const dist = {};
-        dist[startKey] = 0;
-        const pq = [{ key: startKey, sec: from.sec, x: from.x, y: from.y, cost: 0 }];
-
-        // Adjacency helper: from a (sec, x, y), list neighboring (sec, x, y) candidates.
-        // Two kinds of edges:
-        //  (1) Wormhole jump: from this node matching any edge.from -> edge.to, +WORMHOLE_JUMP_AP.
-        //  (2) Intra-sector same-coord landing: if some other sector's wormhole
-        //      names `sec` and lands at (x2,y2), and we're at (x,y), the wormhole
-        //      destination in `sec` at (x2,y2) is reachable via that same-sector
-        //      path. This is captured implicitly by expanding wormhole edges in
-        //      both directions in the edges list.
-        // We do NOT pre-enumerate intra-sector edges; instead we evaluate
-        // intra-sector AP on demand via the existing simTravelAP cache. For
-        // the search, we explore the graph by:
-        //  - finding all wormholes leaving `sec` (one Dijkstra expansion per
-        //    frontier node could be expensive; instead we precompute a
-        //    sector->wormhole-out-edges index).
-        const outByFrom = {};
-        for (const e of edges) {
-            const k = e.from.sec + '|' + e.from.x + ',' + e.from.y;
-            (outByFrom[k] = outByFrom[k] || []).push(e);
-        }
-        // Reverse index: from a destination wormhole, who can land here? This
-        // lets us consider "from this (sec, x, y), the closest landing tile of
-        // a wormhole entering this sector" as a single intra-sector move.
-        const inByTo = {};
-        for (const e of edges) {
-            const k = e.to.sec + '|' + e.to.x + ',' + e.to.y;
-            (inByTo[k] = inByTo[k] || []).push(e);
-        }
-
-        // For each sector, the (x,y) of every wormhole landing IN that sector.
-        // This lets us compute, when we're inside sector S at (sx,sy), the cost
-        // to reach any landing (lx,ly) in S via simTravelAP(sx,sy,lx,ly,S,cache).
-        const landingsBySector = {};
-        for (const e of edges) {
-            (landingsBySector[e.to.sec] = landingsBySector[e.to.sec] || []).push({ x: e.to.x, y: e.to.y });
-        }
-
-        while (pq.length > 0) {
-            pq.sort((a, b) => a.cost - b.cost);
-            const cur = pq.shift();
-            if (cur.cost > (dist[cur.key] !== undefined ? dist[cur.key] : Infinity)) continue;
-            if (cur.key === goalKey) return cur.cost;
-
-            // Expand: outgoing wormhole jumps from this exact (sec, x, y) tile.
-            const out = outByFrom[cur.key] || [];
-            for (const e of out) {
-                const nk = e.to.sec + '|' + e.to.x + ',' + e.to.y;
-                const nc = cur.cost + WORMHOLE_JUMP_AP;
-                if (nc < (dist[nk] !== undefined ? dist[nk] : Infinity)) {
-                    dist[nk] = nc;
-                    pq.push({ key: nk, sec: e.to.sec, x: e.to.x, y: e.to.y, cost: nc });
-                }
-            }
-
-            // Expand: intra-sector moves to all wormhole landing tiles in cur.sec.
-            const landings = landingsBySector[cur.sec] || [];
-            for (const L of landings) {
-                if (L.x === cur.x && L.y === cur.y) continue;
-                const intraAp = simTravelAP({ x: cur.x, y: cur.y }, L, cur.sec, dijCache);
-                if (!isFinite(intraAp)) continue;
-                const nk = cur.sec + '|' + L.x + ',' + L.y;
-                const nc = cur.cost + intraAp;
-                if (nc < (dist[nk] !== undefined ? dist[nk] : Infinity)) {
-                    dist[nk] = nc;
-                    pq.push({ key: nk, sec: cur.sec, x: L.x, y: L.y, cost: nc });
-                }
-            }
-        }
-        return Infinity;
+        return ap;
     }
 
     // Public cross-sector AP. Memoizes per (fromSec|fromX,fromY|toSec|toX,toY).
-    // NO estimation fallback: unknown sectors throw (see simTravelAP rationale).
+    // Delegates to HPA* (hpaCrossSectorAP) which resolves fragments and routes
+    // through the pre-compiled macro wormhole graph. Returns Infinity when
+    // unreachable (so the route engine can score it as infinite cost).
     function simCrossTravelAP(fromCoords, fromSector, toCoords, toSector, dijCache, crossCache) {
         if (!fromCoords || !toCoords) return 0;
         if (!fromSector || !toSector) {
             throw new Error('simCrossTravelAP: sector unknown (from=' + fromSector + ', to=' + toSector + ')');
         }
-        if (fromSector === toSector) {
-            return simTravelAP(fromCoords, toCoords, fromSector, dijCache);
-        }
         const key = fromSector + '|' + fromCoords.x + ',' + fromCoords.y + '|' +
                     toSector   + '|' + toCoords.x   + ',' + toCoords.y;
         if (crossCache && crossCache[key] !== undefined) return crossCache[key];
-        const edges = _simEnumerateWormholeEdges();
-        const ap = _simCrossDijkstra(
-            { sec: fromSector, x: fromCoords.x, y: fromCoords.y },
-            { sec: toSector,   x: toCoords.x,   y: toCoords.y   },
-            edges, dijCache, crossCache
-        );
-        if (crossCache) crossCache[key] = ap;
-        return ap;
+        const table = hpaGetTable();
+        if (!table) return Infinity;
+        let ap;
+        try {
+            ap = hpaCrossSectorAP(table, fromSector, fromCoords, toSector, toCoords);
+        } catch (e) {
+            ap = null;
+        }
+        const result = (ap !== null && isFinite(ap)) ? ap : Infinity;
+        if (crossCache) crossCache[key] = result;
+        return result;
     }
 
     // -- Starbase candidate resolution ---------------------------------------
