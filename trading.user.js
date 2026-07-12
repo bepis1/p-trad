@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.87
+// @version      6.88
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.83: Fix duplicate wormholes between same sector pair (e.g. Ras Elased↔Fornacis) — #sub-region suffix now preserved so all wormhole endpoints reach the pathfinder instead of last-write-wins overwrite.
+// @description  v6.88: Eliminate page-load lag — L1 top-window cache for HPA* table (skips GM deserialize on refresh), deferred UI injection via setTimeout(0), targeted DOM queries instead of body.innerText reflow.
 // @description  v6.84: HPA* pathfinder (hpaCompile/hpaCrossSectorAP/hpaFindRoute) — fixes grid-merge bug (split sectors like Betelgeuse no longer dissolve walls), padding bug (phantom fuel tiles in Ras Elased nook), and recomputes all wormhole distances with ship-configured terrain costs. Wired into simCrossTravelAP, getCrossSectorRoute, getCrossSectorAPFast, and exports calculator.
 // @description  v6.85: Full HPA* cutover — legacy merged-grid model, duplicate macro-graph, and cross-sector Dijkstra deleted. simTravelAP now routes through HPA with fragment resolution (fixes Betelgeuse same-sector AP=0). No silent fallbacks — hard-fail on unknown sectors/unreachable targets.
 // @description  v6.86: Enforce hard-fail policy in simTravelAP/simCrossTravelAP/getCrossSectorAPFast — null coords and unknown sectors now throw instead of returning 0/Infinity/null. hpaGetTable logs compile errors. Added pathfinder facade test suite with bug-museum regressions and golden-master snapshot.
@@ -557,7 +557,13 @@ const SECTOR_DATA = {
         });
 
         let parsedSum = Object.values(newCargo).reduce((a, b) => a + b, 0);
-        let bodyText = document.body.innerText;
+        // Narrow the text read to the cargo panel (already located above)
+        // instead of document.body.innerText, which forces a synchronous
+        // full-page reflow blocking first paint. textContent avoids reflow
+        // entirely; cargoArea is guaranteed non-null by the early return.
+        // All three scanned patterns ("Cargo space left", "DROP CARGO",
+        // "Nt in magnetic cargo hold") live inside this panel.
+        let bodyText = cargoArea.textContent;
 
         // Parse magscoop info: "Cargo space left: X + Yt" and "Nt in magnetic cargo hold"
         let magScoopUsed = 0;
@@ -5351,6 +5357,19 @@ const SECTOR_DATA = {
                         + '|' + rawText.length + '|' + HPA_MACRO_SCHEMA;
             if (_hpaTableKey === key && _hpaTable) return _hpaTable;
 
+            // L1: top-window cache. The frameset (top) survives main-frame
+            // reloads, so a JS object reference here skips the ~500ms-2s
+            // GM_setValue deserialize on every ~5s full refresh. Wrap in
+            // try/catch — cross-origin or no frameset silently falls through
+            // to L2 (this is the expected fallback, not an error).
+            try {
+                if (top.__hpaTableKey === key && top.__hpaTable) {
+                    _hpaTable = top.__hpaTable;
+                    _hpaTableKey = key;
+                    return top.__hpaTable;
+                }
+            } catch (e) { /* no top cache — fall through to L2 */ }
+
             // Try persistent cache (GM_setValue from a previous page load).
             const storedJson = GM_getValue('pardus_hpa_macro_v1', null);
             if (storedJson) {
@@ -5359,6 +5378,11 @@ const SECTOR_DATA = {
                     if (table && table.macro.nodeCount > 0) {
                         _hpaTable = table;
                         _hpaTableKey = key;
+                        try {
+                            top.__hpaTable = table;
+                            top.__hpaTableKey = key;
+                            top.__hpaTerrainAP = terrainAP;
+                        } catch (e) { /* no frameset — L2/L3 still works */ }
                         return table;
                     }
                 } catch (e) {
@@ -5369,6 +5393,11 @@ const SECTOR_DATA = {
             // Full compile (first load or cache miss).
             _hpaTable = hpaCompile(rawText, SECTOR_DATA, terrainAP, wjump, sealed);
             _hpaTableKey = key;
+            try {
+                top.__hpaTable = _hpaTable;
+                top.__hpaTableKey = key;
+                top.__hpaTerrainAP = terrainAP;
+            } catch (e) { /* no frameset — L2/L3 still works */ }
 
             // Persist for next page load (non-fatal if quota exceeded).
             try {
@@ -8578,15 +8607,22 @@ const SECTOR_DATA = {
 
     if (currentPath === '/main.php') {
         injectNavHUD();
-        injectDraggableUI();
-        try { injectFlyHerePanel(); }
-        catch (e) { console.error('[pardus-flyhere] panel inject failed:', e); }
+        // Defer heavy UI injection so the browser can paint the nav screen
+        // first. These run in the same frame but after paint: injectDraggableUI
+        // triggers hpaGetTable() (L1 top-cache hit after first load), then the
+        // exports calc (1 Dijkstra), fly-here (~250 options), and tracker.
+        setTimeout(() => {
+            try { injectDraggableUI(); }
+            catch (e) { console.error('[pardus-ui] draggable inject failed:', e); }
+            try { injectFlyHerePanel(); }
+            catch (e) { console.error('[pardus-flyhere] panel inject failed:', e); }
+            try { injectExportsCalculator(); }
+            catch (e) { console.error('[pardus-exports] panel inject failed:', e); }
+            try { injectTrackerPanel(); }
+            catch (e) { console.error('[pardus-tracker] panel inject failed:', e); }
+        }, 0);
         try { resumeFlightAfterAmbush(); }
         catch (e) { console.error('[pardus-ambush] resume failed:', e); }
-        try { injectExportsCalculator(); }
-        catch (e) { console.error('[pardus-exports] panel inject failed:', e); }
-        try { injectTrackerPanel(); }
-        catch (e) { console.error('[pardus-tracker] panel inject failed:', e); }
     } else if (currentPath === '/overview_buildings.php') {
         injectBuildingsUI();
     } else if (currentPath.includes('trade.php') || currentPath.includes('building_management.php')) {
