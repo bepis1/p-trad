@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.62
+// @version      6.63
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.58: Remove dangling GM_deleteValue('logistics_mag_scoop_size') from clear button (key no longer written since magscoop refactor); restore update-skip mechanism in auto-updater with "Skip this version" Tampermonkey menu command.
 // @description  v6.59: REVERTED — native buildings overview parser was published in error, reverted to v6.58 codebase. Work preserved on branch tomb/native-buildings-parser.
 // @description  v6.60: Revert of v6.59 native buildings parser — restores v6.58 behavior. Bump version to force Tampermonkey to pull the revert (it won't downgrade).
 // @description  v6.61: Fix monster sidestep in auto-fly — nav grid is 9×11 (99 tiles, center field 49), not 11×11 (121 tiles, center 60); sidestep now uses two 1-tile forward moves instead of one 2-tile move (Pardus only moves 1 tile per navAjax call).
 // @description  v6.62: Fix sidestep rejoin sending player into a second consecutive monster — rejoin now checks if the path tile is clear before moving; loop-based forward movement handles any number of consecutive monsters (max 5).
+// @description  v6.63: Add diagnostic console.log to sidestep logic (prefix [SIDESTEP]) to trace monster-avoidance failures. Open browser console (F12) to capture logs when reporting issues.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3872,6 +3872,12 @@ const SECTOR_DATA = {
             knownAmbushTiles.add(saved.ambushTileId);
         }
         resumingAfterAmbush = true;
+        console.log('[SIDESTEP] resumeFlightAfterAmbush fired', {
+            ambushTileId: saved.ambushTileId,
+            target: saved.target,
+            destLabel: saved.destLabel,
+            knownAmbushTiles: [...knownAmbushTiles]
+        });
         const ov = document.createElement('div');
         ov.style.cssText = 'position:fixed; top:0; left:0; width:100%; background:#003355; color:#fff; text-align:center; padding:6px; z-index:999999; font-weight:bold; font-size:13px; border-bottom:2px solid #0088ff;';
         ov.innerText = '\u2708 Resuming flight to ' + saved.destLabel + ' (avoiding ambush tile)...';
@@ -4094,10 +4100,20 @@ const SECTOR_DATA = {
             // >> Monster guard — scan nav screen and sidestep if blocked
             const monsterSet = scanNavForMonsters();
             for (const at of knownAmbushTiles) { monsterSet.add(at); }
+            console.log('[SIDESTEP] flyNext', {
+                curId, idx, dirX, dirY,
+                curCoord: pathCoords[idx],
+                nextCoord: pathCoords[idx + 1],
+                targetIdx_before_guard: targetIdx,
+                monsters_scanned: [...monsterSet],
+                knownAmbushTiles: [...knownAmbushTiles],
+                nextTileIds: tileIds.slice(idx + 1, idx + 4)
+            });
             if (monsterSet.size > 0) {
                 for (let j = idx + 1; j <= targetIdx; j++) {
                     if (monsterSet.has(tileIds[j])) {
                         targetIdx = j - 1;
+                        console.log('[SIDESTEP] Monster guard: blocked at path idx', j, 'tileId', tileIds[j], 'targetIdx reduced to', targetIdx);
                         break;
                     }
                 }
@@ -4111,6 +4127,7 @@ const SECTOR_DATA = {
                 }
 
                 const perpOptions = [[-dirY, dirX], [dirY, -dirX]];
+                console.log('[SIDESTEP] Entering sidestep block', { dirX, dirY, perpOptions });
                 let sidestepped = false;
 
                 const moveAndWait = (tileId, afterMs, onSuccess, onFailMsg) => {
@@ -4131,8 +4148,10 @@ const SECTOR_DATA = {
                 };
 
                 for (const [pDx, pDy] of perpOptions) {
-                    if (!isNavTileClear(pDx, pDy)) continue;
+                    const clear = isNavTileClear(pDx, pDy);
                     const sidestepId = getNavTileIdAt(pDx, pDy);
+                    console.log('[SIDESTEP] Trying perp option', { pDx, pDy, isNavTileClear: clear, sidestepId });
+                    if (!clear) continue;
                     if (!sidestepId) continue;
                     sidestepped = true;
                     const dirName = pDx > 0 ? 'east' : pDx < 0 ? 'west' : pDy > 0 ? 'south' : 'north';
@@ -4150,8 +4169,17 @@ const SECTOR_DATA = {
                             // Can we rejoin the original path?  Only attempt
                             // after at least 1 forward move (otherwise we'd
                             // rejoin onto the starting tile, going nowhere).
-                            if (forwardCount > 0 && isNavTileClear(-pDx, -pDy)) {
-                                const backId = getNavTileIdAt(-pDx, -pDy);
+                            const rejoinClear = forwardCount > 0 && isNavTileClear(-pDx, -pDy);
+                            const rejoinId = forwardCount > 0 ? getNavTileIdAt(-pDx, -pDy) : null;
+                            console.log('[SIDESTEP] moveForwardOrRejoin', {
+                                forwardCount,
+                                rejoinClear,
+                                rejoinId,
+                                fwdClear: isNavTileClear(dirX, dirY),
+                                fwdId: getNavTileIdAt(dirX, dirY)
+                            });
+                            if (rejoinClear) {
+                                const backId = rejoinId;
                                 if (!backId) { fail('\u26a0 Cannot find path-rejoin tile. Stopping.'); return; }
                                 setOverlay('\u26a0 Rejoining original path...');
                                 moveAndWait(backId, 150, () => {
