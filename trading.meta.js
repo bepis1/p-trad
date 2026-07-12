@@ -1,39 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.55
-// @description  Adds 1-click Split-Transfer buttons to bypass Pardus backend "Not enough room" errors during simultaneous dual-trades.
-// @description  v6.25: In-script auto-updater via authenticated GM_xmlhttpRequest (fixes private-repo update checks that silently 404).
-// @description  v6.26: Version bump to test the auto-update flow.
-// @description  v6.27: Remove fwStashPending mechanism that caused F/W dump-to-TO-then-hub-reload loop. FWE fires directly with F/W in cargo.
-// @description  v6.28: Fix auto-updater — publish as trading.user.js so Tampermonkey intercepts the install; open raw URL directly via GM_openInTab instead of broken blob: URL approach.
-// @description  v6.29: Version bump to test the fixed auto-update flow.
-// @description  v6.30: Fix auto-updater install — use GitHub Contents API to get a signed download_url (browsers strip credentials from URL navigations, so GM_openInTab with token-in-URL was 404ing).
-// @description  v6.31: Version bump to test the Contents API auto-update flow.
-// @description  v6.32: Version bump to test auto-update from 6.31.
-// @description  v6.33: Security — split read-only token (GH_READ_TOKEN, embedded in script) from write token (GH_TOKEN, publish-only). Fine-grained PAT scoped to repo read-only.
-// @description  v6.34: Fix magscoop space leak — sim no longer frees regular cargo space when dropping magscoop items, preventing the route planner from filling the +150 magscoop.
-// @description  v6.35: Fix runtime magscoop leak — getTrueBaseFreeSpace() now returns only regular cargo space, preventing the reality clamp from allowing magscoop-filling pickups at trade screens.
-// @description  v6.36: Cross-sector auto-fly from exports panel — clicking a starbase/planet name in another sector now routes through wormholes instead of doing nothing.
-// @description  v6.37: Fix same-sector route totalAP reporting 0 instead of actual terrain AP cost.
-// @description  v6.38: Remove backup pathfinding snap-to-nearest-tile fallback in flyToCoords — fail hard instead of wasting AP on a bad resync.
-// @description  v6.39: Hub reload now uses sweep lookahead scoring — always evaluates hub as candidate and scores by the full multi-factory sweep it enables, eliminating trailing microtrips from late partial reloads.
-// @description  v6.40: Fix hub sweep overcounting — only count marginal action from hub-loaded supplies (not pre-existing cargo the ship could deliver without the detour), preventing the hub from winning when a far detour isn't worth it.
-// @description  v6.41: AP-efficiency guard — hub can't win when a factory with actual cargo drops has better linear action/AP ratio; prevents far hub detours that waste AP when nearby factories can be served with current cargo.
-// @description  v6.42: Starbase energy run no longer gets Infinity score — scored by energy items per AP (same exponent formula as factories/hub). Far starbases with low stock now lose to nearby factories instead of always winning.
-// @description  v6.43: FWE hub load fills entire hull with F/W in 123:84 ratio instead of tracker-clamped quantities — ship always carries max F/W to the starbase so the trip is worthwhile even if tracker data is stale.
-// @description  v6.44: FWE gate requires 80% hull capacity available for F/W — prevents starbase runs when the ship is mostly full of other cargo. Ship delivers its cargo first, then does FWE with a near-empty hull.
-// @description  v6.45: FWE override clearing phase — when energy demand requires a starbase run but the hull is full of other cargo, proactively delivers cargo to nearest demanding buildings and dumps leftovers at TO before firing FWE, instead of passively waiting.
-// @description  v6.46: Protect hydrogen fuel and phantom protection from being traded, stashed at TO, or cleared by FWE override — these permanent cargo items now occupy space without being treated as tradeable.
-// @description  v6.47: Monster guard for auto-fly — scans the nav screen for NPCs (navNpc class) before each jump and sidesteps around monsters blocking the path instead of flying into combat.
-// @description  v6.48: Auto-retreat from NPC ambushes — when a cloaked/hidden NPC ambushes during auto-fly, automatically retreats and resumes the flight, sidestepping the ambush tile. Toggle in control center.
-// @description  v6.49: Fly Here draggable panel — searchable sector list, plot path/AP cost preview (cross-sector via wormholes), and one-click auto-fly to any sector coordinate.
-// @description  v6.50: Fix fly-here-panel scope — move inside main IIFE so it can access routing functions.
-// @description  v6.51: Fix fly-here-panel crash — use header.querySelector instead of document.getElementById for min-btn before panel is mounted.
-// @description  v6.52: Fix auto-updater — embed read token directly as constant instead of extracting from @downloadURL (Tampermonkey strips URL credentials).
-// @description  v6.53: Fix fly-here cross-sector routing — normalize wormhole destination names (strip #suffix, underscores→spaces) so they match parsedMap sector keys. Previously underscore sectors like Ras Elased and #-suffixed wormholes like SZ 4-419#North silently dropped all wormhole edges, causing "No path found" for most cross-sector routes.
-// @description  v6.54: Equipment-aware terrain AP costs — port getTileCosts() from pardusapcalculator.uk so Dijkstra uses drive speed, nav level, amber stim, pathfinder, boost, exocrab, flux capacitors, viral persuader instead of hard-coded values. Wormhole-seal calendar (Asdwolf epoch logic) skips sealed wormholes. Configurable wormhole jump cost. Ship-config section in Fly Here panel. Sim engine (03-3) now respects configurable wormhole surcharge and seal calendar for route scoring.
-// @description  v6.55: Fix cross-sector routing crash on sub-sector sectors (Betelgeuse East/West, Pardus NE/West, etc.). parseStaticMap now merges sub-sector grid fragments into their parent sector (e.g. Betelgeuse East+West → Betelgeuse) and remaps wormhole destinations. Added getSectorData() fallback resolver for name mismatches (BL3961 vs "BL 3961", Wayaan vs Waayan, directional suffixes). Fixes "sd is undefined" crash when plotting routes through these sectors.
+// @version      6.58
+// @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v6.54: Equipment-aware terrain AP costs (drive speed, nav level, stims, pathfinder, flux, persuader), wormhole-seal calendar, configurable wormhole jump cost, ship-config UI in Fly Here panel.
+// @description  v6.55: Fix cross-sector routing crash on sub-sector sectors — merge grid fragments into parent sectors, remap wormhole destinations, add getSectorData() name resolver.
+// @description  v6.56: Refactor — merge split trade-screen DOM files, remove dead terrainAP legacy constant, fix UI version label and misleading indentation.
+// @description  v6.57: Cache-optimal part reordering (static data first, load-time dispatcher last — fixes ambush-resume TDZ bug); remove ALL Manhattan/Chebyshev distance-estimate fallbacks (Dijkstra only, hard fail with deferred recalc retry); dead-code purge (unused helpers, dead GM keys, per-pathfind diagnostic log spam); auto-updater skips headless harnesses.
+// @description  v6.58: Remove dangling GM_deleteValue('logistics_mag_scoop_size') from clear button (key no longer written since magscoop refactor); restore update-skip mechanism in auto-updater with "Skip this version" Tampermonkey menu command.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
