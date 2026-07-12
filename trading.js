@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.60
+// @version      6.61
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.56: Refactor — merge split trade-screen DOM files, remove dead terrainAP legacy constant, fix UI version label and misleading indentation.
 // @description  v6.57: Cache-optimal part reordering (static data first, load-time dispatcher last — fixes ambush-resume TDZ bug); remove ALL Manhattan/Chebyshev distance-estimate fallbacks (Dijkstra only, hard fail with deferred recalc retry); dead-code purge (unused helpers, dead GM keys, per-pathfind diagnostic log spam); auto-updater skips headless harnesses.
 // @description  v6.58: Remove dangling GM_deleteValue('logistics_mag_scoop_size') from clear button (key no longer written since magscoop refactor); restore update-skip mechanism in auto-updater with "Skip this version" Tampermonkey menu command.
 // @description  v6.59: REVERTED — native buildings overview parser was published in error, reverted to v6.58 codebase. Work preserved on branch tomb/native-buildings-parser.
 // @description  v6.60: Revert of v6.59 native buildings parser — restores v6.58 behavior. Bump version to force Tampermonkey to pull the revert (it won't downgrade).
+// @description  v6.61: Fix monster sidestep in auto-fly — nav grid is 9×11 (99 tiles, center field 49), not 11×11 (121 tiles, center 60); sidestep now uses two 1-tile forward moves instead of one 2-tile move (Pardus only moves 1 tile per navAjax call).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3883,14 +3883,19 @@ const SECTOR_DATA = {
     }
 
     // >> Monster sidestep helpers
-    // The Pardus nav screen is an 11×11 grid (tdNavField0 … tdNavField120).
-    // The player is at the centre — tdNavField60 (row 5, col 5).
+    // The Pardus nav screen is a 9×11 grid (tdNavField0 … tdNavField98).
+    // navSizeVer=9 rows, navSizeHor=11 cols. The player is at the centre —
+    // tdNavField49 (row 4, col 5).
     // Monsters / NPCs appear with class "navNpc" on the <td>.
     // Tile IDs are embedded in the <a onclick="navAjax(tileId)"> attribute.
 
+    const NAV_CENTER = 49;
+    const NAV_COLS = 11;
+    const NAV_MAX_FIELD = 98;
+
     function scanNavForMonsters() {
         const monsters = new Set();
-        for (let i = 0; i <= 120; i++) {
+        for (let i = 0; i <= NAV_MAX_FIELD; i++) {
             const td = document.getElementById('tdNavField' + i);
             if (td && td.classList.contains('navNpc')) {
                 const a = td.querySelector('a');
@@ -3904,8 +3909,8 @@ const SECTOR_DATA = {
     }
 
     function getNavTileIdAt(dx, dy) {
-        const navIdx = 60 + dy * 11 + dx;
-        if (navIdx < 0 || navIdx > 120) return null;
+        const navIdx = NAV_CENTER + dy * NAV_COLS + dx;
+        if (navIdx < 0 || navIdx > NAV_MAX_FIELD) return null;
         const td = document.getElementById('tdNavField' + navIdx);
         if (!td) return null;
         const a = td.querySelector('a');
@@ -3915,8 +3920,8 @@ const SECTOR_DATA = {
     }
 
     function isNavTileClear(dx, dy) {
-        const navIdx = 60 + dy * 11 + dx;
-        if (navIdx < 0 || navIdx > 120) return false;
+        const navIdx = NAV_CENTER + dy * NAV_COLS + dx;
+        if (navIdx < 0 || navIdx > NAV_MAX_FIELD) return false;
         const td = document.getElementById('tdNavField' + navIdx);
         return !!td && !td.classList.contains('navNpc');
     }
@@ -4134,23 +4139,32 @@ const SECTOR_DATA = {
                     setOverlay('\u26a0 Monster in path \u2014 sidestepping ' + dirName + '...');
 
                     moveAndWait(sidestepId, 150, () => {
-                        if (!isNavTileClear(dirX, dirY) || !isNavTileClear(dirX * 2, dirY * 2)) {
+                        if (!isNavTileClear(dirX, dirY)) {
                             fail('\u26a0 Another monster on sidestep forward path. Stopping.');
                             return;
                         }
-                        const fwdId = getNavTileIdAt(dirX * 2, dirY * 2);
-                        if (!fwdId) { fail('\u26a0 Cannot find forward tile after sidestep. Stopping.'); return; }
+                        const fwd1Id = getNavTileIdAt(dirX, dirY);
+                        if (!fwd1Id) { fail('\u26a0 Cannot find forward tile after sidestep. Stopping.'); return; }
                         setOverlay('\u26a0 Sidestep done \u2014 moving forward past monster...');
 
-                        moveAndWait(fwdId, 150, () => {
-                            const backId = getNavTileIdAt(-pDx, -pDy);
-                            if (!backId) { fail('\u26a0 Cannot find path-rejoin tile. Stopping.'); return; }
-                            setOverlay('\u26a0 Rejoining original path...');
+                        moveAndWait(fwd1Id, 150, () => {
+                            if (!isNavTileClear(dirX, dirY)) {
+                                fail('\u26a0 Another monster ahead past sidestep. Stopping.');
+                                return;
+                            }
+                            const fwd2Id = getNavTileIdAt(dirX, dirY);
+                            if (!fwd2Id) { fail('\u26a0 Cannot find second forward tile. Stopping.'); return; }
 
-                            moveAndWait(backId, 150, () => {
-                                setOverlay('\u2708 Monster avoided \u2014 resuming flight to ' + destLabel + '...');
-                                flyNext();
-                            }, '\u26a0 Rejoin move did not complete. Stopping.');
+                            moveAndWait(fwd2Id, 150, () => {
+                                const backId = getNavTileIdAt(-pDx, -pDy);
+                                if (!backId) { fail('\u26a0 Cannot find path-rejoin tile. Stopping.'); return; }
+                                setOverlay('\u26a0 Rejoining original path...');
+
+                                moveAndWait(backId, 150, () => {
+                                    setOverlay('\u2708 Monster avoided \u2014 resuming flight to ' + destLabel + '...');
+                                    flyNext();
+                                }, '\u26a0 Rejoin move did not complete. Stopping.');
+                            }, '\u26a0 Second forward move did not complete. Stopping.');
                         }, '\u26a0 Forward move after sidestep did not complete. Stopping.');
                     }, '\u26a0 Sidestep move did not complete. Stopping.');
                     break;
