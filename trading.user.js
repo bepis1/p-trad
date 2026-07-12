@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.69
+// @version      6.70
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.65: Fix root cause — compute tile IDs arithmetically from userloc + sector rows instead of reading from nav grid HTML (which had stale/wrong tile IDs after replaceHtml GC churn). Also checks navImpassable in isNavTileClear.
 // @description  v6.66: Remove diagnostic console.log statements from sidestep logic — fix confirmed working. Clean stable release.
 // @description  v6.67: Macro wormhole graph — pre-calculates all-pairs shortest path between every wormhole tile in the universe (Floyd-Warshall). Fast cross-sector AP lookup via getCrossSectorAPFast() using two local Dijkstra runs + macro lookup. Foundation for the opportunities panel.
 // @description  v6.68: Opportunities tab in exports panel — one-way arbitrage (buy low at A, sell high at B, cr/AP via macro AP) and two-way arbitrage (A↔B round-trip with best forward X + return Y commodities). Curve-aware pricing, asymmetric terrain AP.
 // @description  v6.69: Cache opportunities results — recompute only on Recalculate click, not on every tab switch. Exports/FWE tabs unchanged (auto-calculate, negligible cost).
+// @description  v6.70: Active run pinning — clicking a route in Opps pins it as an active run that persists across recalculates and tab switches, so the buyer location stays visible after you've bought the item. Clear manually when done.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3360,6 +3360,7 @@ const SECTOR_DATA = {
         controls.appendChild(refreshBtn);
 
         let oppsCache = { oneway: null, twoway: null };
+        let oppsActiveRun = GM_getValue('opps_active_run_v1', null);
         function renderBody(force) {
             if (activeTab === 'fwe') renderFweBody();
             else if (activeTab === 'opps') renderOpportunitiesBody(force);
@@ -3402,9 +3403,11 @@ const SECTOR_DATA = {
                 sumHtml += '</div>';
             }
             if (res.usedFallback) {
-                sumHtml += '<div style="color:#8a6a3a;margin-bottom:4px;">\u26a0 No sector map data \u2014 same-sector AP unavailable (?). Load static_ext.txt.</div>';
+                html += '<div style="color:#8a6a3a;margin-bottom:4px;">\u26a0 No sector map data \u2014 AP unavailable (?). Load static_ext.txt.</div>';
             }
-            body.innerHTML = sumHtml;
+            const sumDiv = document.createElement('div');
+            sumDiv.innerHTML = html;
+            body.appendChild(sumDiv);
 
             if (res.routes.length === 0) {
                 const empty = document.createElement('div');
@@ -3588,6 +3591,76 @@ const SECTOR_DATA = {
             body.appendChild(note);
         }
 
+        // >> Opportunities: active run bar
+        //
+        // When the user clicks a route to fly, it gets pinned as the active
+        // run. The bar shows the full route (all locations clickable) at the
+        // top of the opps body, persisting across recalculates and tab
+        // switches until the user clears it. This solves the "bought the
+        // item, now the route is gone" problem — the buyer location stays
+        // visible.
+        function renderActiveRunBar() {
+            const run = oppsActiveRun;
+            if (!run) return;
+
+            const bar = document.createElement('div');
+            bar.style.cssText = 'background:#0a1a0a;border:1px solid #2a5a2a;padding:5px 7px;margin-bottom:4px;';
+
+            let inner = '';
+            inner += '<div style="margin-bottom:2px;">' +
+                '<span style="color:#00ff88;font-weight:bold;">\uD83D\uDCCC Active Run</span>' +
+                '<button type="button" class="opps-clear-run" style="float:right;cursor:pointer;font-size:8px;background:#330000;color:#ff8866;border:1px solid #5a0000;padding:1px 5px;">Clear</button>' +
+                '</div>';
+
+            if (run.subTab === 'oneway') {
+                inner += '<div style="color:#ccc;">' +
+                    'Buy <span style="color:#ffcc77;">' + run.item + '</span> at ' +
+                    '<span class="opps-active-fly" data-target="seller" style="color:#aaffaa;cursor:pointer;text-decoration:underline;">' + run.sellerName + ' [' + run.sellerCoords.x + ',' + run.sellerCoords.y + ']</span>' +
+                    ' \u2192 Sell at ' +
+                    '<span class="opps-active-fly" data-target="buyer" style="color:#88ccff;cursor:pointer;text-decoration:underline;">' + run.buyerName + ' [' + run.buyerCoords.x + ',' + run.buyerCoords.y + ']</span>' +
+                    '</div>';
+                inner += '<div style="color:#888;font-size:8px;margin-top:1px;">' + run.units + 'u \u00b7 buy ' + fmtCr(run.buyPerUnit) + ' \u00b7 sell ' + fmtCr(run.sellPerUnit) + ' \u00b7 profit ' + fmtCr(run.profit) + ' cr</div>';
+            } else {
+                inner += '<div style="color:#ccc;">' +
+                    'Buy <span style="color:#ffcc77;">' + run.fwdItem + '</span> at ' +
+                    '<span class="opps-active-fly" data-target="A" style="color:#aaffaa;cursor:pointer;text-decoration:underline;">' + run.Aname + ' [' + run.Acoords.x + ',' + run.Acoords.y + ']</span>' +
+                    ' \u2192 Sell ' + run.fwdItem + ' / Buy <span style="color:#88ccff;">' + run.retItem + '</span> at ' +
+                    '<span class="opps-active-fly" data-target="B" style="color:#88ccff;cursor:pointer;text-decoration:underline;">' + run.Bname + ' [' + run.Bcoords.x + ',' + run.Bcoords.y + ']</span>' +
+                    ' \u2192 Sell ' + run.retItem + ' at ' +
+                    '<span class="opps-active-fly" data-target="A" style="color:#aaffaa;cursor:pointer;text-decoration:underline;">' + run.Aname + '</span>' +
+                    '</div>';
+                inner += '<div style="color:#888;font-size:8px;margin-top:1px;">Fwd: ' + run.fwdQty + ' ' + run.fwdItem + ' (+' + fmtCr(run.fwdProfit) + ') \u00b7 Ret: ' + run.retQty + ' ' + run.retItem + ' (+' + fmtCr(run.retProfit) + ') \u00b7 Total: ' + fmtCr(run.profit) + ' cr</div>';
+            }
+            bar.innerHTML = inner;
+
+            bar.addEventListener('click', function(e) {
+                if (e.target.closest('.opps-clear-run')) {
+                    oppsActiveRun = null;
+                    GM_deleteValue('opps_active_run_v1');
+                    renderBody(false);
+                    return;
+                }
+                const el = e.target.closest('.opps-active-fly');
+                if (!el) return;
+                const target = el.dataset.target;
+                if (run.subTab === 'oneway') {
+                    if (target === 'seller') {
+                        flyToCoords({ x: run.sellerCoords.x, y: run.sellerCoords.y, sector: run.sellerSector }, run.sellerName + ' [' + run.sellerCoords.x + ',' + run.sellerCoords.y + ']');
+                    } else {
+                        flyToCoords({ x: run.buyerCoords.x, y: run.buyerCoords.y, sector: run.buyerSector }, run.buyerName + ' [' + run.buyerCoords.x + ',' + run.buyerCoords.y + ']');
+                    }
+                } else {
+                    if (target === 'A') {
+                        flyToCoords({ x: run.Acoords.x, y: run.Acoords.y, sector: run.Asector }, run.Aname + ' [' + run.Acoords.x + ',' + run.Acoords.y + ']');
+                    } else {
+                        flyToCoords({ x: run.Bcoords.x, y: run.Bcoords.y, sector: run.Bsector }, run.Bname + ' [' + run.Bcoords.x + ',' + run.Bcoords.y + ']');
+                    }
+                }
+            });
+
+            body.appendChild(bar);
+        }
+
         // >> Opportunities tab renderer
         // Opps computation is O(n²×commodities) with macro AP lookups — too
         // heavy to re-run on every tab switch. Results are cached per sub-tab;
@@ -3595,6 +3668,7 @@ const SECTOR_DATA = {
         function renderOpportunitiesBody(force) {
             body.innerHTML = '';
             updateSubTabStyle();
+            renderActiveRunBar();
             if (oppSubTab === 'twoway') {
                 if (force || !oppsCache.twoway) oppsCache.twoway = computeTwoWayArbitrage();
                 renderTwoWayOpps(oppsCache.twoway);
@@ -3619,7 +3693,9 @@ const SECTOR_DATA = {
             if (res.usedFallback) {
                 html += '<div style="color:#8a6a3a;margin-bottom:4px;">\u26a0 No sector map data \u2014 AP unavailable (?). Load static_ext.txt.</div>';
             }
-            body.innerHTML = html;
+            const sumDiv = document.createElement('div');
+            sumDiv.innerHTML = html;
+            body.appendChild(sumDiv);
 
             if (res.routes.length === 0) {
                 const empty = document.createElement('div');
@@ -3680,17 +3756,35 @@ const SECTOR_DATA = {
                 const idx = parseInt(el.dataset.idx, 10);
                 const r = res.routes[idx];
                 if (!r) return;
-                if (el.dataset.target === 'seller') {
-                    flyToCoords({ x: r.sellerCoords.x, y: r.sellerCoords.y, sector: r.sellerSector }, (r.seller.name || '?') + ' [' + r.sellerCoords.x + ',' + r.sellerCoords.y + ']');
-                } else {
-                    flyToCoords({ x: r.buyerCoords.x, y: r.buyerCoords.y, sector: r.buyerSector }, (r.buyer.name || '?') + ' [' + r.buyerCoords.x + ',' + r.buyerCoords.y + ']');
-                }
+                oppsActiveRun = {
+                    subTab: 'oneway',
+                    item: r.item,
+                    sellerName: r.seller.name || '?',
+                    sellerCoords: r.sellerCoords,
+                    sellerSector: r.sellerSector,
+                    buyerName: r.buyer.name || '?',
+                    buyerCoords: r.buyerCoords,
+                    buyerSector: r.buyerSector,
+                    units: r.units,
+                    profit: r.profit,
+                    buyPerUnit: r.buyPerUnit,
+                    sellPerUnit: r.sellPerUnit
+                };
+                GM_setValue('opps_active_run_v1', oppsActiveRun);
+                renderBody(false);
+                try {
+                    if (el.dataset.target === 'seller') {
+                        flyToCoords({ x: r.sellerCoords.x, y: r.sellerCoords.y, sector: r.sellerSector }, (r.seller.name || '?') + ' [' + r.sellerCoords.x + ',' + r.sellerCoords.y + ']');
+                    } else {
+                        flyToCoords({ x: r.buyerCoords.x, y: r.buyerCoords.y, sector: r.buyerSector }, (r.buyer.name || '?') + ' [' + r.buyerCoords.x + ',' + r.buyerCoords.y + ']');
+                    }
+                } catch(e) { console.error('[pardus-opps] fly error:', e); }
             });
             body.appendChild(t);
 
             const note = document.createElement('div');
             note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
-            note.innerHTML = 'Buy at seller \u2192 travel \u2192 sell at buyer. Profitable routes only (profit &gt; 0). AP = travel (macro wormhole AP, asymmetric terrain) + 10 (buy 5 + sell 5). Buy/Sell = per-unit average (curve-aware for planets/starbases). Click a name to auto-fly.';
+            note.innerHTML = 'Buy at seller \u2192 travel \u2192 sell at buyer. Profitable routes only (profit &gt; 0). AP = travel (macro wormhole AP, asymmetric terrain) + 10 (buy 5 + sell 5). Buy/Sell = per-unit average (curve-aware for planets/starbases). Click a name to auto-fly and pin as active run.';
             body.appendChild(note);
         }
 
@@ -3708,7 +3802,9 @@ const SECTOR_DATA = {
             if (res.usedFallback) {
                 html += '<div style="color:#8a6a3a;margin-bottom:4px;">\u26a0 No sector map data \u2014 AP unavailable (?). Load static_ext.txt.</div>';
             }
-            body.innerHTML = html;
+            const sumDiv2 = document.createElement('div');
+            sumDiv2.innerHTML = html;
+            body.appendChild(sumDiv2);
 
             if (res.routes.length === 0) {
                 const empty = document.createElement('div');
@@ -3765,17 +3861,37 @@ const SECTOR_DATA = {
                 const idx = parseInt(el.dataset.idx, 10);
                 const r = res.routes[idx];
                 if (!r) return;
-                if (el.dataset.target === 'A') {
-                    flyToCoords({ x: r.Acoords.x, y: r.Acoords.y, sector: r.Asector }, (r.A.name || '?') + ' [' + r.Acoords.x + ',' + r.Acoords.y + ']');
-                } else {
-                    flyToCoords({ x: r.Bcoords.x, y: r.Bcoords.y, sector: r.Bsector }, (r.B.name || '?') + ' [' + r.Bcoords.x + ',' + r.Bcoords.y + ']');
-                }
+                oppsActiveRun = {
+                    subTab: 'twoway',
+                    Aname: r.A.name || '?',
+                    Acoords: r.Acoords,
+                    Asector: r.Asector,
+                    Bname: r.B.name || '?',
+                    Bcoords: r.Bcoords,
+                    Bsector: r.Bsector,
+                    fwdItem: r.fwdItem,
+                    fwdQty: r.fwdQty,
+                    fwdProfit: r.fwdProfit,
+                    retItem: r.retItem,
+                    retQty: r.retQty,
+                    retProfit: r.retProfit,
+                    profit: r.profit
+                };
+                GM_setValue('opps_active_run_v1', oppsActiveRun);
+                renderBody(false);
+                try {
+                    if (el.dataset.target === 'A') {
+                        flyToCoords({ x: r.Acoords.x, y: r.Acoords.y, sector: r.Asector }, (r.A.name || '?') + ' [' + r.Acoords.x + ',' + r.Acoords.y + ']');
+                    } else {
+                        flyToCoords({ x: r.Bcoords.x, y: r.Bcoords.y, sector: r.Bsector }, (r.B.name || '?') + ' [' + r.Bcoords.x + ',' + r.Bcoords.y + ']');
+                    }
+                } catch(e) { console.error('[pardus-opps] fly error:', e); }
             });
             body.appendChild(t);
 
             const note = document.createElement('div');
             note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
-            note.innerHTML = 'Round-trip: buy X at A \u2192 travel A\u2192B \u2192 sell X, buy Y at B \u2192 travel B\u2192A \u2192 sell Y at A. AP = macro A\u2192B + macro B\u2192A (asymmetric) + 10 (combined sell+buy at each end, steady-state). Best forward (X) and return (Y) commodities chosen per pair (X\u2260Y). Click a name to auto-fly.';
+            note.innerHTML = 'Round-trip: buy X at A \u2192 travel A\u2192B \u2192 sell X, buy Y at B \u2192 travel B\u2192A \u2192 sell Y at A. AP = macro A\u2192B + macro B\u2192A (asymmetric) + 10 (combined sell+buy at each end, steady-state). Best forward (X) and return (Y) commodities chosen per pair (X\u2260Y). Click a name to auto-fly and pin as active run.';
             body.appendChild(note);
         }
 
