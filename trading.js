@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.88
+// @version      6.89
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v6.89: Defer route recalc off critical path — nav paints first, itinerary updates after. Moves recalculateRouteOnTheFly into setTimeout(0) and injectNavHUD into the deferred panels block so the HUD reads the fresh route.
 // @description  v6.88: Eliminate page-load lag — L1 top-window cache for HPA* table (skips GM deserialize on refresh), deferred UI injection via setTimeout(0), targeted DOM queries instead of body.innerText reflow.
-// @description  v6.84: HPA* pathfinder (hpaCompile/hpaCrossSectorAP/hpaFindRoute) — fixes grid-merge bug (split sectors like Betelgeuse no longer dissolve walls), padding bug (phantom fuel tiles in Ras Elased nook), and recomputes all wormhole distances with ship-configured terrain costs. Wired into simCrossTravelAP, getCrossSectorRoute, getCrossSectorAPFast, and exports calculator.
 // @description  v6.85: Full HPA* cutover — legacy merged-grid model, duplicate macro-graph, and cross-sector Dijkstra deleted. simTravelAP now routes through HPA with fragment resolution (fixes Betelgeuse same-sector AP=0). No silent fallbacks — hard-fail on unknown sectors/unreachable targets.
 // @description  v6.86: Enforce hard-fail policy in simTravelAP/simCrossTravelAP/getCrossSectorAPFast — null coords and unknown sectors now throw instead of returning 0/Infinity/null. hpaGetTable logs compile errors. Added pathfinder facade test suite with bug-museum regressions and golden-master snapshot.
 // @description  v6.87: Persist HPA* macro graph across page loads via GM_setValue — eliminates ~5s Dijkstra+Floyd-Warshall recompile on every navigation. Compact typed-array format (Float32Array/Int32Array + base64). Cache key includes terrainAP, wjump, sealed, rawText.length, and schema version for auto-invalidation.
@@ -8592,26 +8592,35 @@ const SECTOR_DATA = {
         initBookkeeperParser();
     }
     if (GM_getValue('logistics_needs_recalc', false)) {
-        let sectorState = GM_getValue('raw_bookkeeper_data', []);
-        try {
-            recalculateRouteOnTheFly(sectorState);
-            GM_deleteValue('logistics_needs_recalc');
-        } catch (e) {
-            // Hard-fail policy: the sim refuses to plan without real
-            // Dijkstra data (no Manhattan estimates). Keep the recalc flag
-            // set so it retries on the next page where userloc + static map
-            // are available, and let the rest of the UI load normally.
-            console.error('[pardus-sim] route recalc failed (flag kept for retry):', e);
-        }
+        // Deferred off the critical path so the nav screen paints before
+        // the sim runs. FIFO ordering of equal-delay setTimeouts guarantees
+        // this (queued here, before the panels block below) completes and
+        // writes logistics_route_v5 before injectNavHUD/injectDraggableUI
+        // read it.
+        setTimeout(() => {
+            let sectorState = GM_getValue('raw_bookkeeper_data', []);
+            try {
+                recalculateRouteOnTheFly(sectorState);
+                GM_deleteValue('logistics_needs_recalc');
+            } catch (e) {
+                // Hard-fail policy: keep the recalc flag set so it retries
+                // on the next page where userloc + static map are available.
+                console.error('[pardus-sim] route recalc failed (flag kept for retry):', e);
+            }
+        }, 0);
     }
 
     if (currentPath === '/main.php') {
-        injectNavHUD();
         // Defer heavy UI injection so the browser can paint the nav screen
-        // first. These run in the same frame but after paint: injectDraggableUI
-        // triggers hpaGetTable() (L1 top-cache hit after first load), then the
-        // exports calc (1 Dijkstra), fly-here (~250 options), and tracker.
+        // first. injectNavHUD runs first inside this block so it reads the
+        // freshly-recalculated logistics_route_v5 (the deferred recalc above
+        // is queued earlier than this setTimeout, so FIFO guarantees it
+        // completes first). injectDraggableUI triggers hpaGetTable() (L1
+        // top-cache hit after first load), then the exports calc (1
+        // Dijkstra), fly-here (~250 options), and tracker.
         setTimeout(() => {
+            try { injectNavHUD(); }
+            catch (e) { console.error('[pardus-nav] HUD inject failed:', e); }
             try { injectDraggableUI(); }
             catch (e) { console.error('[pardus-ui] draggable inject failed:', e); }
             try { injectFlyHerePanel(); }
