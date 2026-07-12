@@ -5244,12 +5244,6 @@ const SECTOR_DATA = {
             return null;
         }
 
-        function resolveWarpFn() {
-            if (typeof w.warpAjax === 'function') return w.warpAjax;
-            if (typeof w.warp === 'function') return w.warp;
-            return null;
-        }
-
         function currentTileId() {
             const v = w.userloc;
             return (v === undefined || v === null) ? -1 : parseInt(v.toString(), 10);
@@ -5312,17 +5306,16 @@ const SECTOR_DATA = {
                     if (onArrive) onArrive(true);
                     return;
                 }
-                // At a wormhole tile — trigger the jump via warpAjax/warp.
-                // Pardus uses a separate warp function for wormhole jumps;
-                // navAjax does nothing when already on the wormhole tile.
-                const warpFn = resolveWarpFn();
-                if (!warpFn) {
-                    fail('\u26a0 Pardus warp function (warpAjax/warp) not found on page. Stopping.');
+                // At a wormhole tile — trigger the jump by clicking the
+                // "jump to *" link that Pardus renders on the nav screen.
+                const jumpLink = document.querySelector('a[href*="warpAjax"]');
+                if (!jumpLink) {
+                    fail('\u26a0 No wormhole jump link found on page. Stopping.');
                     return;
                 }
                 const beforeSector = curSector;
                 setOverlay(`\u2708 Triggering wormhole jump (leg ${legIdx + 1}/${legs.length})...`);
-                try { warpFn(tileIds[idx]); } catch (e) { fail(`\u26a0 warp() threw: ${e.message}. Stopping.`); return; }
+                jumpLink.click();
 
                 const deadline = Date.now() + 8000;
                 (function waitForJump() {
