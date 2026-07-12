@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.73
+// @version      6.74
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.69: Cache opportunities results — recompute only on Recalculate click, not on every tab switch. Exports/FWE tabs unchanged (auto-calculate, negligible cost).
 // @description  v6.70: Active run pinning — clicking a route in Opps pins it as an active run that persists across recalculates and tab switches, so the buyer location stays visible after you've bought the item. Clear manually when done.
 // @description  v6.71: Fix exports tab blank (undefined html var) — exports body was empty because sumHtml was built but never rendered. Opps tab no longer auto-computes on first open — shows placeholder until Recalculate is pressed.
 // @description  v6.72: Min cr/AP filter for Opps — input field sets a profit-per-AP floor. Low-profit pairs are skipped before AP pathfinding (pre-filter: profit/TRADE_AP < threshold), and remaining routes are post-filtered by actual cr/AP. Cuts computation and clutter.
 // @description  v6.73: Return exports in active run bar — shows the top 2 profitable commodities in the reverse direction (B→A), so you can see at a glance what's worth bringing back for a second run.
+// @description  v6.74: Return exports now shows combined cr/AP instead of per-item credit profit — cleaner single-value display of reverse-direction profitability.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3730,12 +3730,12 @@ const SECTOR_DATA = {
                 const fromEntry = store[String(fromLoc)];
                 const toEntry = store[String(toLoc)];
                 const returns = findReturnExports(fromEntry, toEntry, maxCargo);
-                if (returns.length > 0) {
-                    const top = returns.slice(0, 2);
-                    const parts = top.map(function(r) {
-                        return '<span style="color:#ffcc77;">' + r.item + '</span> ' + r.qty + 'u <span style="color:#88ff88;">+' + fmtCr(r.profit) + '</span>';
-                    });
-                    inner += '<div class="opps-return-exports" style="color:#8a6a3a;font-size:8px;margin-top:2px;">Return: ' + parts.join(' \u00b7 ') + '</div>';
+                if (returns.length > 0 && run.apCost != null && run.apCost > 0) {
+                    const totalRetProfit = returns.reduce(function(s, r) { return s + r.profit; }, 0);
+                    const crap = totalRetProfit / run.apCost;
+                    inner += '<div class="opps-return-exports" style="color:#8a6a3a;font-size:8px;margin-top:2px;">Return: <span style="color:#00ff88;font-weight:bold;">' + fmtRatio(crap) + '</span> cr/AP (' + returns.length + ' item' + (returns.length > 1 ? 's' : '') + ')</div>';
+                } else if (returns.length > 0) {
+                    inner += '<div class="opps-return-exports" style="color:#8a6a3a;font-size:8px;margin-top:2px;">Return: ' + returns.length + ' item' + (returns.length > 1 ? 's' : '') + ' (AP unknown)</div>';
                 } else {
                     inner += '<div class="opps-return-exports" style="color:#5a3a1a;font-size:8px;margin-top:2px;">Return: \u2014</div>';
                 }
@@ -3896,6 +3896,7 @@ const SECTOR_DATA = {
                     buyerLoc: r.buyer.userloc,
                     units: r.units,
                     profit: r.profit,
+                    apCost: r.apCost,
                     buyPerUnit: r.buyPerUnit,
                     sellPerUnit: r.sellPerUnit
                 };
@@ -4011,7 +4012,8 @@ const SECTOR_DATA = {
                     retItem: r.retItem,
                     retQty: r.retQty,
                     retProfit: r.retProfit,
-                    profit: r.profit
+                    profit: r.profit,
+                    apCost: r.apCost
                 };
                 GM_setValue('opps_active_run_v1', oppsActiveRun);
                 renderBody(false);
