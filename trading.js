@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.67
-// @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.63: Add diagnostic console.log to sidestep logic (prefix [SIDESTEP]) to trace monster-avoidance failures. Open browser console (F12) to capture logs when reporting issues.
+// @version      6.68
+// @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
 // @description  v6.64: Enhanced sidestep diagnostics — dump full nav grid layout (5×5 around center), navSizeHor/Ver, and center tile ID to identify grid mismatches.
 // @description  v6.65: Fix root cause — compute tile IDs arithmetically from userloc + sector rows instead of reading from nav grid HTML (which had stale/wrong tile IDs after replaceHtml GC churn). Also checks navImpassable in isNavTileClear.
 // @description  v6.66: Remove diagnostic console.log statements from sidestep logic — fix confirmed working. Clean stable release.
 // @description  v6.67: Macro wormhole graph — pre-calculates all-pairs shortest path between every wormhole tile in the universe (Floyd-Warshall). Fast cross-sector AP lookup via getCrossSectorAPFast() using two local Dijkstra runs + macro lookup. Foundation for the opportunities panel.
+// @description  v6.68: Opportunities tab in exports panel — one-way arbitrage (buy low at A, sell high at B, cr/AP via macro AP) and two-way arbitrage (A↔B round-trip with best forward X + return Y commodities). Curve-aware pricing, asymmetric terrain AP.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2925,6 +2925,304 @@ const SECTOR_DATA = {
         };
     }
 
+    // >> Opportunities: one-way arbitrage
+    //
+    // Scans ALL tracked locations (not just configured export items) for
+    // buy-low → sell-high pairs. For every commodity that at least one
+    // location sells (buyFromObjPrice > 0) and another buys (sellToObjPrice
+    // > 0), it projects a full-cargo buy at the seller and sell at the buyer,
+    // then computes credit/AP via getCrossSectorAPFast (pre-calculated macro
+    // wormhole graph + local Dijkstra). Only profitable routes (profit > 0)
+    // are kept, sorted by cr/AP descending.
+    //
+    // Curve-aware pricing: trackerProjectBuy/Sell account for planet/starbase
+    // price curves when buying/selling in bulk. Buildings use flat pricing.
+    //
+    // AP model: travel (macro AP, asymmetric terrain) + TRADE_AP (10 = buy at
+    // seller 5 + sell at buyer 5). Unlike the exports calculator (where TO
+    // loading is free via building_management), opportunities require actual
+    // trade-form actions at both ends.
+    function computeOpportunities() {
+        const maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
+        const TRADE_AP = 10;
+
+        parseStaticMap(true);
+        const store = getTrackerStore();
+        if (Object.keys(store).length === 0) {
+            return { error: 'No tracked locations yet. Open building/planet/starbase trade screens to capture them.' };
+        }
+
+        // Build resId → { name, sellers: [...], buyers: [...] }
+        const commodityIndex = {};
+        for (const k in store) {
+            const e = store[k];
+            if (!e || !e.commodities) continue;
+            const rc = realSectorAndCoords(e);
+            if (!rc.coords) continue;
+
+            for (const resId in e.commodities) {
+                const c = e.commodities[resId];
+                if (!c || !c.name) continue;
+
+                if (!commodityIndex[resId]) {
+                    commodityIndex[resId] = { name: c.name, sellers: [], buyers: [] };
+                }
+                if (c.buyFromObjPrice > 0) {
+                    commodityIndex[resId].sellers.push({ entry: e, coords: rc.coords, sector: rc.sector });
+                }
+                if (c.sellToObjPrice > 0) {
+                    commodityIndex[resId].buyers.push({ entry: e, coords: rc.coords, sector: rc.sector });
+                }
+            }
+        }
+
+        let macroGraph = null;
+        try { macroGraph = getMacroWormholeGraph(); } catch (e) { macroGraph = null; }
+        const dijCache = {};
+        const routes = [];
+        const usedFallback = !macroGraph;
+
+        for (const resId in commodityIndex) {
+            const ci = commodityIndex[resId];
+            if (ci.sellers.length === 0 || ci.buyers.length === 0) continue;
+
+            for (const seller of ci.sellers) {
+                for (const buyer of ci.buyers) {
+                    if (seller.entry.userloc === buyer.entry.userloc) continue;
+
+                    const buyProj = trackerProjectBuy(seller.entry, resId, maxCargo);
+                    if (!buyProj || buyProj.quantity <= 0) continue;
+
+                    const sellProj = trackerProjectSell(buyer.entry, resId, maxCargo);
+                    if (!sellProj || sellProj.quantity <= 0) continue;
+
+                    const qty = Math.min(buyProj.quantity, sellProj.quantity);
+                    if (qty <= 0) continue;
+
+                    // Re-project with actual quantity for accurate curve pricing.
+                    const finalBuy = trackerProjectBuy(seller.entry, resId, qty);
+                    const finalSell = trackerProjectSell(buyer.entry, resId, qty);
+                    if (!finalBuy || !finalSell || finalBuy.quantity <= 0 || finalSell.quantity <= 0) continue;
+
+                    const cost = finalBuy.totalCost;
+                    const revenue = finalSell.totalRevenue;
+                    const profit = revenue - cost;
+                    if (profit <= 0) continue;
+
+                    let ap = null;
+                    if (macroGraph) {
+                        try {
+                            ap = getCrossSectorAPFast(seller.coords, seller.sector, buyer.coords, buyer.sector, dijCache, macroGraph);
+                        } catch (e) { ap = null; }
+                    }
+
+                    const apCost = (ap != null) ? ap + TRADE_AP : null;
+                    const ratio = (apCost != null && apCost > 0) ? profit / apCost : null;
+
+                    routes.push({
+                        item: ci.name,
+                        seller: seller.entry,
+                        buyer: buyer.entry,
+                        sellerCoords: seller.coords,
+                        buyerCoords: buyer.coords,
+                        sellerSector: seller.sector,
+                        buyerSector: buyer.sector,
+                        units: qty,
+                        buyPerUnit: finalBuy.perUnitAvg,
+                        sellPerUnit: finalSell.perUnitAvg,
+                        cost: cost,
+                        revenue: revenue,
+                        profit: profit,
+                        travelAp: ap,
+                        apCost: apCost,
+                        ratio: ratio
+                    });
+                }
+            }
+        }
+
+        routes.sort((a, b) => {
+            if (a.ratio != null && b.ratio != null) return b.ratio - a.ratio;
+            if (a.ratio != null) return -1;
+            if (b.ratio != null) return 1;
+            return (b.profit || 0) - (a.profit || 0);
+        });
+
+        return {
+            routes: routes,
+            maxCargo: maxCargo,
+            usedFallback: usedFallback,
+            commodityCount: Object.keys(commodityIndex).length
+        };
+    }
+
+    // >> Opportunities: two-way arbitrage
+    //
+    // Finds location pairs A↔B where a round-trip is profitable:
+    //   1. Buy X at A → travel A→B → sell X at B (forward leg)
+    //   2. Buy Y at B → travel B→A → sell Y at A (return leg)
+    // X and Y must be different commodities (same-commodity "round-trips"
+    // reduce to a one-way arbitrage and are excluded).
+    //
+    // For each unordered pair (A, B), all profitable forward and return
+    // commodities are collected, then the best (fwd, ret) pair with
+    // different resIds is chosen — maximizing total round-trip profit.
+    //
+    // AP model: macro A→B + macro B→A (asymmetric terrain) + TRADE_AP (10
+    // = combined sell+buy at each end, 5+5, steady-state). cr/AP = total
+    // profit / total AP. Sorted by cr/AP descending.
+    function computeTwoWayArbitrage() {
+        const maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
+        const TRADE_AP = 10;
+
+        parseStaticMap(true);
+        const store = getTrackerStore();
+        if (Object.keys(store).length === 0) {
+            return { error: 'No tracked locations yet. Open building/planet/starbase trade screens to capture them.' };
+        }
+
+        // Collect tracked locations with resolved coords.
+        const locs = [];
+        for (const k in store) {
+            const e = store[k];
+            if (!e || !e.commodities) continue;
+            const rc = realSectorAndCoords(e);
+            if (!rc.coords) continue;
+            locs.push({ entry: e, coords: rc.coords, sector: rc.sector });
+        }
+
+        let macroGraph = null;
+        try { macroGraph = getMacroWormholeGraph(); } catch (e) { macroGraph = null; }
+        const dijCache = {};
+        const routes = [];
+        const usedFallback = !macroGraph;
+
+        for (let i = 0; i < locs.length; i++) {
+            for (let j = i + 1; j < locs.length; j++) {
+                const A = locs[i];
+                const B = locs[j];
+
+                // Collect profitable forward (A sells → B buys) and return
+                // (B sells → A buys) commodity candidates.
+                const fwdCandidates = [];
+                const retCandidates = [];
+
+                for (const resId in A.entry.commodities) {
+                    const aComm = A.entry.commodities[resId];
+                    if (!aComm || !aComm.name) continue;
+                    const bComm = B.entry.commodities[resId];
+                    if (!bComm) continue;
+
+                    // Forward: A sells X (buyFromObjPrice), B buys X (sellToObjPrice).
+                    if (aComm.buyFromObjPrice > 0 && bComm.sellToObjPrice > 0) {
+                        const bp = trackerProjectBuy(A.entry, resId, maxCargo);
+                        const sp = trackerProjectSell(B.entry, resId, maxCargo);
+                        if (bp && sp && bp.quantity > 0 && sp.quantity > 0) {
+                            const q = Math.min(bp.quantity, sp.quantity);
+                            const fb = trackerProjectBuy(A.entry, resId, q);
+                            const fs = trackerProjectSell(B.entry, resId, q);
+                            if (fb && fs && fb.quantity > 0 && fs.quantity > 0) {
+                                const p = fs.totalRevenue - fb.totalCost;
+                                if (p > 0) fwdCandidates.push({
+                                    resId: resId, name: aComm.name, qty: q, profit: p,
+                                    buyPerUnit: fb.perUnitAvg, sellPerUnit: fs.perUnitAvg
+                                });
+                            }
+                        }
+                    }
+
+                    // Return: B sells Y (buyFromObjPrice), A buys Y (sellToObjPrice).
+                    if (aComm.sellToObjPrice > 0 && bComm.buyFromObjPrice > 0) {
+                        const bp = trackerProjectBuy(B.entry, resId, maxCargo);
+                        const sp = trackerProjectSell(A.entry, resId, maxCargo);
+                        if (bp && sp && bp.quantity > 0 && sp.quantity > 0) {
+                            const q = Math.min(bp.quantity, sp.quantity);
+                            const fb = trackerProjectBuy(B.entry, resId, q);
+                            const fs = trackerProjectSell(A.entry, resId, q);
+                            if (fb && fs && fb.quantity > 0 && fs.quantity > 0) {
+                                const p = fs.totalRevenue - fb.totalCost;
+                                if (p > 0) retCandidates.push({
+                                    resId: resId, name: aComm.name, qty: q, profit: p,
+                                    buyPerUnit: fb.perUnitAvg, sellPerUnit: fs.perUnitAvg
+                                });
+                            }
+                        }
+                    }
+                }
+
+                if (fwdCandidates.length === 0 || retCandidates.length === 0) continue;
+
+                fwdCandidates.sort((a, b) => b.profit - a.profit);
+                retCandidates.sort((a, b) => b.profit - a.profit);
+
+                // Find the best (fwd, ret) pair with different resIds.
+                let bestTotal = -Infinity;
+                let bestFwd = null, bestRet = null;
+                for (const f of fwdCandidates) {
+                    for (const r of retCandidates) {
+                        if (f.resId === r.resId) continue;
+                        const total = f.profit + r.profit;
+                        if (total > bestTotal) {
+                            bestTotal = total;
+                            bestFwd = f;
+                            bestRet = r;
+                        }
+                    }
+                }
+                if (!bestFwd || !bestRet) continue;
+
+                // Macro AP both ways (Pardus terrain is asymmetric).
+                let apAB = null, apBA = null;
+                if (macroGraph) {
+                    try {
+                        apAB = getCrossSectorAPFast(A.coords, A.sector, B.coords, B.sector, dijCache, macroGraph);
+                        apBA = getCrossSectorAPFast(B.coords, B.sector, A.coords, A.sector, dijCache, macroGraph);
+                    } catch (e) { apAB = null; apBA = null; }
+                }
+
+                const apCost = (apAB != null && apBA != null) ? apAB + apBA + TRADE_AP : null;
+                const ratio = (apCost != null && apCost > 0) ? bestTotal / apCost : null;
+
+                routes.push({
+                    A: A.entry,
+                    B: B.entry,
+                    Acoords: A.coords,
+                    Bcoords: B.coords,
+                    Asector: A.sector,
+                    Bsector: B.sector,
+                    fwdItem: bestFwd.name,
+                    fwdQty: bestFwd.qty,
+                    fwdProfit: bestFwd.profit,
+                    fwdBuyPerUnit: bestFwd.buyPerUnit,
+                    fwdSellPerUnit: bestFwd.sellPerUnit,
+                    retItem: bestRet.name,
+                    retQty: bestRet.qty,
+                    retProfit: bestRet.profit,
+                    retBuyPerUnit: bestRet.buyPerUnit,
+                    retSellPerUnit: bestRet.sellPerUnit,
+                    profit: bestTotal,
+                    travelApAB: apAB,
+                    travelApBA: apBA,
+                    apCost: apCost,
+                    ratio: ratio
+                });
+            }
+        }
+
+        routes.sort((a, b) => {
+            if (a.ratio != null && b.ratio != null) return b.ratio - a.ratio;
+            if (a.ratio != null) return -1;
+            if (b.ratio != null) return 1;
+            return (b.profit || 0) - (a.profit || 0);
+        });
+
+        return {
+            routes: routes,
+            maxCargo: maxCargo,
+            usedFallback: usedFallback
+        };
+    }
+
     function fmtCr(n) {
         if (n == null || isNaN(n)) return '?';
         return simpleNumberFormatTracker(n);
@@ -2965,7 +3263,7 @@ const SECTOR_DATA = {
         wrap.appendChild(tabBar);
 
         function updateTabStyle() {
-            [exportsTabBtn, fweTabBtn].forEach(btn => {
+            [exportsTabBtn, fweTabBtn, oppsTabBtn].forEach(btn => {
                 const active = btn.dataset.tab === activeTab;
                 btn.style.borderBottom = active ? '2px solid #ffaa55' : '2px solid transparent';
                 btn.style.color = active ? '#ffcc77' : '#8a6a3a';
@@ -2973,6 +3271,8 @@ const SECTOR_DATA = {
             });
             // cfgBar (buy-price override) only applies to the Exports tab.
             cfgBar.style.display = (activeTab === 'exports' && !collapsed) ? 'flex' : 'none';
+            // Sub-tab bar only applies to the Opportunities tab.
+            if (oppSubBar) oppSubBar.style.display = (activeTab === 'opps' && !collapsed) ? 'flex' : 'none';
         }
 
         function makeTabBtn(label, tabId) {
@@ -2990,8 +3290,43 @@ const SECTOR_DATA = {
         }
         const exportsTabBtn = makeTabBtn('Exports', 'exports');
         const fweTabBtn = makeTabBtn('FWE', 'fwe');
+        const oppsTabBtn = makeTabBtn('Opps', 'opps');
         tabBar.appendChild(exportsTabBtn);
         tabBar.appendChild(fweTabBtn);
+        tabBar.appendChild(oppsTabBtn);
+
+        // Sub-tab bar for Opportunities (one-way vs two-way).
+        let oppSubTab = 'oneway';
+        const oppSubBar = document.createElement('div');
+        oppSubBar.style.cssText = 'display:none;padding:3px 7px;border-bottom:1px solid #5a3a1a;gap:4px;';
+        wrap.appendChild(oppSubBar);
+
+        function makeSubTabBtn(label, subId) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = label;
+            btn.dataset.subtab = subId;
+            btn.style.cssText = 'flex:1;cursor:pointer;font-size:9px;padding:2px 6px;border:1px solid #5a3a1a;background:#1a1000;color:#8a6a3a;';
+            btn.addEventListener('click', () => {
+                oppSubTab = subId;
+                updateSubTabStyle();
+                renderBody();
+            });
+            return btn;
+        }
+        const onewaySubBtn = makeSubTabBtn('One-way', 'oneway');
+        const twowaySubBtn = makeSubTabBtn('Two-way', 'twoway');
+        oppSubBar.appendChild(onewaySubBtn);
+        oppSubBar.appendChild(twowaySubBtn);
+
+        function updateSubTabStyle() {
+            [onewaySubBtn, twowaySubBtn].forEach(btn => {
+                const active = btn.dataset.subtab === oppSubTab;
+                btn.style.color = active ? '#ffcc77' : '#8a6a3a';
+                btn.style.background = active ? '#332200' : '#1a1000';
+                btn.style.borderColor = active ? '#aa7744' : '#5a3a1a';
+            });
+        }
 
         const cfgBar = document.createElement('div');
         cfgBar.style.cssText = 'padding:4px 7px;border-bottom:1px solid #5a3a1a;display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:9px;';
@@ -3026,6 +3361,7 @@ const SECTOR_DATA = {
 
         function renderBody() {
             if (activeTab === 'fwe') renderFweBody();
+            else if (activeTab === 'opps') renderOpportunitiesBody();
             else renderExportsBody();
         }
 
@@ -3248,6 +3584,194 @@ const SECTOR_DATA = {
             const note = document.createElement('div');
             note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
             note.innerHTML = 'FWE cycle: buy food+water at hub (123:84 ratio) \u2192 travel to starbase \u2192 sell food+water, buy energy \u2192 travel back \u2192 sell energy at hub. AP = round-trip travel + 10 (2 combined trade actions). Quantities are capped by stock/capacity limits. Click a starbase name to auto-fly there. Only same-sector starbases are listed.';
+            body.appendChild(note);
+        }
+
+        // >> Opportunities tab renderer
+        function renderOpportunitiesBody() {
+            body.innerHTML = '';
+            updateSubTabStyle();
+            if (oppSubTab === 'twoway') {
+                const res = computeTwoWayArbitrage();
+                renderTwoWayOpps(res);
+            } else {
+                const res = computeOpportunities();
+                renderOneWayOpps(res);
+            }
+        }
+
+        function renderOneWayOpps(res) {
+            if (res.error) {
+                body.innerHTML = '<div style="color:#ff8866;padding:6px;text-align:center;">' + res.error + '</div>';
+                return;
+            }
+
+            let html = '<div style="margin-bottom:4px;color:#aaa;">' +
+                'One-way arbitrage: buy low \u2192 sell high. ' +
+                '<span style="color:#88ccff;">' + res.routes.length + '</span> profitable routes' +
+                ' across <span style="color:#88ccff;">' + res.commodityCount + '</span> tracked commodities' +
+                ' (cargo <span style="color:#ffcc77;">' + res.maxCargo + '</span>).' +
+                '</div>';
+            if (res.usedFallback) {
+                html += '<div style="color:#8a6a3a;margin-bottom:4px;">\u26a0 No sector map data \u2014 AP unavailable (?). Load static_ext.txt.</div>';
+            }
+            body.innerHTML = html;
+
+            if (res.routes.length === 0) {
+                const empty = document.createElement('div');
+                empty.style.cssText = 'color:#888;text-align:center;padding:8px;';
+                empty.textContent = 'No profitable one-way routes found. Open more trade screens to capture prices.';
+                body.appendChild(empty);
+                return;
+            }
+
+            const t = document.createElement('table');
+            t.style.cssText = 'width:100%;border-collapse:collapse;font-size:9px;';
+            t.innerHTML = '<tr style="color:#8a6a3a;">' +
+                '<th style="text-align:left;">#</th>' +
+                '<th style="text-align:left;">Item</th>' +
+                '<th style="text-align:left;">From \u2192 To</th>' +
+                '<th>Qty</th>' +
+                '<th>Buy</th>' +
+                '<th>Sell</th>' +
+                '<th>Profit</th>' +
+                '<th>AP</th>' +
+                '<th>cr/AP</th>' +
+                '</tr>';
+
+            res.routes.forEach((r, i) => {
+                const tr = document.createElement('tr');
+                tr.style.cssText = 'border-bottom:1px dashed #2a2a1a;color:#bbb;';
+                const sIcon = r.seller.type === 'planet' ? '\u25cf' : (r.seller.type === 'starbase' ? '\u25b2' : '\u25a0');
+                const bIcon = r.buyer.type === 'planet' ? '\u25cf' : (r.buyer.type === 'starbase' ? '\u25b2' : '\u25a0');
+                const sColor = r.seller.type === 'planet' ? '#aaffaa' : (r.seller.type === 'starbase' ? '#88ccff' : '#ffcc88');
+                const bColor = r.buyer.type === 'planet' ? '#aaffaa' : (r.buyer.type === 'starbase' ? '#88ccff' : '#ffcc88');
+                const apTxt = (r.apCost == null)
+                    ? '<span style="color:#666;">?</span>'
+                    : '<span style="color:#ffaa44;">' + r.apCost + '</span>';
+                const ratioTxt = (r.ratio == null)
+                    ? '<span style="color:#666;">?</span>'
+                    : '<span style="color:#00ff88;font-weight:bold;">' + fmtRatio(r.ratio) + '</span>';
+                tr.innerHTML =
+                    '<td>' + (i + 1) + '</td>' +
+                    '<td style="color:#ffcc77;">' + r.item + '</td>' +
+                    '<td><span style="color:' + sColor + ';">' + sIcon + '</span> ' +
+                        '<span class="export-fly-target" data-idx="' + i + '" data-target="seller" title="Click to fly to seller" style="color:' + sColor + ';cursor:pointer;text-decoration:underline;">' + (r.seller.name || '?') + '</span>' +
+                        ' <span style="color:#5a5a3a;">[' + r.sellerCoords.x + ',' + r.sellerCoords.y + ']</span>' +
+                        ' <span style="color:#8a6a3a;">\u2192</span> ' +
+                        '<span style="color:' + bColor + ';">' + bIcon + '</span> ' +
+                        '<span class="export-fly-target" data-idx="' + i + '" data-target="buyer" title="Click to fly to buyer" style="color:' + bColor + ';cursor:pointer;text-decoration:underline;">' + (r.buyer.name || '?') + '</span>' +
+                        ' <span style="color:#5a5a3a;">[' + r.buyerCoords.x + ',' + r.buyerCoords.y + ']</span></td>' +
+                    '<td style="text-align:right;">' + r.units + '</td>' +
+                    '<td style="text-align:right;color:#ffaa55;">' + fmtCr(r.buyPerUnit) + '</td>' +
+                    '<td style="text-align:right;color:#88cc88;">' + fmtCr(r.sellPerUnit) + '</td>' +
+                    '<td style="text-align:right;color:#88ff88;">' + fmtCr(r.profit) + '</td>' +
+                    '<td style="text-align:right;color:#ffaa44;">' + apTxt + '</td>' +
+                    '<td style="text-align:right;">' + ratioTxt + '</td>';
+                t.appendChild(tr);
+            });
+            t.addEventListener('click', function(e) {
+                const el = e.target.closest('.export-fly-target');
+                if (!el) return;
+                const idx = parseInt(el.dataset.idx, 10);
+                const r = res.routes[idx];
+                if (!r) return;
+                if (el.dataset.target === 'seller') {
+                    flyToCoords({ x: r.sellerCoords.x, y: r.sellerCoords.y, sector: r.sellerSector }, (r.seller.name || '?') + ' [' + r.sellerCoords.x + ',' + r.sellerCoords.y + ']');
+                } else {
+                    flyToCoords({ x: r.buyerCoords.x, y: r.buyerCoords.y, sector: r.buyerSector }, (r.buyer.name || '?') + ' [' + r.buyerCoords.x + ',' + r.buyerCoords.y + ']');
+                }
+            });
+            body.appendChild(t);
+
+            const note = document.createElement('div');
+            note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
+            note.innerHTML = 'Buy at seller \u2192 travel \u2192 sell at buyer. Profitable routes only (profit &gt; 0). AP = travel (macro wormhole AP, asymmetric terrain) + 10 (buy 5 + sell 5). Buy/Sell = per-unit average (curve-aware for planets/starbases). Click a name to auto-fly.';
+            body.appendChild(note);
+        }
+
+        function renderTwoWayOpps(res) {
+            if (res.error) {
+                body.innerHTML = '<div style="color:#ff8866;padding:6px;text-align:center;">' + res.error + '</div>';
+                return;
+            }
+
+            let html = '<div style="margin-bottom:4px;color:#aaa;">' +
+                'Two-way arbitrage: A\u2194B round-trip. ' +
+                '<span style="color:#88ccff;">' + res.routes.length + '</span> profitable pairs' +
+                ' (cargo <span style="color:#ffcc77;">' + res.maxCargo + '</span>).' +
+                '</div>';
+            if (res.usedFallback) {
+                html += '<div style="color:#8a6a3a;margin-bottom:4px;">\u26a0 No sector map data \u2014 AP unavailable (?). Load static_ext.txt.</div>';
+            }
+            body.innerHTML = html;
+
+            if (res.routes.length === 0) {
+                const empty = document.createElement('div');
+                empty.style.cssText = 'color:#888;text-align:center;padding:8px;';
+                empty.textContent = 'No profitable two-way arbitrage pairs found. Need at least two locations that sell different commodities each other buys.';
+                body.appendChild(empty);
+                return;
+            }
+
+            const t = document.createElement('table');
+            t.style.cssText = 'width:100%;border-collapse:collapse;font-size:9px;';
+            t.innerHTML = '<tr style="color:#8a6a3a;">' +
+                '<th style="text-align:left;">#</th>' +
+                '<th style="text-align:left;">A \u2194 B</th>' +
+                '<th>\u2192Fwd</th>' +
+                '<th>\u2190Ret</th>' +
+                '<th>Profit</th>' +
+                '<th>AP</th>' +
+                '<th>cr/AP</th>' +
+                '</tr>';
+
+            res.routes.forEach((r, i) => {
+                const tr = document.createElement('tr');
+                tr.style.cssText = 'border-bottom:1px dashed #2a2a1a;color:#bbb;';
+                const aIcon = r.A.type === 'planet' ? '\u25cf' : (r.A.type === 'starbase' ? '\u25b2' : '\u25a0');
+                const bIcon = r.B.type === 'planet' ? '\u25cf' : (r.B.type === 'starbase' ? '\u25b2' : '\u25a0');
+                const aColor = r.A.type === 'planet' ? '#aaffaa' : (r.A.type === 'starbase' ? '#88ccff' : '#ffcc88');
+                const bColor = r.B.type === 'planet' ? '#aaffaa' : (r.B.type === 'starbase' ? '#88ccff' : '#ffcc88');
+                const apTxt = (r.apCost == null)
+                    ? '<span style="color:#666;">?</span>'
+                    : '<span style="color:#ffaa44;">' + r.apCost + '</span>';
+                const ratioTxt = (r.ratio == null)
+                    ? '<span style="color:#666;">?</span>'
+                    : '<span style="color:#00ff88;font-weight:bold;">' + fmtRatio(r.ratio) + '</span>';
+                tr.innerHTML =
+                    '<td>' + (i + 1) + '</td>' +
+                    '<td><span style="color:' + aColor + ';">' + aIcon + '</span> ' +
+                        '<span class="export-fly-target" data-idx="' + i + '" data-target="A" title="Click to fly to A" style="color:' + aColor + ';cursor:pointer;text-decoration:underline;">' + (r.A.name || '?') + '</span>' +
+                        ' <span style="color:#5a5a3a;">[' + r.Acoords.x + ',' + r.Acoords.y + ']</span>' +
+                        ' <span style="color:#8a6a3a;">\u2194</span> ' +
+                        '<span style="color:' + bColor + ';">' + bIcon + '</span> ' +
+                        '<span class="export-fly-target" data-idx="' + i + '" data-target="B" title="Click to fly to B" style="color:' + bColor + ';cursor:pointer;text-decoration:underline;">' + (r.B.name || '?') + '</span>' +
+                        ' <span style="color:#5a5a3a;">[' + r.Bcoords.x + ',' + r.Bcoords.y + ']</span></td>' +
+                    '<td style="text-align:right;color:#ffcc77;">' + r.fwdItem + '<br><span style="color:#5a5a3a;">' + r.fwdQty + 'u +' + fmtCr(r.fwdProfit) + '</span></td>' +
+                    '<td style="text-align:right;color:#88ccff;">' + r.retItem + '<br><span style="color:#5a5a3a;">' + r.retQty + 'u +' + fmtCr(r.retProfit) + '</span></td>' +
+                    '<td style="text-align:right;color:#88ff88;">' + fmtCr(r.profit) + '</td>' +
+                    '<td style="text-align:right;color:#ffaa44;">' + apTxt + '</td>' +
+                    '<td style="text-align:right;">' + ratioTxt + '</td>';
+                t.appendChild(tr);
+            });
+            t.addEventListener('click', function(e) {
+                const el = e.target.closest('.export-fly-target');
+                if (!el) return;
+                const idx = parseInt(el.dataset.idx, 10);
+                const r = res.routes[idx];
+                if (!r) return;
+                if (el.dataset.target === 'A') {
+                    flyToCoords({ x: r.Acoords.x, y: r.Acoords.y, sector: r.Asector }, (r.A.name || '?') + ' [' + r.Acoords.x + ',' + r.Acoords.y + ']');
+                } else {
+                    flyToCoords({ x: r.Bcoords.x, y: r.Bcoords.y, sector: r.Bsector }, (r.B.name || '?') + ' [' + r.Bcoords.x + ',' + r.Bcoords.y + ']');
+                }
+            });
+            body.appendChild(t);
+
+            const note = document.createElement('div');
+            note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
+            note.innerHTML = 'Round-trip: buy X at A \u2192 travel A\u2192B \u2192 sell X, buy Y at B \u2192 travel B\u2192A \u2192 sell Y at A. AP = macro A\u2192B + macro B\u2192A (asymmetric) + 10 (combined sell+buy at each end, steady-state). Best forward (X) and return (Y) commodities chosen per pair (X\u2260Y). Click a name to auto-fly.';
             body.appendChild(note);
         }
 
