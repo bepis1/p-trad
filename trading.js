@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.66
+// @version      6.67
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.62: Fix sidestep rejoin sending player into a second consecutive monster — rejoin now checks if the path tile is clear before moving; loop-based forward movement handles any number of consecutive monsters (max 5).
 // @description  v6.63: Add diagnostic console.log to sidestep logic (prefix [SIDESTEP]) to trace monster-avoidance failures. Open browser console (F12) to capture logs when reporting issues.
 // @description  v6.64: Enhanced sidestep diagnostics — dump full nav grid layout (5×5 around center), navSizeHor/Ver, and center tile ID to identify grid mismatches.
 // @description  v6.65: Fix root cause — compute tile IDs arithmetically from userloc + sector rows instead of reading from nav grid HTML (which had stale/wrong tile IDs after replaceHtml GC churn). Also checks navImpassable in isNavTileClear.
 // @description  v6.66: Remove diagnostic console.log statements from sidestep logic — fix confirmed working. Clean stable release.
+// @description  v6.67: Macro wormhole graph — pre-calculates all-pairs shortest path between every wormhole tile in the universe (Floyd-Warshall). Fast cross-sector AP lookup via getCrossSectorAPFast() using two local Dijkstra runs + macro lookup. Foundation for the opportunities panel.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3850,6 +3850,231 @@ const SECTOR_DATA = {
         legs.push({ sector: curPos.sector, path: finalPath, tileIds: finalTileIds });
 
         return { legs, totalAP: best.totalAP };
+    }
+
+    // >> Macro wormhole graph (pre-calculated all-pairs shortest path)
+    //
+    // Pardus terrain is static — the AP cost between any two wormhole tiles
+    // within the same sector never changes. Wormhole connections are also
+    // static (which sector links to which); only the seal calendar rotates
+    // every 2 days. This means we can pre-compute the "macro" AP cost between
+    // every pair of wormhole tiles in the universe once per session (or per
+    // seal-cycle change) and reuse it for O(wormholes_A × wormholes_B) lookups
+    // instead of a full cross-sector Dijkstra per query.
+    //
+    // Macro graph:
+    //   Nodes  = wormhole tiles: (sector, x, y) — typically 2-4 per sector
+    //   Edges  = (a) Wormhole jumps: one-directional, cost = WJUMP
+    //            (b) Intra-sector: bidirectional (terrain AP is symmetric),
+    //                cost = Dijkstra distance between wormhole tiles in the
+    //                same sector
+    //
+    // All-pairs shortest path via Floyd-Warshall. Node count is ~50-100 so
+    // O(n³) is trivial. Result: distMap[whKeyA][whKeyB] = min AP.
+    //
+    // For a location-to-location query (e.g. starbase A → starbase B across
+    // sectors), the total AP is:
+    //   min over wh1 in A's sector, wh2 in B's sector of:
+    //     distFromA[wh1] + macroDist[wh1][wh2] + distFromB[wh2]
+    // where distFromA/distFromB are single Dijkstra runs within each sector
+    // (terrain is symmetric, so Dijkstra from B gives costs TO B as well).
+
+    let _macroWormholeGraph = null;
+
+    function buildMacroWormholeGraph() {
+        if (Object.keys(parsedMap).length === 0) parseStaticMap(true);
+        if (Object.keys(parsedMap).length === 0) return null;
+
+        const sealed = getWormholeSeals();
+        const sealHash = Array.from(sealed).sort().join(',');
+        const WJUMP = Number(getShipOptions().wormhole_cost) || 10;
+
+        const nodes = [];
+        const nodeSet = new Set();
+        const jumpEdges = [];
+
+        for (const secName in parsedMap) {
+            const sec = parsedMap[secName];
+            if (!sec || !sec.wormholes) continue;
+            for (const destName in sec.wormholes) {
+                const fromLocal = sec.wormholes[destName];
+                if (!fromLocal) continue;
+                if (sealed.has(secName.toLowerCase()) || sealed.has(destName.toLowerCase())) continue;
+                const destSec = parsedMap[destName];
+                if (!destSec || !destSec.wormholes) continue;
+                const toLocal = destSec.wormholes[secName];
+                if (!toLocal) continue;
+
+                const fromKey = secName + '|' + fromLocal.x + ',' + fromLocal.y;
+                const toKey = destName + '|' + toLocal.x + ',' + toLocal.y;
+                if (!nodeSet.has(fromKey)) {
+                    nodeSet.add(fromKey);
+                    nodes.push({ key: fromKey, sec: secName, x: fromLocal.x, y: fromLocal.y });
+                }
+                if (!nodeSet.has(toKey)) {
+                    nodeSet.add(toKey);
+                    nodes.push({ key: toKey, sec: destName, x: toLocal.x, y: toLocal.y });
+                }
+                jumpEdges.push({ from: fromKey, to: toKey, cost: WJUMP });
+            }
+        }
+
+        if (nodes.length === 0) return null;
+
+        const nodesBySector = {};
+        for (const n of nodes) {
+            if (!nodesBySector[n.sec]) nodesBySector[n.sec] = [];
+            nodesBySector[n.sec].push(n);
+        }
+
+        // Pre-compute intra-sector distances between all wormhole tiles.
+        // For a sector with k wormholes, we need k Dijkstra runs.
+        const dijCache = {};
+        const intraEdges = [];
+        for (const secName in nodesBySector) {
+            const secNodes = nodesBySector[secName];
+            for (const src of secNodes) {
+                const cacheKey = secName + '|' + src.x + ',' + src.y;
+                let dist = dijCache[cacheKey];
+                if (!dist) {
+                    dist = getSectorAllDistances(secName, src.x, src.y);
+                    dijCache[cacheKey] = dist;
+                }
+                if (!dist) continue;
+                for (const dst of secNodes) {
+                    if (src.key === dst.key) continue;
+                    const d = dist[dst.x + ',' + dst.y];
+                    if (d !== undefined && isFinite(d)) {
+                        intraEdges.push({ from: src.key, to: dst.key, cost: d });
+                    }
+                }
+            }
+        }
+
+        // Floyd-Warshall all-pairs shortest path.
+        const idx = {};
+        nodes.forEach((n, i) => idx[n.key] = i);
+        const n = nodes.length;
+
+        const dist = new Array(n);
+        for (let i = 0; i < n; i++) {
+            dist[i] = new Array(n).fill(Infinity);
+            dist[i][i] = 0;
+        }
+        for (const e of jumpEdges) {
+            const i = idx[e.from], j = idx[e.to];
+            if (i != null && j != null && e.cost < dist[i][j]) dist[i][j] = e.cost;
+        }
+        for (const e of intraEdges) {
+            const i = idx[e.from], j = idx[e.to];
+            if (i != null && j != null && e.cost < dist[i][j]) dist[i][j] = e.cost;
+        }
+        for (let k = 0; k < n; k++) {
+            for (let i = 0; i < n; i++) {
+                if (dist[i][k] === Infinity) continue;
+                for (let j = 0; j < n; j++) {
+                    if (dist[i][k] + dist[k][j] < dist[i][j]) {
+                        dist[i][j] = dist[i][k] + dist[k][j];
+                    }
+                }
+            }
+        }
+
+        const wormholesBySector = {};
+        for (const n of nodes) {
+            if (!wormholesBySector[n.sec]) wormholesBySector[n.sec] = [];
+            wormholesBySector[n.sec].push(n);
+        }
+
+        const distMap = {};
+        for (let i = 0; i < n; i++) {
+            const fromKey = nodes[i].key;
+            distMap[fromKey] = {};
+            for (let j = 0; j < n; j++) {
+                if (i !== j && dist[i][j] !== Infinity) {
+                    distMap[fromKey][nodes[j].key] = dist[i][j];
+                }
+            }
+        }
+
+        return {
+            distMap: distMap,
+            wormholesBySector: wormholesBySector,
+            sealHash: sealHash,
+            nodeCount: n
+        };
+    }
+
+    function getMacroWormholeGraph() {
+        if (_macroWormholeGraph) {
+            const sealHash = Array.from(getWormholeSeals()).sort().join(',');
+            if (_macroWormholeGraph.sealHash === sealHash) return _macroWormholeGraph;
+        }
+        _macroWormholeGraph = buildMacroWormholeGraph();
+        return _macroWormholeGraph;
+    }
+
+    // Fast cross-sector AP using the pre-built macro wormhole graph.
+    // Same-sector: direct Dijkstra lookup.
+    // Cross-sector: min over (wh1 in fromSector, wh2 in toSector) of
+    //   distFromA[wh1] + macroDist[wh1][wh2] + distFromWh2[dest]
+    // Pardus terrain is ASYMMETRIC: moving onto a tile costs that tile's
+    // terrain AP, so dist(A→B) ≠ dist(B→A). A Dijkstra from X gives
+    // distances FROM X; we need distances TO dest, so we must run Dijkstra
+    // from each wormhole tile in the destination sector (typically 2-4),
+    // not from the destination itself.
+    // Returns null if no route is found (NO estimate — hard-fail policy).
+    function getCrossSectorAPFast(fromCoords, fromSector, toCoords, toSector, dijCache, macroGraph) {
+        if (!fromCoords || !toCoords || !fromSector || !toSector || !macroGraph) return null;
+
+        if (fromSector === toSector) {
+            const key = fromSector + '|' + fromCoords.x + ',' + fromCoords.y;
+            let d = dijCache[key];
+            if (!d) {
+                d = getSectorAllDistances(fromSector, fromCoords.x, fromCoords.y);
+                dijCache[key] = d;
+            }
+            if (!d) return null;
+            const v = d[toCoords.x + ',' + toCoords.y];
+            return (v !== undefined && isFinite(v)) ? v : null;
+        }
+
+        const fromWhs = macroGraph.wormholesBySector[fromSector];
+        const toWhs = macroGraph.wormholesBySector[toSector];
+        if (!fromWhs || !toWhs) return null;
+
+        const fromKey = fromSector + '|' + fromCoords.x + ',' + fromCoords.y;
+        let distFrom = dijCache[fromKey];
+        if (!distFrom) {
+            distFrom = getSectorAllDistances(fromSector, fromCoords.x, fromCoords.y);
+            dijCache[fromKey] = distFrom;
+        }
+        if (!distFrom) return null;
+
+        let best = Infinity;
+        for (const w1 of fromWhs) {
+            const d1 = distFrom[w1.x + ',' + w1.y];
+            if (d1 === undefined || !isFinite(d1)) continue;
+            const macro = macroGraph.distMap[w1.key];
+            if (!macro) continue;
+            for (const w2 of toWhs) {
+                const macroLeg = macro[w2.key];
+                if (macroLeg === undefined) continue;
+                const w2Key = toSector + '|' + w2.x + ',' + w2.y;
+                let distFromW2 = dijCache[w2Key];
+                if (!distFromW2) {
+                    distFromW2 = getSectorAllDistances(toSector, w2.x, w2.y);
+                    dijCache[w2Key] = distFromW2;
+                }
+                if (!distFromW2) continue;
+                const d2 = distFromW2[toCoords.x + ',' + toCoords.y];
+                if (d2 === undefined || !isFinite(d2)) continue;
+                const total = d1 + macroLeg + d2;
+                if (total < best) best = total;
+            }
+        }
+
+        return isFinite(best) ? best : null;
     }
 
     // --- 15. Rich Nav HUD ---
