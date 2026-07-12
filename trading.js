@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.63
+// @version      6.64
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.59: REVERTED — native buildings overview parser was published in error, reverted to v6.58 codebase. Work preserved on branch tomb/native-buildings-parser.
 // @description  v6.60: Revert of v6.59 native buildings parser — restores v6.58 behavior. Bump version to force Tampermonkey to pull the revert (it won't downgrade).
 // @description  v6.61: Fix monster sidestep in auto-fly — nav grid is 9×11 (99 tiles, center field 49), not 11×11 (121 tiles, center 60); sidestep now uses two 1-tile forward moves instead of one 2-tile move (Pardus only moves 1 tile per navAjax call).
 // @description  v6.62: Fix sidestep rejoin sending player into a second consecutive monster — rejoin now checks if the path tile is clear before moving; loop-based forward movement handles any number of consecutive monsters (max 5).
 // @description  v6.63: Add diagnostic console.log to sidestep logic (prefix [SIDESTEP]) to trace monster-avoidance failures. Open browser console (F12) to capture logs when reporting issues.
+// @description  v6.64: Enhanced sidestep diagnostics — dump full nav grid layout (5×5 around center), navSizeHor/Ver, and center tile ID to identify grid mismatches.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -4109,6 +4109,23 @@ const SECTOR_DATA = {
                 knownAmbushTiles: [...knownAmbushTiles],
                 nextTileIds: tileIds.slice(idx + 1, idx + 4)
             });
+            // >> Diagnostic: dump the actual nav grid layout
+            const w2 = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+            const navSizeH = w2.navSizeHor;
+            const navSizeV = w2.navSizeVer;
+            const gridDump = {};
+            for (let dy = -2; dy <= 2; dy++) {
+                for (let dx = -2; dx <= 2; dx++) {
+                    const fi = NAV_CENTER + dy * NAV_COLS + dx;
+                    const td = document.getElementById('tdNavField' + fi);
+                    const cls = td ? td.className : 'MISSING';
+                    const a = td ? td.querySelector('a') : null;
+                    const m = a ? (a.getAttribute('onclick') || '').match(/\d+/) : null;
+                    const tid = m ? parseInt(m[0], 10) : null;
+                    gridDump[`${dx},${dy}`] = { field: fi, class: cls, tileId: tid };
+                }
+            }
+            console.log('[SIDESTEP] Nav grid dump', { navSizeHor: navSizeH, navSizeVer: navSizeV, NAV_CENTER, NAV_COLS, userloc: w2.userloc, centerTileId: getNavTileIdAt(0, 0), grid: gridDump });
             if (monsterSet.size > 0) {
                 for (let j = idx + 1; j <= targetIdx; j++) {
                     if (monsterSet.has(tileIds[j])) {
