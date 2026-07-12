@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.72
+// @version      6.73
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.68: Opportunities tab in exports panel — one-way arbitrage (buy low at A, sell high at B, cr/AP via macro AP) and two-way arbitrage (A↔B round-trip with best forward X + return Y commodities). Curve-aware pricing, asymmetric terrain AP.
 // @description  v6.69: Cache opportunities results — recompute only on Recalculate click, not on every tab switch. Exports/FWE tabs unchanged (auto-calculate, negligible cost).
 // @description  v6.70: Active run pinning — clicking a route in Opps pins it as an active run that persists across recalculates and tab switches, so the buyer location stays visible after you've bought the item. Clear manually when done.
 // @description  v6.71: Fix exports tab blank (undefined html var) — exports body was empty because sumHtml was built but never rendered. Opps tab no longer auto-computes on first open — shows placeholder until Recalculate is pressed.
 // @description  v6.72: Min cr/AP filter for Opps — input field sets a profit-per-AP floor. Low-profit pairs are skipped before AP pathfinding (pre-filter: profit/TRADE_AP < threshold), and remaining routes are post-filtered by actual cr/AP. Cuts computation and clutter.
+// @description  v6.73: Return exports in active run bar — shows the top 2 profitable commodities in the reverse direction (B→A), so you can see at a glance what's worth bringing back for a second run.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3247,6 +3247,41 @@ const SECTOR_DATA = {
         };
     }
 
+    // >> Opportunities: return exports for active run
+    //
+    // Given a from→to location pair, finds profitable commodities to buy at
+    // 'from' and sell at 'to'. Used by the active run bar to show what's
+    // worth bringing back in the reverse direction.
+    function findReturnExports(fromEntry, toEntry, maxCargo) {
+        if (!fromEntry || !toEntry || !fromEntry.commodities || !toEntry.commodities) return [];
+        const results = [];
+        for (const resId in fromEntry.commodities) {
+            const fc = fromEntry.commodities[resId];
+            if (!fc || !fc.name) continue;
+            const tc = toEntry.commodities[resId];
+            if (!tc) continue;
+            if (fc.buyFromObjPrice <= 0 || tc.sellToObjPrice <= 0) continue;
+            const bp = trackerProjectBuy(fromEntry, resId, maxCargo);
+            const sp = trackerProjectSell(toEntry, resId, maxCargo);
+            if (!bp || !sp || bp.quantity <= 0 || sp.quantity <= 0) continue;
+            const q = Math.min(bp.quantity, sp.quantity);
+            const fb = trackerProjectBuy(fromEntry, resId, q);
+            const fs = trackerProjectSell(toEntry, resId, q);
+            if (!fb || !fs || fb.quantity <= 0 || fs.quantity <= 0) continue;
+            const profit = fs.totalRevenue - fb.totalCost;
+            if (profit <= 0) continue;
+            results.push({
+                item: fc.name,
+                qty: q,
+                profit: profit,
+                buyPerUnit: fb.perUnitAvg,
+                sellPerUnit: fs.perUnitAvg
+            });
+        }
+        results.sort((a, b) => b.profit - a.profit);
+        return results;
+    }
+
     function fmtCr(n) {
         if (n == null || isNaN(n)) return '?';
         return simpleNumberFormatTracker(n);
@@ -3677,6 +3712,35 @@ const SECTOR_DATA = {
                     '</div>';
                 inner += '<div style="color:#888;font-size:8px;margin-top:1px;">Fwd: ' + run.fwdQty + ' ' + run.fwdItem + ' (+' + fmtCr(run.fwdProfit) + ') \u00b7 Ret: ' + run.retQty + ' ' + run.retItem + ' (+' + fmtCr(run.retProfit) + ') \u00b7 Total: ' + fmtCr(run.profit) + ' cr</div>';
             }
+
+            // Return exports: top 2 profitable commodities in the reverse direction
+            // (B→A for one-way, B→A for two-way). Helps decide if a return trip
+            // is worthwhile. Looks up entries by userloc from the tracker store.
+            const maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
+            const store = getTrackerStore();
+            let fromLoc = null, toLoc = null;
+            if (run.subTab === 'oneway') {
+                fromLoc = run.buyerLoc;
+                toLoc = run.sellerLoc;
+            } else {
+                fromLoc = run.Bloc;
+                toLoc = run.Aloc;
+            }
+            if (fromLoc != null && toLoc != null) {
+                const fromEntry = store[String(fromLoc)];
+                const toEntry = store[String(toLoc)];
+                const returns = findReturnExports(fromEntry, toEntry, maxCargo);
+                if (returns.length > 0) {
+                    const top = returns.slice(0, 2);
+                    const parts = top.map(function(r) {
+                        return '<span style="color:#ffcc77;">' + r.item + '</span> ' + r.qty + 'u <span style="color:#88ff88;">+' + fmtCr(r.profit) + '</span>';
+                    });
+                    inner += '<div class="opps-return-exports" style="color:#8a6a3a;font-size:8px;margin-top:2px;">Return: ' + parts.join(' \u00b7 ') + '</div>';
+                } else {
+                    inner += '<div class="opps-return-exports" style="color:#5a3a1a;font-size:8px;margin-top:2px;">Return: \u2014</div>';
+                }
+            }
+
             bar.innerHTML = inner;
 
             bar.addEventListener('click', function(e) {
@@ -3825,9 +3889,11 @@ const SECTOR_DATA = {
                     sellerName: r.seller.name || '?',
                     sellerCoords: r.sellerCoords,
                     sellerSector: r.sellerSector,
+                    sellerLoc: r.seller.userloc,
                     buyerName: r.buyer.name || '?',
                     buyerCoords: r.buyerCoords,
                     buyerSector: r.buyerSector,
+                    buyerLoc: r.buyer.userloc,
                     units: r.units,
                     profit: r.profit,
                     buyPerUnit: r.buyPerUnit,
@@ -3934,9 +4000,11 @@ const SECTOR_DATA = {
                     Aname: r.A.name || '?',
                     Acoords: r.Acoords,
                     Asector: r.Asector,
+                    Aloc: r.A.userloc,
                     Bname: r.B.name || '?',
                     Bcoords: r.Bcoords,
                     Bsector: r.Bsector,
+                    Bloc: r.B.userloc,
                     fwdItem: r.fwdItem,
                     fwdQty: r.fwdQty,
                     fwdProfit: r.fwdProfit,
