@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.74
+// @version      6.75
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.70: Active run pinning — clicking a route in Opps pins it as an active run that persists across recalculates and tab switches, so the buyer location stays visible after you've bought the item. Clear manually when done.
 // @description  v6.71: Fix exports tab blank (undefined html var) — exports body was empty because sumHtml was built but never rendered. Opps tab no longer auto-computes on first open — shows placeholder until Recalculate is pressed.
 // @description  v6.72: Min cr/AP filter for Opps — input field sets a profit-per-AP floor. Low-profit pairs are skipped before AP pathfinding (pre-filter: profit/TRADE_AP < threshold), and remaining routes are post-filtered by actual cr/AP. Cuts computation and clutter.
 // @description  v6.73: Return exports in active run bar — shows the top 2 profitable commodities in the reverse direction (B→A), so you can see at a glance what's worth bringing back for a second run.
 // @description  v6.74: Return exports now shows combined cr/AP instead of per-item credit profit — cleaner single-value display of reverse-direction profitability.
+// @description  v6.75: Batch analysis in active run bar — shows how many full-hull trips possible before seller stock, buyer credits, or buyer room runs out. Return exports now list item names instead of just count.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
