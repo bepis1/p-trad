@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.76
+// @version      6.77
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.72: Min cr/AP filter for Opps — input field sets a profit-per-AP floor. Low-profit pairs are skipped before AP pathfinding (pre-filter: profit/TRADE_AP < threshold), and remaining routes are post-filtered by actual cr/AP. Cuts computation and clutter.
 // @description  v6.73: Return exports in active run bar — shows the top 2 profitable commodities in the reverse direction (B→A), so you can see at a glance what's worth bringing back for a second run.
 // @description  v6.74: Return exports now shows combined cr/AP instead of per-item credit profit — cleaner single-value display of reverse-direction profitability.
 // @description  v6.75: Batch analysis in active run bar — shows how many full-hull trips possible before seller stock, buyer credits, or buyer room runs out. Return exports now list item names instead of just count.
 // @description  v6.76: Opps cache now persisted to GM storage — computed routes survive page navigation (flying, docking) instead of disappearing on every page reload. Hit Recalculate to refresh stale prices.
+// @description  v6.77: Exports tab auto-loads on panel open (no more "Click Recalculate" placeholder). Opps one-way and two-way tables now have a Laps column showing how many full-hull trips before the bottleneck (stk/cr/room).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3933,8 +3933,10 @@ const SECTOR_DATA = {
                 '<th>Profit</th>' +
                 '<th>AP</th>' +
                 '<th>cr/AP</th>' +
+                '<th>Laps</th>' +
                 '</tr>';
 
+            const store = getTrackerStore();
             res.routes.forEach((r, i) => {
                 const tr = document.createElement('tr');
                 tr.style.cssText = 'border-bottom:1px dashed #2a2a1a;color:#bbb;';
@@ -3948,6 +3950,17 @@ const SECTOR_DATA = {
                 const ratioTxt = (r.ratio == null)
                     ? '<span style="color:#666;">?</span>'
                     : '<span style="color:#00ff88;font-weight:bold;">' + fmtRatio(r.ratio) + '</span>';
+                const sellRevPerBatch = (r.sellPerUnit || 0) * res.maxCargo;
+                const sellerEntry = store[String(r.seller.userloc)];
+                const buyerEntry = store[String(r.buyer.userloc)];
+                const bl = computeBatchLimits(sellerEntry, buyerEntry, r.resId, res.maxCargo, sellRevPerBatch);
+                let lapsTxt;
+                if (bl.batches != null) {
+                    lapsTxt = '<span style="color:#ffaa44;font-weight:bold;">' + bl.batches + '</span>' +
+                        '<br><span style="color:#ff6644;font-size:8px;">' + bl.bottleneck + '</span>';
+                } else {
+                    lapsTxt = '<span style="color:#666;">?</span>';
+                }
                 tr.innerHTML =
                     '<td>' + (i + 1) + '</td>' +
                     '<td style="color:#ffcc77;">' + r.item + '</td>' +
@@ -3963,7 +3976,8 @@ const SECTOR_DATA = {
                     '<td style="text-align:right;color:#88cc88;">' + fmtCr(r.sellPerUnit) + '</td>' +
                     '<td style="text-align:right;color:#88ff88;">' + fmtCr(r.profit) + '</td>' +
                     '<td style="text-align:right;color:#ffaa44;">' + apTxt + '</td>' +
-                    '<td style="text-align:right;">' + ratioTxt + '</td>';
+                    '<td style="text-align:right;">' + ratioTxt + '</td>' +
+                    '<td style="text-align:center;">' + lapsTxt + '</td>';
                 t.appendChild(tr);
             });
             t.addEventListener('click', function(e) {
@@ -4004,7 +4018,7 @@ const SECTOR_DATA = {
 
             const note = document.createElement('div');
             note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
-            note.innerHTML = 'Buy at seller \u2192 travel \u2192 sell at buyer. Profitable routes only (profit &gt; 0). AP = travel (macro wormhole AP, asymmetric terrain) + 10 (buy 5 + sell 5). Buy/Sell = per-unit average (curve-aware for planets/starbases). Click a name to auto-fly and pin as active run.';
+            note.innerHTML = 'Buy at seller \u2192 travel \u2192 sell at buyer. Profitable routes only (profit &gt; 0). AP = travel (macro wormhole AP, asymmetric terrain) + 10 (buy 5 + sell 5). Buy/Sell = per-unit average (curve-aware for planets/starbases). Laps = full-hull trips before bottleneck (stk=seller stock, cr=buyer credits, room=buyer room). Click a name to auto-fly and pin as active run.';
             body.appendChild(note);
         }
 
@@ -4049,8 +4063,10 @@ const SECTOR_DATA = {
                 '<th>Profit</th>' +
                 '<th>AP</th>' +
                 '<th>cr/AP</th>' +
+                '<th>Laps</th>' +
                 '</tr>';
 
+            const store = getTrackerStore();
             res.routes.forEach((r, i) => {
                 const tr = document.createElement('tr');
                 tr.style.cssText = 'border-bottom:1px dashed #2a2a1a;color:#bbb;';
@@ -4064,6 +4080,26 @@ const SECTOR_DATA = {
                 const ratioTxt = (r.ratio == null)
                     ? '<span style="color:#666;">?</span>'
                     : '<span style="color:#00ff88;font-weight:bold;">' + fmtRatio(r.ratio) + '</span>';
+                const aEntry = store[String(r.A.userloc)];
+                const bEntry = store[String(r.B.userloc)];
+                const fwdSellRev = (r.fwdSellPerUnit || 0) * res.maxCargo;
+                const retSellRev = (r.retSellPerUnit || 0) * res.maxCargo;
+                const fwdBL = computeBatchLimits(aEntry, bEntry, r.fwdResId, res.maxCargo, fwdSellRev);
+                const retBL = computeBatchLimits(bEntry, aEntry, r.retResId, res.maxCargo, retSellRev);
+                const blVals = [];
+                if (fwdBL.batches != null) blVals.push(fwdBL.batches);
+                if (retBL.batches != null) blVals.push(retBL.batches);
+                let lapsTxt;
+                if (blVals.length > 0) {
+                    const laps = Math.min.apply(null, blVals);
+                    const bnLabels = [];
+                    if (fwdBL.batches === laps && fwdBL.bottleneck) bnLabels.push('fwd ' + fwdBL.bottleneck);
+                    if (retBL.batches === laps && retBL.bottleneck) bnLabels.push('ret ' + retBL.bottleneck);
+                    lapsTxt = '<span style="color:#ffaa44;font-weight:bold;">' + laps + '</span>' +
+                        '<br><span style="color:#ff6644;font-size:8px;">' + bnLabels.join(', ') + '</span>';
+                } else {
+                    lapsTxt = '<span style="color:#666;">?</span>';
+                }
                 tr.innerHTML =
                     '<td>' + (i + 1) + '</td>' +
                     '<td><span style="color:' + aColor + ';">' + aIcon + '</span> ' +
@@ -4077,7 +4113,8 @@ const SECTOR_DATA = {
                     '<td style="text-align:right;color:#88ccff;">' + r.retItem + '<br><span style="color:#5a5a3a;">' + r.retQty + 'u +' + fmtCr(r.retProfit) + '</span></td>' +
                     '<td style="text-align:right;color:#88ff88;">' + fmtCr(r.profit) + '</td>' +
                     '<td style="text-align:right;color:#ffaa44;">' + apTxt + '</td>' +
-                    '<td style="text-align:right;">' + ratioTxt + '</td>';
+                    '<td style="text-align:right;">' + ratioTxt + '</td>' +
+                    '<td style="text-align:center;">' + lapsTxt + '</td>';
                 t.appendChild(tr);
             });
             t.addEventListener('click', function(e) {
@@ -4123,7 +4160,7 @@ const SECTOR_DATA = {
 
             const note = document.createElement('div');
             note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
-            note.innerHTML = 'Round-trip: buy X at A \u2192 travel A\u2192B \u2192 sell X, buy Y at B \u2192 travel B\u2192A \u2192 sell Y at A. AP = macro A\u2192B + macro B\u2192A (asymmetric) + 10 (combined sell+buy at each end, steady-state). Best forward (X) and return (Y) commodities chosen per pair (X\u2260Y). Click a name to auto-fly and pin as active run.';
+            note.innerHTML = 'Round-trip: buy X at A \u2192 travel A\u2192B \u2192 sell X, buy Y at B \u2192 travel B\u2192A \u2192 sell Y at A. AP = macro A\u2192B + macro B\u2192A (asymmetric) + 10 (combined sell+buy at each end, steady-state). Best forward (X) and return (Y) commodities chosen per pair (X\u2260Y). Laps = round-trips before bottleneck (fwd/ret stk/cr/room). Click a name to auto-fly and pin as active run.';
             body.appendChild(note);
         }
 
@@ -4160,10 +4197,10 @@ const SECTOR_DATA = {
             }
         });
 
-        body.innerHTML = '<div style="color:#8a6a3a;padding:6px;text-align:center;">Click <b>Recalculate</b> to compute routes.<br><span style="font-size:8px;color:#5a5a3a;">(manual trigger \u2014 avoids re-running pathfinding on every load)</span></div>';
         updateTabStyle();
         const mount = document.body || document.documentElement;
         if (mount) mount.appendChild(wrap);
+        renderBody();
         console.log('[pardus-exports] panel injected on', currentPath);
     }
 
