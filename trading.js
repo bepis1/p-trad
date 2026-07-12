@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.61
+// @version      6.62
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.57: Cache-optimal part reordering (static data first, load-time dispatcher last — fixes ambush-resume TDZ bug); remove ALL Manhattan/Chebyshev distance-estimate fallbacks (Dijkstra only, hard fail with deferred recalc retry); dead-code purge (unused helpers, dead GM keys, per-pathfind diagnostic log spam); auto-updater skips headless harnesses.
 // @description  v6.58: Remove dangling GM_deleteValue('logistics_mag_scoop_size') from clear button (key no longer written since magscoop refactor); restore update-skip mechanism in auto-updater with "Skip this version" Tampermonkey menu command.
 // @description  v6.59: REVERTED — native buildings overview parser was published in error, reverted to v6.58 codebase. Work preserved on branch tomb/native-buildings-parser.
 // @description  v6.60: Revert of v6.59 native buildings parser — restores v6.58 behavior. Bump version to force Tampermonkey to pull the revert (it won't downgrade).
 // @description  v6.61: Fix monster sidestep in auto-fly — nav grid is 9×11 (99 tiles, center field 49), not 11×11 (121 tiles, center 60); sidestep now uses two 1-tile forward moves instead of one 2-tile move (Pardus only moves 1 tile per navAjax call).
+// @description  v6.62: Fix sidestep rejoin sending player into a second consecutive monster — rejoin now checks if the path tile is clear before moving; loop-based forward movement handles any number of consecutive monsters (max 5).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -4139,33 +4139,44 @@ const SECTOR_DATA = {
                     setOverlay('\u26a0 Monster in path \u2014 sidestepping ' + dirName + '...');
 
                     moveAndWait(sidestepId, 150, () => {
-                        if (!isNavTileClear(dirX, dirY)) {
-                            fail('\u26a0 Another monster on sidestep forward path. Stopping.');
-                            return;
-                        }
-                        const fwd1Id = getNavTileIdAt(dirX, dirY);
-                        if (!fwd1Id) { fail('\u26a0 Cannot find forward tile after sidestep. Stopping.'); return; }
-                        setOverlay('\u26a0 Sidestep done \u2014 moving forward past monster...');
+                        // After sidestepping, loop: move forward until the
+                        // rejoin tile (back to original path) is clear, then
+                        // rejoin.  This handles any number of consecutive
+                        // monsters on the original path.
+                        let forwardCount = 0;
+                        const MAX_FORWARD = 5;
 
-                        moveAndWait(fwd1Id, 150, () => {
-                            if (!isNavTileClear(dirX, dirY)) {
-                                fail('\u26a0 Another monster ahead past sidestep. Stopping.');
-                                return;
-                            }
-                            const fwd2Id = getNavTileIdAt(dirX, dirY);
-                            if (!fwd2Id) { fail('\u26a0 Cannot find second forward tile. Stopping.'); return; }
-
-                            moveAndWait(fwd2Id, 150, () => {
+                        const moveForwardOrRejoin = () => {
+                            // Can we rejoin the original path?  Only attempt
+                            // after at least 1 forward move (otherwise we'd
+                            // rejoin onto the starting tile, going nowhere).
+                            if (forwardCount > 0 && isNavTileClear(-pDx, -pDy)) {
                                 const backId = getNavTileIdAt(-pDx, -pDy);
                                 if (!backId) { fail('\u26a0 Cannot find path-rejoin tile. Stopping.'); return; }
                                 setOverlay('\u26a0 Rejoining original path...');
-
                                 moveAndWait(backId, 150, () => {
                                     setOverlay('\u2708 Monster avoided \u2014 resuming flight to ' + destLabel + '...');
                                     flyNext();
                                 }, '\u26a0 Rejoin move did not complete. Stopping.');
-                            }, '\u26a0 Second forward move did not complete. Stopping.');
-                        }, '\u26a0 Forward move after sidestep did not complete. Stopping.');
+                                return;
+                            }
+                            // Can't rejoin yet — move forward on the offset path.
+                            if (forwardCount >= MAX_FORWARD) {
+                                fail('\u26a0 Too many consecutive monsters (' + MAX_FORWARD + '+). Stopping \u2014 fly manually.');
+                                return;
+                            }
+                            if (!isNavTileClear(dirX, dirY)) {
+                                fail('\u26a0 Monster on sidestep forward path. Stopping.');
+                                return;
+                            }
+                            const fwdId = getNavTileIdAt(dirX, dirY);
+                            if (!fwdId) { fail('\u26a0 Cannot find forward tile after sidestep. Stopping.'); return; }
+                            forwardCount++;
+                            setOverlay('\u26a0 Moving forward past monster' + (forwardCount > 1 ? 's' : '') + '...');
+                            moveAndWait(fwdId, 150, moveForwardOrRejoin, '\u26a0 Forward move did not complete. Stopping.');
+                        };
+
+                        moveForwardOrRejoin();
                     }, '\u26a0 Sidestep move did not complete. Stopping.');
                     break;
                 }
