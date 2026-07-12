@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.79
+// @version      6.80
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
 // @description  v6.75: Batch analysis in active run bar — shows how many full-hull trips possible before seller stock, buyer credits, or buyer room runs out. Return exports now list item names instead of just count.
 // @description  v6.76: Opps cache now persisted to GM storage — computed routes survive page navigation (flying, docking) instead of disappearing on every page reload. Hit Recalculate to refresh stale prices.
 // @description  v6.77: Exports tab auto-loads on panel open (no more "Click Recalculate" placeholder). Opps one-way and two-way tables now have a Laps column showing how many full-hull trips before the bottleneck (stk/cr/room).
 // @description  v6.78: Laps now show fractional values (e.g. 2.5 instead of 2). Pin button to set active run without flying. Active run bar is now a separate draggable floating window outside the exports panel.
 // @description  v6.79: Wormhole jumps now use warpAjax/warp instead of navAjax — fixes cross-sector auto-fly getting stuck on wormhole tiles.
+// @description  v6.80: 2-sector routes now use direct wormhole connections (no multi-hop detours). Fixed "Off local path" error after wormhole jumps by recomputing path from actual post-jump tile.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -4766,6 +4767,58 @@ const SECTOR_DATA = {
             }
         }
 
+        // >> Direct wormhole shortcut (2-sector routes)
+        // For routes from sector A directly to sector B, prefer the direct
+        // wormhole connection over the multi-hop Dijkstra. This prevents
+        // absurdly long detours to a far-away wormhole in the same sector
+        // when a nearby one exists. Only fall back to multi-hop if no direct
+        // wormhole connects the two sectors.
+        const shipOpt0 = getShipOptions();
+        const WJUMP0 = Number(shipOpt0.wormhole_cost) || 10;
+        const tap0 = getTerrainAP();
+        const directEdges = edges.filter(e => e.fromSec === fromSector && e.toSec === toSector);
+        if (directEdges.length > 0) {
+            let bestDirect = null;
+            for (const e of directEdges) {
+                const pathToWh = getSectorPath(fromSector, fromX, fromY, e.fromX, e.fromY);
+                if (!pathToWh) continue;
+                const pathFromWh = getSectorPath(toSector, e.toX, e.toY, toX, toY);
+                if (!pathFromWh) continue;
+                let ap = 0;
+                const gridFrom = parsedMap[fromSector].grid;
+                for (let i = 1; i < pathToWh.length; i++) {
+                    const ch = gridFrom[pathToWh[i].y][pathToWh[i].x];
+                    ap += tap0[ch] !== undefined ? tap0[ch] : 9;
+                }
+                ap += WJUMP0;
+                const gridTo = parsedMap[toSector].grid;
+                for (let i = 1; i < pathFromWh.length; i++) {
+                    const ch = gridTo[pathFromWh[i].y][pathFromWh[i].x];
+                    ap += tap0[ch] !== undefined ? tap0[ch] : 9;
+                }
+                if (!bestDirect || ap < bestDirect.ap) {
+                    bestDirect = { edge: e, pathToWh, pathFromWh, ap };
+                }
+            }
+            if (bestDirect) {
+                const sdFrom = getSectorData(fromSector);
+                const rowsFrom = sdFrom ? sdFrom.rows : parsedMap[fromSector].grid.length;
+                const sStartFrom = sdFrom ? sdFrom.start : 0;
+                const tileIdsFrom = bestDirect.pathToWh.map(p => sStartFrom + p.x * rowsFrom + p.y);
+                const sdTo = getSectorData(toSector);
+                const rowsTo = sdTo ? sdTo.rows : parsedMap[toSector].grid.length;
+                const sStartTo = sdTo ? sdTo.start : 0;
+                const tileIdsTo = bestDirect.pathFromWh.map(p => sStartTo + p.x * rowsTo + p.y);
+                return {
+                    legs: [
+                        { sector: fromSector, path: bestDirect.pathToWh, tileIds: tileIdsFrom },
+                        { sector: toSector, path: bestDirect.pathFromWh, tileIds: tileIdsTo }
+                    ],
+                    totalAP: bestDirect.ap
+                };
+            }
+        }
+
         // Index: wormhole exits reachable from a given (sec, x, y) tile.
         const outByKey = {};
         for (const e of edges) {
@@ -5294,8 +5347,23 @@ const SECTOR_DATA = {
 
             let idx = tileIds.indexOf(curId);
             if (idx < 0) {
-                fail(`\u26a0 Off local path (tile ${curId}, expected one of ${tileIds.length} tiles in ${leg.sector}). Stopping — fly manually.`);
-                return;
+                // After a wormhole jump, the pre-computed tile IDs for this
+                // leg may not match the actual post-jump tile (static map
+                // wormhole coordinates can differ from the live game).
+                // Recompute the path from the real tile to this leg's endpoint.
+                const newCoords = getLocalCoordsFromTileId(curId, curSector);
+                if (newCoords) {
+                    const legEnd = pathCoords[pathCoords.length - 1];
+                    const newResult = pardusGetSectorPath(curSector, curId, newCoords.x, newCoords.y, legEnd.x, legEnd.y);
+                    if (newResult && newResult.tileIds.length > 0) {
+                        legs[legIdx] = { sector: curSector, path: newResult.path, tileIds: newResult.tileIds };
+                        idx = 0;
+                    }
+                }
+                if (idx < 0) {
+                    fail(`\u26a0 Off local path (tile ${curId}, expected one of ${tileIds.length} tiles in ${leg.sector}). Stopping — fly manually.`);
+                    return;
+                }
             }
             if (idx === tileIds.length - 1) {
                 // At the end of this leg.
