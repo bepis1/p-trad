@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.75
+// @version      6.76
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.71: Fix exports tab blank (undefined html var) — exports body was empty because sumHtml was built but never rendered. Opps tab no longer auto-computes on first open — shows placeholder until Recalculate is pressed.
 // @description  v6.72: Min cr/AP filter for Opps — input field sets a profit-per-AP floor. Low-profit pairs are skipped before AP pathfinding (pre-filter: profit/TRADE_AP < threshold), and remaining routes are post-filtered by actual cr/AP. Cuts computation and clutter.
 // @description  v6.73: Return exports in active run bar — shows the top 2 profitable commodities in the reverse direction (B→A), so you can see at a glance what's worth bringing back for a second run.
 // @description  v6.74: Return exports now shows combined cr/AP instead of per-item credit profit — cleaner single-value display of reverse-direction profitability.
 // @description  v6.75: Batch analysis in active run bar — shows how many full-hull trips possible before seller stock, buyer credits, or buyer room runs out. Return exports now list item names instead of just count.
+// @description  v6.76: Opps cache now persisted to GM storage — computed routes survive page navigation (flying, docking) instead of disappearing on every page reload. Hit Recalculate to refresh stale prices.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3485,10 +3485,15 @@ const SECTOR_DATA = {
             // Clear cache so Recalculate picks up the new threshold.
             oppsCache.oneway = null;
             oppsCache.twoway = null;
+            GM_deleteValue('opps_cache_v1');
             renderBody();
         });
 
-        let oppsCache = { oneway: null, twoway: null };
+        let oppsCache = GM_getValue('opps_cache_v1', null);
+        if (!oppsCache) oppsCache = { oneway: null, twoway: null };
+        function saveOppsCache() {
+            try { GM_setValue('opps_cache_v1', oppsCache); } catch (e) { /* too large */ }
+        }
         let oppsActiveRun = GM_getValue('opps_active_run_v1', null);
         function renderBody(force) {
             if (activeTab === 'fwe') renderFweBody();
@@ -3864,7 +3869,7 @@ const SECTOR_DATA = {
             updateSubTabStyle();
             renderActiveRunBar();
             if (oppSubTab === 'twoway') {
-                if (force) oppsCache.twoway = computeTwoWayArbitrage();
+                if (force) { oppsCache.twoway = computeTwoWayArbitrage(); saveOppsCache(); }
                 if (oppsCache.twoway) renderTwoWayOpps(oppsCache.twoway);
                 else {
                     const empty = document.createElement('div');
@@ -3873,7 +3878,7 @@ const SECTOR_DATA = {
                     body.appendChild(empty);
                 }
             } else {
-                if (force) oppsCache.oneway = computeOpportunities();
+                if (force) { oppsCache.oneway = computeOpportunities(); saveOppsCache(); }
                 if (oppsCache.oneway) renderOneWayOpps(oppsCache.oneway);
                 else {
                     const empty = document.createElement('div');
