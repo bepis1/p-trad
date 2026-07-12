@@ -1,14 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.80
+// @version      6.81
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.75: Batch analysis in active run bar — shows how many full-hull trips possible before seller stock, buyer credits, or buyer room runs out. Return exports now list item names instead of just count.
-// @description  v6.76: Opps cache now persisted to GM storage — computed routes survive page navigation (flying, docking) instead of disappearing on every page reload. Hit Recalculate to refresh stale prices.
 // @description  v6.77: Exports tab auto-loads on panel open (no more "Click Recalculate" placeholder). Opps one-way and two-way tables now have a Laps column showing how many full-hull trips before the bottleneck (stk/cr/room).
 // @description  v6.78: Laps now show fractional values (e.g. 2.5 instead of 2). Pin button to set active run without flying. Active run bar is now a separate draggable floating window outside the exports panel.
 // @description  v6.79: Wormhole jumps now use warpAjax/warp instead of navAjax — fixes cross-sector auto-fly getting stuck on wormhole tiles.
 // @description  v6.80: 2-sector routes now use direct wormhole connections (no multi-hop detours). Fixed "Off local path" error after wormhole jumps by recomputing path from actual post-jump tile.
+// @description  v6.81: Cross-sector auto-fly now uses the same Floyd-Warshall macro graph as the opps estimator — flown routes match opps AP estimates, including multi-hop paths through intermediate sectors.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -4767,55 +4766,138 @@ const SECTOR_DATA = {
             }
         }
 
-        // >> Direct wormhole shortcut (2-sector routes)
-        // For routes from sector A directly to sector B, prefer the direct
-        // wormhole connection over the multi-hop Dijkstra. This prevents
-        // absurdly long detours to a far-away wormhole in the same sector
-        // when a nearby one exists. Only fall back to multi-hop if no direct
-        // wormhole connects the two sectors.
-        const shipOpt0 = getShipOptions();
-        const WJUMP0 = Number(shipOpt0.wormhole_cost) || 10;
-        const tap0 = getTerrainAP();
-        const directEdges = edges.filter(e => e.fromSec === fromSector && e.toSec === toSector);
-        if (directEdges.length > 0) {
-            let bestDirect = null;
-            for (const e of directEdges) {
-                const pathToWh = getSectorPath(fromSector, fromX, fromY, e.fromX, e.fromY);
-                if (!pathToWh) continue;
-                const pathFromWh = getSectorPath(toSector, e.toX, e.toY, toX, toY);
-                if (!pathFromWh) continue;
-                let ap = 0;
-                const gridFrom = parsedMap[fromSector].grid;
-                for (let i = 1; i < pathToWh.length; i++) {
-                    const ch = gridFrom[pathToWh[i].y][pathToWh[i].x];
-                    ap += tap0[ch] !== undefined ? tap0[ch] : 9;
+        // >> Macro-graph optimal route (matches opps estimation)
+        // Use the same Floyd-Warshall macro wormhole graph as
+        // getCrossSectorAPFast (used by the opps calculator) to find the
+        // optimal wormhole sequence. This guarantees the flown route matches
+        // the opps AP estimate, including multi-hop routes through
+        // intermediate sectors that a direct-wormhole-only shortcut would
+        // miss. Falls through to the multi-hop Dijkstra below on failure.
+        const macroGraph = getMacroWormholeGraph();
+        if (macroGraph) {
+            const fromWhs = macroGraph.wormholesBySector[fromSector];
+            const toWhs = macroGraph.wormholesBySector[toSector];
+            if (fromWhs && toWhs) {
+                const dijCacheM = {};
+                let distFrom = getSectorAllDistances(fromSector, fromX, fromY);
+                dijCacheM[fromSector + '|' + fromX + ',' + fromY] = distFrom;
+
+                let bestPair = null;
+                if (distFrom) {
+                    for (const w1 of fromWhs) {
+                        const d1 = distFrom[w1.x + ',' + w1.y];
+                        if (d1 === undefined || !isFinite(d1)) continue;
+                        const macro = macroGraph.distMap[w1.key];
+                        if (!macro) continue;
+                        for (const w2 of toWhs) {
+                            const macroLeg = macro[w2.key];
+                            if (macroLeg === undefined) continue;
+                            const w2Key = toSector + '|' + w2.x + ',' + w2.y;
+                            let distFromW2 = dijCacheM[w2Key];
+                            if (!distFromW2) {
+                                distFromW2 = getSectorAllDistances(toSector, w2.x, w2.y);
+                                dijCacheM[w2Key] = distFromW2;
+                            }
+                            if (!distFromW2) continue;
+                            const d2 = distFromW2[toX + ',' + toY];
+                            if (d2 === undefined || !isFinite(d2)) continue;
+                            const total = d1 + macroLeg + d2;
+                            if (!bestPair || total < bestPair.total) {
+                                bestPair = { w1, w2, total };
+                            }
+                        }
+                    }
                 }
-                ap += WJUMP0;
-                const gridTo = parsedMap[toSector].grid;
-                for (let i = 1; i < pathFromWh.length; i++) {
-                    const ch = gridTo[pathFromWh[i].y][pathFromWh[i].x];
-                    ap += tap0[ch] !== undefined ? tap0[ch] : 9;
+
+                if (bestPair) {
+                    // Reconstruct the wormhole tile sequence from w1 to w2
+                    // using the Floyd-Warshall distMap. At each step, find
+                    // the next tile on a shortest path to the target.
+                    const targetKey = bestPair.w2.key;
+                    const seq = [bestPair.w1.key];
+                    let cur = bestPair.w1.key;
+                    let guard = 0;
+                    while (cur !== targetKey && guard++ < 200) {
+                        const curDist = macroGraph.distMap[cur];
+                        if (!curDist) break;
+                        const curToTarget = curDist[targetKey];
+                        if (curToTarget === undefined) break;
+                        let bestNext = null;
+                        let bestLegCost = Infinity;
+                        for (const nextKey in curDist) {
+                            const legCost = curDist[nextKey];
+                            const nextDist = macroGraph.distMap[nextKey];
+                            if (!nextDist) continue;
+                            const nextToTarget = nextDist[targetKey];
+                            if (nextToTarget === undefined) continue;
+                            if (legCost + nextToTarget === curToTarget) {
+                                if (legCost < bestLegCost) {
+                                    bestLegCost = legCost;
+                                    bestNext = nextKey;
+                                }
+                            }
+                        }
+                        if (!bestNext) break;
+                        seq.push(bestNext);
+                        cur = bestNext;
+                    }
+
+                    if (cur === targetKey) {
+                        // Extract the jump sequence: consecutive tiles in
+                        // different sectors are wormhole jumps.
+                        const jumps = [];
+                        for (let si = 0; si < seq.length - 1; si++) {
+                            const cp = seq[si].split('|');
+                            const np = seq[si + 1].split('|');
+                            if (cp[0] !== np[0]) {
+                                const fc = cp[1].split(',').map(Number);
+                                const nc = np[1].split(',').map(Number);
+                                jumps.push({ fromSec: cp[0], fromX: fc[0], fromY: fc[1], toSec: np[0], toX: nc[0], toY: nc[1] });
+                            }
+                        }
+
+                        // Build legs from the jump sequence.
+                        const legs = [];
+                        let curPos = { sector: fromSector, x: fromX, y: fromY };
+                        let valid = true;
+                        for (const j of jumps) {
+                            const path = getSectorPath(curPos.sector, curPos.x, curPos.y, j.fromX, j.fromY);
+                            if (!path) { valid = false; break; }
+                            const sd = getSectorData(curPos.sector);
+                            const rows = sd ? sd.rows : parsedMap[curPos.sector].grid.length;
+                            const sStart = sd ? sd.start : 0;
+                            const tileIds = path.map(p => sStart + p.x * rows + p.y);
+                            legs.push({ sector: curPos.sector, path, tileIds });
+                            curPos = { sector: j.toSec, x: j.toX, y: j.toY };
+                        }
+
+                        if (valid) {
+                            const finalPath = getSectorPath(curPos.sector, curPos.x, curPos.y, toX, toY);
+                            if (finalPath) {
+                                const sd = getSectorData(curPos.sector);
+                                const rows = sd ? sd.rows : parsedMap[curPos.sector].grid.length;
+                                const sStart = sd ? sd.start : 0;
+                                const finalTileIds = finalPath.map(p => sStart + p.x * rows + p.y);
+                                legs.push({ sector: curPos.sector, path: finalPath, tileIds: finalTileIds });
+
+                                const shipOpt = getShipOptions();
+                                const WJUMP = Number(shipOpt.wormhole_cost) || 10;
+                                const tap = getTerrainAP();
+                                let totalAP = 0;
+                                for (let li = 0; li < legs.length; li++) {
+                                    const leg = legs[li];
+                                    const grid = parsedMap[leg.sector].grid;
+                                    for (let i = 1; i < leg.path.length; i++) {
+                                        const ch = grid[leg.path[i].y][leg.path[i].x];
+                                        totalAP += tap[ch] !== undefined ? tap[ch] : 9;
+                                    }
+                                    if (li < legs.length - 1) totalAP += WJUMP;
+                                }
+                                return { legs, totalAP };
+                            }
+                        }
+                    }
                 }
-                if (!bestDirect || ap < bestDirect.ap) {
-                    bestDirect = { edge: e, pathToWh, pathFromWh, ap };
-                }
-            }
-            if (bestDirect) {
-                const sdFrom = getSectorData(fromSector);
-                const rowsFrom = sdFrom ? sdFrom.rows : parsedMap[fromSector].grid.length;
-                const sStartFrom = sdFrom ? sdFrom.start : 0;
-                const tileIdsFrom = bestDirect.pathToWh.map(p => sStartFrom + p.x * rowsFrom + p.y);
-                const sdTo = getSectorData(toSector);
-                const rowsTo = sdTo ? sdTo.rows : parsedMap[toSector].grid.length;
-                const sStartTo = sdTo ? sdTo.start : 0;
-                const tileIdsTo = bestDirect.pathFromWh.map(p => sStartTo + p.x * rowsTo + p.y);
-                return {
-                    legs: [
-                        { sector: fromSector, path: bestDirect.pathToWh, tileIds: tileIdsFrom },
-                        { sector: toSector, path: bestDirect.pathFromWh, tileIds: tileIdsTo }
-                    ],
-                    totalAP: bestDirect.ap
-                };
             }
         }
 
