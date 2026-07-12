@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.82
+// @version      6.83
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v6.78: Laps now show fractional values (e.g. 2.5 instead of 2). Pin button to set active run without flying. Active run bar is now a separate draggable floating window outside the exports panel.
 // @description  v6.79: Wormhole jumps now use warpAjax/warp instead of navAjax — fixes cross-sector auto-fly getting stuck on wormhole tiles.
 // @description  v6.80: 2-sector routes now use direct wormhole connections (no multi-hop detours). Fixed "Off local path" error after wormhole jumps by recomputing path from actual post-jump tile.
 // @description  v6.81: Cross-sector auto-fly now uses the same Floyd-Warshall macro graph as the opps estimator — flown routes match opps AP estimates, including multi-hop paths through intermediate sectors.
 // @description  v6.82: Cancel button in the flight overlay bar — stops auto-fly immediately in case of misclick or wrong destination.
+// @description  v6.83: Fix duplicate wormholes between same sector pair (e.g. Ras Elased↔Fornacis) — #sub-region suffix now preserved so all wormhole endpoints reach the pathfinder instead of last-write-wins overwrite.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -4411,6 +4411,24 @@ const SECTOR_DATA = {
 
     // --- 14. Local Sector Pathfinder ---
 
+    // >> Pair wormhole endpoints by sub-region suffix.
+    // When multiple wormholes connect the same two sectors (e.g.
+    // "Fornacis#West" and "Fornacis#East" in Ras Elased), each source
+    // wormhole must be paired with the correct destination tile. The #suffix
+    // in the static_ext.txt wormhole name identifies the sub-region of the
+    // destination sector — matching by suffix gives the correct bidirectional
+    // pair. Falls back to 1:1 pairing when no suffixes are present.
+    function _pairWormholes(fromList, toList) {
+        const pairs = [];
+        for (const fw of fromList) {
+            let tw = toList.find(t => t.sub === fw.sub);
+            if (!tw && fromList.length === 1 && toList.length === 1) tw = toList[0];
+            if (!tw) continue;
+            pairs.push({ from: fw, to: tw });
+        }
+        return pairs;
+    }
+
     function parseStaticMap(silent = false) {
         let rawMapData = localStorage.getItem("pardus_static_map_data") || "PASTE_YOUR_STATICXT_TXT_HERE";
         if (!rawMapData || rawMapData.includes("PASTE_YOUR_STATICXT_TXT_HERE")) {
@@ -4428,8 +4446,14 @@ const SECTOR_DATA = {
                 parsedMap[currentSectorName] = { grid: [], wormholes: {}, beacons: [], starbases: [] };
             } else if (line.startsWith("wh ")) {
                 let parts = line.split(" ");
-                let whDest = parts[1].replace(/_/g, " ").split("#")[0];
-                parsedMap[currentSectorName].wormholes[whDest] = { x: parseInt(parts[2], 10), y: parseInt(parts[3], 10) };
+                let parts1 = parts[1].replace(/_/g, " ");
+                let hashIdx = parts1.indexOf("#");
+                let whDest = hashIdx >= 0 ? parts1.substring(0, hashIdx) : parts1;
+                let whSub = hashIdx >= 0 ? parts1.substring(hashIdx + 1) : null;
+                if (!parsedMap[currentSectorName].wormholes[whDest]) {
+                    parsedMap[currentSectorName].wormholes[whDest] = [];
+                }
+                parsedMap[currentSectorName].wormholes[whDest].push({ x: parseInt(parts[2], 10), y: parseInt(parts[3], 10), sub: whSub });
             } else if (line.startsWith("beacon ")) {
                 let parts = line.split(" ");
                 parsedMap[currentSectorName].beacons.push({ x: parseInt(parts[parts.length - 2], 10), y: parseInt(parts[parts.length - 1], 10) });
@@ -4480,7 +4504,8 @@ const SECTOR_DATA = {
                 }
             }
             for (const wd in subSec.wormholes) {
-                if (!par.wormholes[wd]) par.wormholes[wd] = subSec.wormholes[wd];
+                if (!par.wormholes[wd]) par.wormholes[wd] = [];
+                par.wormholes[wd].push(...subSec.wormholes[wd]);
             }
             if (subSec.beacons) par.beacons.push(...subSec.beacons);
             if (subSec.starbases) par.starbases.push(...subSec.starbases);
@@ -4498,7 +4523,8 @@ const SECTOR_DATA = {
                 }
             }
             for (const { old, nw } of renames) {
-                if (!sec.wormholes[nw]) sec.wormholes[nw] = sec.wormholes[old];
+                if (!sec.wormholes[nw]) sec.wormholes[nw] = [];
+                sec.wormholes[nw].push(...sec.wormholes[old]);
                 delete sec.wormholes[old];
             }
         }
@@ -4752,17 +4778,19 @@ const SECTOR_DATA = {
             const sec = parsedMap[secName];
             if (!sec || !sec.wormholes) continue;
             for (const destName in sec.wormholes) {
-                const fromLocal = sec.wormholes[destName];
-                if (!fromLocal) continue;
+                const fromList = sec.wormholes[destName];
+                if (!fromList || fromList.length === 0) continue;
+                if (sealed.has(secName.toLowerCase()) || sealed.has(destName.toLowerCase())) continue;
                 const destSec = parsedMap[destName];
                 if (!destSec || !destSec.wormholes) continue;
-                const toLocal = destSec.wormholes[secName];
-                if (!toLocal) continue;
-                if (sealed.has(secName.toLowerCase()) || sealed.has(destName.toLowerCase())) continue;
-                edges.push({
-                    fromSec: secName, fromX: fromLocal.x, fromY: fromLocal.y,
-                    toSec: destName, toX: toLocal.x, toY: toLocal.y
-                });
+                const toList = destSec.wormholes[secName];
+                if (!toList || toList.length === 0) continue;
+                for (const pair of _pairWormholes(fromList, toList)) {
+                    edges.push({
+                        fromSec: secName, fromX: pair.from.x, fromY: pair.from.y,
+                        toSec: destName, toX: pair.to.x, toY: pair.to.y
+                    });
+                }
             }
         }
 
@@ -5053,25 +5081,26 @@ const SECTOR_DATA = {
             const sec = parsedMap[secName];
             if (!sec || !sec.wormholes) continue;
             for (const destName in sec.wormholes) {
-                const fromLocal = sec.wormholes[destName];
-                if (!fromLocal) continue;
+                const fromList = sec.wormholes[destName];
+                if (!fromList || fromList.length === 0) continue;
                 if (sealed.has(secName.toLowerCase()) || sealed.has(destName.toLowerCase())) continue;
                 const destSec = parsedMap[destName];
                 if (!destSec || !destSec.wormholes) continue;
-                const toLocal = destSec.wormholes[secName];
-                if (!toLocal) continue;
-
-                const fromKey = secName + '|' + fromLocal.x + ',' + fromLocal.y;
-                const toKey = destName + '|' + toLocal.x + ',' + toLocal.y;
-                if (!nodeSet.has(fromKey)) {
-                    nodeSet.add(fromKey);
-                    nodes.push({ key: fromKey, sec: secName, x: fromLocal.x, y: fromLocal.y });
+                const toList = destSec.wormholes[secName];
+                if (!toList || toList.length === 0) continue;
+                for (const pair of _pairWormholes(fromList, toList)) {
+                    const fromKey = secName + '|' + pair.from.x + ',' + pair.from.y;
+                    const toKey = destName + '|' + pair.to.x + ',' + pair.to.y;
+                    if (!nodeSet.has(fromKey)) {
+                        nodeSet.add(fromKey);
+                        nodes.push({ key: fromKey, sec: secName, x: pair.from.x, y: pair.from.y });
+                    }
+                    if (!nodeSet.has(toKey)) {
+                        nodeSet.add(toKey);
+                        nodes.push({ key: toKey, sec: destName, x: pair.to.x, y: pair.to.y });
+                    }
+                    jumpEdges.push({ from: fromKey, to: toKey, cost: WJUMP });
                 }
-                if (!nodeSet.has(toKey)) {
-                    nodeSet.add(toKey);
-                    nodes.push({ key: toKey, sec: destName, x: toLocal.x, y: toLocal.y });
-                }
-                jumpEdges.push({ from: fromKey, to: toKey, cost: WJUMP });
             }
         }
 
@@ -7095,22 +7124,19 @@ const SECTOR_DATA = {
             const sec = pm[secName];
             if (!sec || !sec.wormholes) continue;
             for (const destName in sec.wormholes) {
-                const fromLocal = sec.wormholes[destName];
-                if (!fromLocal) continue;
-                // Skip wormholes whose endpoint sector is currently sealed.
+                const fromList = sec.wormholes[destName];
+                if (!fromList || fromList.length === 0) continue;
                 if (sealed.has(secName.toLowerCase()) || sealed.has(destName.toLowerCase())) continue;
-                // The linked sector's matching wormhole endpoint (the one that
-                // names this sector). It should be the entry in destSec.wormholes
-                // whose key is secName. If missing (data incomplete) skip —
-                // we cannot route to a sector without a known landing tile.
                 const destSec = pm[destName];
                 if (!destSec || !destSec.wormholes) continue;
-                const toLocal = destSec.wormholes[secName];
-                if (!toLocal) continue;
-                out.push({
-                    from: { sec: secName, x: fromLocal.x, y: fromLocal.y },
-                    to:   { sec: destName,  x: toLocal.x,   y: toLocal.y   }
-                });
+                const toList = destSec.wormholes[secName];
+                if (!toList || toList.length === 0) continue;
+                for (const pair of _pairWormholes(fromList, toList)) {
+                    out.push({
+                        from: { sec: secName, x: pair.from.x, y: pair.from.y },
+                        to:   { sec: destName,  x: pair.to.x,   y: pair.to.y   }
+                    });
+                }
             }
         }
         return out;
