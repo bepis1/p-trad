@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.91
+// @version      6.92
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v6.92: Cut L2 deserialize ~976ms→~22ms — flat Int16Array dist/next matrices are now the primary in-memory macro graph representation (eliminates 1.2M Map.set calls from Map-of-Maps rebuild). Wire format unchanged (schema 2); route output byte-identical (test_routing.js green).
 // @description  v6.91: Fix ~5s F5 refresh lag — switch HPA* macro table serialization from Float32/Int32 (12.5 MB, over GM_setValue's ~10 MB limit) to Int16/Int16 (6.3 MB). Schema bumped to 2; -1 sentinel for unreachable pairs. Route output byte-identical (test_routing.js green).
 // @description  v6.90: Cut post-trade recalc cost — memoize location parsing (locOf cache) and replace JSON deep-clone of flat cargo map with shallow spread in optimizeFactoryRuns. No algorithm change; route output byte-identical (test_routing.js green).
 // @description  v6.89: Defer route recalc off critical path — nav paints first, itinerary updates after. Moves recalculateRouteOnTheFly into setTimeout(0) and injectNavHUD into the deferred panels block so the HUD reads the fresh route.
 // @description  v6.88: Eliminate page-load lag — L1 top-window cache for HPA* table (skips GM deserialize on refresh), deferred UI injection via setTimeout(0), targeted DOM queries instead of body.innerText reflow.
-// @description  v6.87: Persist HPA* macro graph across page loads via GM_setValue — eliminates ~5s Dijkstra+Floyd-Warshall recompile on every navigation. Compact typed-array format (Float32Array/Int32Array + base64). Cache key includes terrainAP, wjump, sealed, rawText.length, and schema version for auto-invalidation.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -4867,7 +4867,7 @@ const SECTOR_DATA = {
     // Nodes = wormhole tiles (keyed "sector|x,y"). Edges = wormhole jumps
     // (directed, cost=wjump) + intra-sector Dijkstra distances (directed,
     // cost=A* path cost). Sealed sectors' wormholes are excluded.
-    // Returns { nodes, distMap, nextMap, wormholesBySector, nodeCount }.
+    // Returns { nodes, distFlat, nextFlat, keyToIdx, wormholesBySector, nodeCount }.
     function hpaBuildMacroGraph(sectors, terrainAP, wjump, sealed) {
         const nodes = [];
         const nodeSet = new Set();
@@ -4903,7 +4903,7 @@ const SECTOR_DATA = {
         }
 
         if (nodes.length === 0) {
-            return { nodes, distMap: new Map(), nextMap: new Map(), wormholesBySector: new Map(), nodeCount: 0 };
+            return { nodes, distFlat: new Int16Array(0), nextFlat: new Int16Array(0), keyToIdx: new Map(), wormholesBySector: new Map(), nodeCount: 0 };
         }
 
         const nodesBySector = new Map();
@@ -4969,24 +4969,20 @@ const SECTOR_DATA = {
             }
         }
 
-        // Build Map-based distMap + nextMap for query functions.
-        const distMap = new Map();
-        const nextMap = new Map();
+        // Flatten dist/next to Int16Array (primary representation for queries + serialize).
+        const distFlat = new Int16Array(n * n);
+        const nextFlat = new Int16Array(n * n);
         for (let i = 0; i < n; i++) {
-            const fromKey = nodes[i].key;
-            const dm = new Map();
-            const nm = new Map();
             for (let j = 0; j < n; j++) {
-                if (i !== j && dist[i][j] !== Infinity) {
-                    dm.set(nodes[j].key, dist[i][j]);
-                    nm.set(nodes[j].key, next[i][j] !== null ? nodes[next[i][j]].key : null);
-                }
+                distFlat[i * n + j] = isFinite(dist[i][j]) ? dist[i][j] : -1;
+                nextFlat[i * n + j] = (next[i][j] !== null) ? next[i][j] : -1;
             }
-            distMap.set(fromKey, dm);
-            nextMap.set(fromKey, nm);
         }
 
-        return { nodes, distMap, nextMap, wormholesBySector: nodesBySector, nodeCount: n };
+        const keyToIdx = new Map();
+        nodes.forEach((nd, i) => keyToIdx.set(nd.key, i));
+
+        return { nodes, distFlat, nextFlat, keyToIdx, wormholesBySector: nodesBySector, nodeCount: n };
     }
 
     // >> Compile — one-time build. Pure function (no IIFE globals).
@@ -5020,34 +5016,13 @@ const SECTOR_DATA = {
     }
 
     // >> Serialize the HPA* table to a JSON string for GM_setValue.
-    // Converts Map-based dist/next to flat Int16Array (base64, -1 = unreachable),
+    // distFlat/nextFlat are already Int16Array — base64-encode directly.
     // ~6 MB — under GM_setValue's practical ~10 MB storage limit.
     function hpaSerializeTable(table, cacheKey) {
         const n = table.macro.nodeCount;
         const nodes = table.macro.nodes;
-        const keyToIdx = new Map();
-        nodes.forEach((nd, i) => keyToIdx.set(nd.key, i));
-
-        const distFlat = new Int16Array(n * n);
-        const nextFlat = new Int16Array(n * n);
-        for (let i = 0; i < n; i++) {
-            const dm = table.macro.distMap.get(nodes[i].key);
-            const nm = table.macro.nextMap.get(nodes[i].key);
-            for (let j = 0; j < n; j++) {
-                if (i === j) {
-                    distFlat[i * n + j] = 0;
-                    nextFlat[i * n + j] = j;
-                } else if (dm) {
-                    const d = dm.get(nodes[j].key);
-                    distFlat[i * n + j] = (d !== undefined && isFinite(d)) ? d : -1;
-                    const nx = nm ? nm.get(nodes[j].key) : null;
-                    nextFlat[i * n + j] = (nx != null) ? (keyToIdx.has(nx) ? keyToIdx.get(nx) : -1) : -1;
-                } else {
-                    distFlat[i * n + j] = -1;
-                    nextFlat[i * n + j] = -1;
-                }
-            }
-        }
+        const distFlat = table.macro.distFlat;
+        const nextFlat = table.macro.nextFlat;
 
         const distB64 = hpaBytesToBase64(new Uint8Array(distFlat.buffer));
         const nextB64 = hpaBytesToBase64(new Uint8Array(nextFlat.buffer));
@@ -5076,8 +5051,9 @@ const SECTOR_DATA = {
     }
 
     // >> Deserialize the HPA* table from a GM_getValue JSON string.
-    // Rebuilds Map-based dist/next from flat typed arrays, and re-parses
-    // sector grids from rawText (cheap — no Dijkstra/Floyd-Warshall).
+    // Creates Int16Array views on the decoded base64 buffers (zero-copy),
+    // builds a 1104-entry keyToIdx Map, and re-parses sector grids from
+    // rawText (cheap — no Dijkstra/Floyd-Warshall). No Map-of-Maps rebuild.
     // terrainAP is passed in (not deserialized) because JSON.stringify
     // converts Infinity → null, which would make impassable tiles passable.
     // Returns null when schema or cacheKey doesn't match.
@@ -5094,24 +5070,8 @@ const SECTOR_DATA = {
         const distFlat = new Int16Array(distBytes.buffer);
         const nextFlat = new Int16Array(nextBytes.buffer);
 
-        const distMap = new Map();
-        const nextMap = new Map();
-        for (let i = 0; i < n; i++) {
-            const fromKey = nodes[i].key;
-            const dm = new Map();
-            const nm = new Map();
-            for (let j = 0; j < n; j++) {
-                if (i !== j && distFlat[i * n + j] >= 0) {
-                    dm.set(nodes[j].key, distFlat[i * n + j]);
-                    const nextIdx = nextFlat[i * n + j];
-                    if (nextIdx >= 0 && nextIdx < n) {
-                        nm.set(nodes[j].key, nodes[nextIdx].key);
-                    }
-                }
-            }
-            distMap.set(fromKey, dm);
-            nextMap.set(fromKey, nm);
-        }
+        const keyToIdx = new Map();
+        nodes.forEach((nd, i) => keyToIdx.set(nd.key, i));
 
         const wormholesBySector = new Map();
         for (const [k, v] of stored.wormholesBySector) {
@@ -5129,7 +5089,7 @@ const SECTOR_DATA = {
 
         return {
             sectors: sectors,
-            macro: { nodes, distMap, nextMap, wormholesBySector, nodeCount: n },
+            macro: { nodes, distFlat, nextFlat, keyToIdx, wormholesBySector, nodeCount: n },
             terrainAP: terrainAP,
             wjump: stored.wjump,
             dijCache: dijCache,
@@ -5183,15 +5143,20 @@ const SECTOR_DATA = {
         const fromDist = hpaLocalDijkstraCached(table, fromSec, fromXY.x, fromXY.y);
         if (!fromDist) return null;
 
+        const distFlat = table.macro.distFlat;
+        const keyToIdx = table.macro.keyToIdx;
+        const n = table.macro.nodeCount;
         let best = Infinity;
         for (const w1 of fromWhs) {
             const d1 = fromDist.get(w1.x + ',' + w1.y);
             if (d1 === undefined || !isFinite(d1)) continue;
-            const macroDist = table.macro.distMap.get(w1.key);
-            if (!macroDist) continue;
+            const i1 = keyToIdx.get(w1.key);
+            if (i1 === undefined) continue;
             for (const w2 of toWhs) {
-                const macroLeg = macroDist.get(w2.key);
-                if (macroLeg === undefined) continue;
+                const i2 = keyToIdx.get(w2.key);
+                if (i2 === undefined) continue;
+                const macroLeg = distFlat[i1 * n + i2];
+                if (macroLeg < 0) continue;
                 const toDist = hpaLocalDijkstraCached(table, toSec, w2.x, w2.y);
                 if (!toDist) continue;
                 const d2 = toDist.get(toXY.x + ',' + toXY.y);
@@ -5205,7 +5170,7 @@ const SECTOR_DATA = {
 
     // >> Full route with path reconstruction — HPA* hand-off.
     // 1. Find optimal (w1, w2) pair via the same formula as hpaCrossSectorAP.
-    // 2. Reconstruct macro wormhole sequence via nextMap (Floyd-Warshall
+    // 2. Reconstruct macro wormhole sequence via nextFlat (Floyd-Warshall
     //    next-hop chain).
     // 3. Build legs: local A* for each intra-sector segment between
     //    consecutive wormhole tiles in the same sector. Wormhole jumps
@@ -5249,15 +5214,20 @@ const SECTOR_DATA = {
         if (!fromDist) return null;
 
         // Find optimal (w1, w2) pair.
+        const distFlat = table.macro.distFlat;
+        const keyToIdx = table.macro.keyToIdx;
+        const n = table.macro.nodeCount;
         let bestPair = null;
         for (const w1 of fromWhs) {
             const d1 = fromDist.get(w1.x + ',' + w1.y);
             if (d1 === undefined || !isFinite(d1)) continue;
-            const macroDist = table.macro.distMap.get(w1.key);
-            if (!macroDist) continue;
+            const i1 = keyToIdx.get(w1.key);
+            if (i1 === undefined) continue;
             for (const w2 of toWhs) {
-                const macroLeg = macroDist.get(w2.key);
-                if (macroLeg === undefined) continue;
+                const i2 = keyToIdx.get(w2.key);
+                if (i2 === undefined) continue;
+                const macroLeg = distFlat[i1 * n + i2];
+                if (macroLeg < 0) continue;
                 const toDist = hpaLocalDijkstraCached(table, toSec, w2.x, w2.y);
                 if (!toDist) continue;
                 const d2 = toDist.get(toXY.x + ',' + toXY.y);
@@ -5270,19 +5240,20 @@ const SECTOR_DATA = {
         }
         if (!bestPair) return null;
 
-        // Reconstruct macro wormhole sequence via nextMap.
+        // Reconstruct macro wormhole sequence via nextFlat (index space).
+        const nextFlat = table.macro.nextFlat;
+        const macroNodes = table.macro.nodes;
+        const targetIdx = keyToIdx.get(bestPair.w2.key);
         const macroPath = [bestPair.w1.key];
-        let curKey = bestPair.w1.key;
+        let curIdx = keyToIdx.get(bestPair.w1.key);
         let guard = 0;
-        while (curKey !== bestPair.w2.key && guard++ < 500) {
-            const nm = table.macro.nextMap.get(curKey);
-            if (!nm) return null;
-            const nextKey = nm.get(bestPair.w2.key);
-            if (!nextKey) return null;
-            macroPath.push(nextKey);
-            curKey = nextKey;
+        while (curIdx !== targetIdx && guard++ < 500) {
+            const nextIdx = nextFlat[curIdx * n + targetIdx];
+            if (nextIdx < 0 || nextIdx >= n) return null;
+            macroPath.push(macroNodes[nextIdx].key);
+            curIdx = nextIdx;
         }
-        if (curKey !== bestPair.w2.key) return null;
+        if (curIdx !== targetIdx) return null;
 
         // Parse macro path nodes into {sec, x, y}.
         const parsedPath = macroPath.map(k => {
