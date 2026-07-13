@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.02
+// @version      7.03
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v7.03: Debounce terrain recompile + compile-time optimizations. Terrain version bump is now deferred 15s after the last nav step (dirty-flag pattern in scrapeAndStoreTerrain + deferred timer in dispatcher), eliminating the ~8-10s per-step freeze during active exploration. Binary min-heap (_hpaBinHeap) replaces pq.sort()+shift() in hpaLocalDijkstra/hpaLocalAStar (O(n log n)→O(log n) per pop). Flat Float64Array/Int32Array Floyd-Warshall in hpaBuildMacroGraph (cache-friendly, no array-of-arrays pointer chasing). Serialization + GM_setValue deferred to setTimeout(0) so UI panels render first. No signature changes; no estimate fallbacks (ADR 011; all 5 test harnesses green).
 // @description  v7.02: Custom export sub-tab on the Exports Calculator — plan a single-item export trip from a flexible origin (current position or chosen coords+sector) with user-specified quantity. Buy price auto-detected via resolveExportBuyPrice with shared cfgBar override. Table rendering extracted into buildExportsRouteTable helper (shared by both sub-tabs). Hard-fail on unknown sector/item; no estimate fallbacks (ADR 010; test_opportunities.js + test_to.js + test_routing.js + test_prices.js green).
 // @description  v7.01: Live terrain scraping overlay — scrape real terrain from the #navarea HTML on every nav page load, accumulate in GM_setValue, and overlay it on the static_ext grid in hpaParseMap (ground truth wins over static_ext, including padded 'b' rows). Fixes the Ras Elased [27,39] starbase unreachability; static_ext row mismatches self-correct as the player explores. Macro graph cache auto-invalidates on new terrain discovery (terrainVersion in cache key). HPA* functions stay pure (liveTerrain passed as a parameter) (ADR 009; test_terrain_overlay.js + test_routing.js green).
 // @description  v7.00: Wire cross-sector AP (HPA* wormhole router) into the Trade Tracker panel — cross-sector tracked locations previously showed "?" for AP distance. Now calls getCrossSectorAPFast, matching the exports/FWE/opportunities tabs (ADR 008). Same-sector Dijkstra path unchanged (test_cross_sector.js + test_pathfinder_facade.js green).
 // @description  v6.99: Tracker Item Search filter now matches the displayed "avail" column (stock minus min) instead of raw stock — entries showing 0 avail are hidden, fixing the case where stock was positive but at/below the location's keep threshold.
-// @description  v6.98: Fix Tracker Item Search "avail" column — was still showing raw stock (v6.97 edit landed on wrong line). Also fix root cause: amount_min page var is not populated on planet/starbase trade pages, so c.min was always 0. Now captures min from the trade table DOM (3 cells before buy input). Re-visit locations to populate min (test_routing.js green).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -5389,6 +5389,43 @@ const SECTOR_DATA = {
         return sectors;
     }
 
+    // >> Binary min-heap for Dijkstra/A* priority queues. O(log n) push/pop
+    // vs O(n log n) array sort. Critical for compile time: hpaBuildMacroGraph
+    // runs 1104 Dijkstra calls; each with up to ~1000 nodes in the open set.
+    function _hpaBinHeap(cmp) {
+        const a = [];
+        return {
+            get length() { return a.length; },
+            push(v) {
+                a.push(v);
+                let i = a.length - 1;
+                while (i > 0) {
+                    const p = (i - 1) >> 1;
+                    if (cmp(a[p], a[i]) <= 0) break;
+                    const t = a[p]; a[p] = a[i]; a[i] = t; i = p;
+                }
+            },
+            shift() {
+                if (a.length === 0) return undefined;
+                const top = a[0];
+                const last = a.pop();
+                if (a.length > 0) {
+                    a[0] = last;
+                    let i = 0;
+                    const n = a.length;
+                    while (true) {
+                        let l = 2 * i + 1, r = 2 * i + 2, m = i;
+                        if (l < n && cmp(a[l], a[m]) < 0) m = l;
+                        if (r < n && cmp(a[r], a[m]) < 0) m = r;
+                        if (m === i) break;
+                        const t = a[m]; a[m] = a[i]; a[i] = t; i = m;
+                    }
+                }
+                return top;
+            }
+        };
+    }
+
     // >> Single-source Dijkstra over a sector grid.
     // Returns a Map<"x,y", apCost> for every reachable tile. Pardus terrain
     // is ASYMMETRIC: entering a tile costs that tile's terrainAP, so a
@@ -5401,12 +5438,11 @@ const SECTOR_DATA = {
         if (sx < 0 || sy < 0 || sx >= cols || sy >= rows) return null;
 
         const dist = new Map();
-        const pq = [];
+        const pq = _hpaBinHeap((a, b) => a.cost - b.cost);
         dist.set(sx + ',' + sy, 0);
         pq.push({ x: sx, y: sy, cost: 0 });
 
         while (pq.length > 0) {
-            pq.sort((a, b) => a.cost - b.cost);
             const cur = pq.shift();
             const cKey = cur.x + ',' + cur.y;
             if (cur.cost > dist.get(cKey)) continue;
@@ -5451,7 +5487,7 @@ const SECTOR_DATA = {
         const gScore = new Map();
         const turns = new Map();
         const prev = new Map();
-        const open = [];
+        const open = _hpaBinHeap((a, b) => (a.f - b.f) || (a.t - b.t));
 
         const startKey = sx + ',' + sy;
         gScore.set(startKey, 0);
@@ -5462,7 +5498,6 @@ const SECTOR_DATA = {
         });
 
         while (open.length > 0) {
-            open.sort((a, b) => (a.f - b.f) || (a.t - b.t));
             const cur = open.shift();
             const cKey = cur.x + ',' + cur.y;
             if (cur.g > gScore.get(cKey)) continue;
@@ -5578,35 +5613,38 @@ const SECTOR_DATA = {
         const idx = new Map();
         nodes.forEach((node, i) => idx.set(node.key, i));
 
-        const dist = new Array(n);
-        const next = new Array(n);
+        const dist = new Float64Array(n * n);
+        const next = new Int32Array(n * n);
+        dist.fill(Infinity);
+        next.fill(-1);
         for (let i = 0; i < n; i++) {
-            dist[i] = new Array(n).fill(Infinity);
-            next[i] = new Array(n).fill(null);
-            dist[i][i] = 0;
-            next[i][i] = i;
+            dist[i * n + i] = 0;
+            next[i * n + i] = i;
         }
         for (const e of jumpEdges) {
             const i = idx.get(e.from), j = idx.get(e.to);
-            if (i != null && j != null && e.cost < dist[i][j]) {
-                dist[i][j] = e.cost;
-                next[i][j] = j;
+            if (i != null && j != null && e.cost < dist[i * n + j]) {
+                dist[i * n + j] = e.cost;
+                next[i * n + j] = j;
             }
         }
         for (const e of intraEdges) {
             const i = idx.get(e.from), j = idx.get(e.to);
-            if (i != null && j != null && e.cost < dist[i][j]) {
-                dist[i][j] = e.cost;
-                next[i][j] = j;
+            if (i != null && j != null && e.cost < dist[i * n + j]) {
+                dist[i * n + j] = e.cost;
+                next[i * n + j] = j;
             }
         }
         for (let k = 0; k < n; k++) {
             for (let i = 0; i < n; i++) {
-                if (dist[i][k] === Infinity) continue;
+                const dik = dist[i * n + k];
+                if (dik === Infinity) continue;
+                const ik = i * n; const kj = k * n;
                 for (let j = 0; j < n; j++) {
-                    if (dist[i][k] + dist[k][j] < dist[i][j]) {
-                        dist[i][j] = dist[i][k] + dist[k][j];
-                        next[i][j] = next[i][k];
+                    const alt = dik + dist[kj + j];
+                    if (alt < dist[ik + j]) {
+                        dist[ik + j] = alt;
+                        next[ik + j] = next[ik + k];
                     }
                 }
             }
@@ -5617,8 +5655,10 @@ const SECTOR_DATA = {
         const nextFlat = new Int16Array(n * n);
         for (let i = 0; i < n; i++) {
             for (let j = 0; j < n; j++) {
-                distFlat[i * n + j] = isFinite(dist[i][j]) ? dist[i][j] : -1;
-                nextFlat[i * n + j] = (next[i][j] !== null) ? next[i][j] : -1;
+                const d = dist[i * n + j];
+                distFlat[i * n + j] = isFinite(d) ? d : -1;
+                const nx = next[i * n + j];
+                nextFlat[i * n + j] = (nx !== -1 && nx !== undefined) ? nx : -1;
             }
         }
 
@@ -6021,15 +6061,21 @@ const SECTOR_DATA = {
                 top.__hpaTerrainAP = terrainAP;
             } catch (e) { /* no frameset — L2/L3 still works */ }
 
-            // Persist for next page load (non-fatal if quota exceeded).
-            try {
-                const serialized = hpaSerializeTable(_hpaTable, key);
-                console.log('[hpa] L2: persisting ' + (serialized.length / 1024 / 1024).toFixed(1) + ' MB');
-                GM_setValue('pardus_hpa_macro_v1', serialized);
-                console.log('[hpa] L2: persist OK');
-            } catch (e) {
-                console.warn('[hpa] L2: persist FAILED:', e.message);
-            }
+            // Defer serialization so UI panels (which call hpaGetTable
+            // synchronously via setTimeout(0) in the dispatcher) can start
+            // rendering first. The table is already in L1 cache, so the next
+            // hpaGetTable() call returns immediately. Serialization +
+            // GM_setValue runs in a follow-up macrotask. See ADR 011.
+            setTimeout(() => {
+                try {
+                    const serialized = hpaSerializeTable(_hpaTable, key);
+                    console.log('[hpa] L2: persisting ' + (serialized.length / 1024 / 1024).toFixed(1) + ' MB');
+                    GM_setValue('pardus_hpa_macro_v1', serialized);
+                    console.log('[hpa] L2: persist OK');
+                } catch (e) {
+                    console.warn('[hpa] L2: persist FAILED:', e.message);
+                }
+            }, 0);
 
             return _hpaTable;
         } catch (e) {
@@ -6206,9 +6252,11 @@ const SECTOR_DATA = {
         return { sector: canonical, tiles };
     }
 
-    // >> IIFE-bridge: scrape + merge into the GM terrain store. Increments the
-    // terrain version ONLY when a tile is newly discovered or changes value —
-    // confirming already-known terrain does not trigger a macro-graph recompile.
+    // >> IIFE-bridge: scrape + merge into the GM terrain store. Sets a dirty
+    // flag when a tile is newly discovered or changes value — the version
+    // increment (which invalidates the macro-graph cache) is deferred to the
+    // dispatcher so active navigation doesn't trigger a per-step recompile.
+    // Confirming already-known terrain does not set the dirty flag. See ADR 011.
     // Called synchronously from the dispatcher on /main.php (part 20).
     function scrapeAndStoreTerrain() {
         const result = scrapeNavTerrain();
@@ -6224,8 +6272,8 @@ const SECTOR_DATA = {
         }
         if (changed) {
             GM_setValue('pardus_terrain_v1', store);
-            GM_setValue('pardus_terrain_version', GM_getValue('pardus_terrain_version', 0) + 1);
-            console.log('[terrain] ' + result.sector + ': stored ' + Object.keys(result.tiles).length + ' tiles, version now ' + GM_getValue('pardus_terrain_version', 0));
+            GM_setValue('pardus_terrain_dirty', true);
+            console.log('[terrain] ' + result.sector + ': stored ' + Object.keys(result.tiles).length + ' tiles (version bump deferred)');
         }
     }
 
@@ -9513,6 +9561,21 @@ const SECTOR_DATA = {
         // break the rest of the script. See ADR 009.
         try { scrapeAndStoreTerrain(); }
         catch (e) { console.error('[terrain] scrape failed:', e); }
+        // Deferred terrain version bump: if new terrain was discovered, delay
+        // the version increment so active navigation doesn't trigger a per-step
+        // macro graph recompile. The dirty flag persists across page loads;
+        // only when the user is idle (15s) does the version bump fire → one
+        // recompile. See ADR 011.
+        if (GM_getValue('pardus_terrain_dirty', false)) {
+            setTimeout(() => {
+                if (GM_getValue('pardus_terrain_dirty', false)) {
+                    GM_setValue('pardus_terrain_dirty', false);
+                    const v = GM_getValue('pardus_terrain_version', 0) + 1;
+                    GM_setValue('pardus_terrain_version', v);
+                    console.log('[terrain] deferred version bump → ' + v + ' (user idle 15s)');
+                }
+            }, 15000);
+        }
     } else if (currentPath === '/overview_buildings.php') {
         initBookkeeperParser();
     }
