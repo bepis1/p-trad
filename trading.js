@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.99
+// @version      7.00
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v7.00: Wire cross-sector AP (HPA* wormhole router) into the Trade Tracker panel — cross-sector tracked locations previously showed "?" for AP distance. Now calls getCrossSectorAPFast, matching the exports/FWE/opportunities tabs (ADR 008). Same-sector Dijkstra path unchanged (test_cross_sector.js + test_pathfinder_facade.js green).
+// @description  v6.99: Tracker Item Search filter now matches the displayed "avail" column (stock minus min) instead of raw stock — entries showing 0 avail are hidden, fixing the case where stock was positive but at/below the location's keep threshold.
 // @description  v6.98: Fix Tracker Item Search "avail" column — was still showing raw stock (v6.97 edit landed on wrong line). Also fix root cause: amount_min page var is not populated on planet/starbase trade pages, so c.min was always 0. Now captures min from the trade table DOM (3 cells before buy input). Re-visit locations to populate min (test_routing.js green).
 // @description  v6.97: Tracker Item Search "stk" column renamed to "avail" and now shows stock minus the location's sell minimum (max 0) — the quantity actually buyable, matching trackerProjectBuy. Additive UI; no computation change (test_routing.js green).
 // @description  v6.96: Wire cross-sector AP (HPA* macro wormhole router) into Exports and FWE tabs — cross-sector buyers/starbases previously showed "?" (and were skipped in FWE entirely). Unblocks the 400t packing feature for cross-sector destinations >400 AP away with >200 buyer room. Same-sector Dijkstra path unchanged (test_fwe.js + test_fwe_gate.js + test_cross_sector.js green).
-// @description  v6.95: Add Take-All gather mode — enter comma-separated item names, sim visits every producing building and buys all available stock, dumping non-protected cargo into the TO when the ship is too full for a complete pickup. New calculateTakeAllRoute function (same step shape); existing supply-chain engine untouched (test_routing.js green).
-// @description  v6.99: Tracker Item Search filter now matches the displayed "avail" column (stock minus min) instead of raw stock — entries showing 0 avail are hidden, fixing the case where stock was positive but at/below the location's keep threshold.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -1820,7 +1820,19 @@ const SECTOR_DATA = {
                     result[k] = null;
                 }
             } else {
-                result[k] = null; // different sector
+                // Cross-sector: wormhole-aware HPA* AP. Returns null
+                // when no route / no map — rendered as '?' (hard-fail,
+                // no estimate). try/catch mirrors the Dijkstra guard at
+                // lines 367-371 so one bad entry can't abort the pass.
+                try {
+                    const ap = getCrossSectorAPFast(
+                        playerCoords, playerSector, eCoords, eSector, null, null);
+                    result[k] = (ap !== null && isFinite(ap)) ? ap : null;
+                } catch (err) {
+                    console.warn('[pardus-tracker] cross-sector AP failed:', e.name, err);
+                    result[k] = null;
+                    usedFallback = true;
+                }
             }
         }
         return {
