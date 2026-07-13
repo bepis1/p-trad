@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.01
+// @version      7.02
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v7.02: Custom export sub-tab on the Exports Calculator — plan a single-item export trip from a flexible origin (current position or chosen coords+sector) with user-specified quantity. Buy price auto-detected via resolveExportBuyPrice with shared cfgBar override. Table rendering extracted into buildExportsRouteTable helper (shared by both sub-tabs). Hard-fail on unknown sector/item; no estimate fallbacks (ADR 010; test_opportunities.js + test_to.js + test_routing.js + test_prices.js green).
 // @description  v7.01: Live terrain scraping overlay — scrape real terrain from the #navarea HTML on every nav page load, accumulate in GM_setValue, and overlay it on the static_ext grid in hpaParseMap (ground truth wins over static_ext, including padded 'b' rows). Fixes the Ras Elased [27,39] starbase unreachability; static_ext row mismatches self-correct as the player explores. Macro graph cache auto-invalidates on new terrain discovery (terrainVersion in cache key). HPA* functions stay pure (liveTerrain passed as a parameter) (ADR 009; test_terrain_overlay.js + test_routing.js green).
 // @description  v7.00: Wire cross-sector AP (HPA* wormhole router) into the Trade Tracker panel — cross-sector tracked locations previously showed "?" for AP distance. Now calls getCrossSectorAPFast, matching the exports/FWE/opportunities tabs (ADR 008). Same-sector Dijkstra path unchanged (test_cross_sector.js + test_pathfinder_facade.js green).
 // @description  v6.99: Tracker Item Search filter now matches the displayed "avail" column (stock minus min) instead of raw stock — entries showing 0 avail are hidden, fixing the case where stock was positive but at/below the location's keep threshold.
 // @description  v6.98: Fix Tracker Item Search "avail" column — was still showing raw stock (v6.97 edit landed on wrong line). Also fix root cause: amount_min page var is not populated on planet/starbase trade pages, so c.min was always 0. Now captures min from the trade table DOM (3 cells before buy input). Re-visit locations to populate min (test_routing.js green).
-// @description  v6.97: Tracker Item Search "stk" column renamed to "avail" and now shows stock minus the location's sell minimum (max 0) — the quantity actually buyable, matching trackerProjectBuy. Additive UI; no computation change (test_routing.js green).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2934,6 +2934,143 @@ const SECTOR_DATA = {
         };
     }
 
+    // >> Custom export: single-item, flexible-origin route planner
+    //
+    // Like computeExportRoutes but for one user-specified item+quantity from a
+    // flexible origin (current position or chosen coords+sector). Same route
+    // shape, same packaging model, same helpers. Buy price auto-detected via
+    // resolveExportBuyPrice (shared cfgBar override).
+    function computeCustomExportRoutes(opts) {
+        const maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
+
+        // --- Resolve origin ---
+        let originCoords, originSector;
+        if (opts.originMode === 'current') {
+            const tileId = trackerGetPlayerTileId();
+            if (tileId == null) {
+                return { error: 'Current position unavailable (no userloc on this page). Use Coords mode or switch to a nav/main page.' };
+            }
+            originSector = getSectorFromTileId(tileId);
+            if (!originSector) return { error: 'Could not resolve sector for current tile ' + tileId + '.' };
+            originCoords = getLocalCoordsFromTileId(tileId, originSector);
+            if (!originCoords) return { error: 'Could not resolve local coords for current tile.' };
+        } else {
+            if (!opts.coordsStr || !/\d+,\d+/.test(opts.coordsStr)) {
+                return { error: 'Enter origin coords as x,y (e.g. 12,5).' };
+            }
+            originCoords = parseCoords(opts.coordsStr);
+            const resolvedSector = _resolveSectorName(opts.sectorStr);
+            if (!resolvedSector) {
+                return { error: 'Unknown sector "' + (opts.sectorStr || '') + '". Check the sector name spelling.' };
+            }
+            originSector = resolvedSector;
+        }
+
+        // --- Resolve item + store ---
+        parseStaticMap(true);
+        const store = getTrackerStore();
+        if (Object.keys(store).length === 0) {
+            return { error: 'No tracked locations yet. Open building/planet/starbase trade screens to capture them.' };
+        }
+        const nameToResId = buildExportNameToResIdMap(store);
+        const itemName = (opts.itemName || '').trim();
+        const resId = nameToResId[itemName.toLowerCase()];
+        if (!resId) {
+            return { error: 'Item "' + itemName + '" is not tracked. Open a trade screen that lists this commodity.' };
+        }
+        const qty = parseInt(opts.qty, 10);
+        if (!qty || qty <= 0) {
+            return { error: 'Enter a positive quantity to transport.' };
+        }
+
+        const buyOverride = opts.buyOverride != null && !isNaN(opts.buyOverride) && opts.buyOverride > 0 ? opts.buyOverride : null;
+        const buy = resolveExportBuyPrice(store, resId, buyOverride);
+        const buyPrice = buy.price;
+
+        // --- One Dijkstra from origin covers all same-sector destinations ---
+        let originDijkstra = null;
+        let usedFallback = false;
+        try { originDijkstra = getSectorAllDistances(originSector, originCoords.x, originCoords.y); }
+        catch (e) { originDijkstra = null; }
+        if (!originDijkstra) usedFallback = true;
+
+        const routes = [];
+        const PACK_AP = 400;
+        const PACK_CAP = maxCargo * 2;
+
+        for (const k in store) {
+            const e = store[k];
+            if (!e || !e.commodities) continue;
+            const c = e.commodities[resId];
+            if (!c || c.sellToObjPrice <= 0) continue;
+
+            const rc = realSectorAndCoords(e);
+            if (!rc.coords) continue;
+            const eSector = rc.sector;
+            const eCoords = rc.coords;
+
+            const sameSector = !!(eSector && eSector === originSector);
+
+            // AP: same-sector Dijkstra, cross-sector HPA* (no estimates — null → '?')
+            let D = null;
+            if (sameSector && originDijkstra) {
+                const key = eCoords.x + ',' + eCoords.y;
+                D = (originDijkstra[key] !== undefined) ? originDijkstra[key] : null;
+            } else if (!sameSector && eSector) {
+                try { D = getCrossSectorAPFast(originCoords, originSector, eCoords, eSector, null, null); }
+                catch (e2) { D = null; }
+            }
+
+            // Packaging model (same as computeExportRoutes)
+            let usePacking = false;
+            const unpackedDesired = Math.min(maxCargo, qty);
+            const unpackedProj = trackerProjectSell(e, resId, unpackedDesired);
+            if (D != null && D > PACK_AP) {
+                const packDesired = Math.min(PACK_CAP, qty);
+                const packProj = trackerProjectSell(e, resId, packDesired);
+                if (packProj && packProj.quantity > maxCargo) usePacking = true;
+            }
+            const proj = usePacking
+                ? trackerProjectSell(e, resId, Math.min(PACK_CAP, qty))
+                : unpackedProj;
+            if (!proj || proj.quantity <= 0) continue;
+
+            const units = proj.quantity;
+            const revenue = proj.totalRevenue;
+            const sellPerUnit = proj.perUnitAvg;
+            const profit = (buyPrice != null) ? (revenue - buyPrice * units) : null;
+            const apCost = (D != null) ? (D + (usePacking ? PACK_AP : 0)) : null;
+            const credit = (profit != null) ? profit : revenue;
+            const ratio = (apCost != null && apCost > 0) ? credit / apCost : null;
+
+            routes.push({
+                item: itemName, dest: e, sector: eSector, coords: eCoords,
+                sameSector: sameSector, packed: usePacking, units: units,
+                buyPrice: buyPrice, sellPerUnit: sellPerUnit, revenue: revenue,
+                profit: profit, credit: credit, apCost: apCost, ratio: ratio
+            });
+        }
+
+        routes.sort((a, b) => {
+            if (a.ratio != null && b.ratio != null) return b.ratio - a.ratio;
+            if (a.ratio != null) return -1;
+            if (b.ratio != null) return 1;
+            return (b.credit || 0) - (a.credit || 0);
+        });
+
+        return {
+            routes: routes,
+            originSector: originSector,
+            originCoords: originCoords,
+            itemName: itemName,
+            resId: resId,
+            qty: qty,
+            buyPrice: buyPrice,
+            buySource: buy.source,
+            usedFallback: usedFallback
+        };
+    }
+
     // FWE (Food/Water/Energy) cycle calculator.
     //
     // Cycle: buy food+water at the hub planet (123:84 ratio of max cargo),
@@ -3626,6 +3763,10 @@ const SECTOR_DATA = {
             cfgBar.style.display = (activeTab === 'exports' && !collapsed) ? 'flex' : 'none';
             // Sub-tab bar only applies to the Opportunities tab.
             if (oppSubBar) oppSubBar.style.display = (activeTab === 'opps' && !collapsed) ? 'flex' : 'none';
+            // Exports sub-tab bar (TO vs Custom).
+            if (expSubBar) expSubBar.style.display = (activeTab === 'exports' && !collapsed) ? 'flex' : 'none';
+            if (expCustomBar) expCustomBar.style.display = (activeTab === 'exports' && expSubTab === 'custom' && !collapsed) ? 'flex' : 'none';
+            if (expSubBar) updateExpSubTabStyle();
         }
 
         function makeTabBtn(label, tabId) {
@@ -3680,6 +3821,155 @@ const SECTOR_DATA = {
                 btn.style.borderColor = active ? '#aa7744' : '#5a3a1a';
             });
         }
+
+        // Sub-tab bar for Exports (TO vs Custom).
+        let expSubTab = GM_getValue('exports_subtab', 'to');
+        const expSubBar = document.createElement('div');
+        expSubBar.style.cssText = 'display:none;padding:3px 7px;border-bottom:1px solid #5a3a1a;gap:4px;';
+        wrap.appendChild(expSubBar);
+
+        function makeExpSubTabBtn(label, subId) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = label;
+            btn.dataset.expsubtab = subId;
+            btn.style.cssText = 'flex:1;cursor:pointer;font-size:9px;padding:2px 6px;border:1px solid #5a3a1a;background:#1a1000;color:#8a6a3a;';
+            btn.addEventListener('click', () => {
+                expSubTab = subId;
+                GM_setValue('exports_subtab', subId);
+                updateExpSubTabStyle();
+                updateTabStyle();
+                renderBody();
+            });
+            return btn;
+        }
+        const toSubBtn = makeExpSubTabBtn('TO', 'to');
+        const customSubBtn = makeExpSubTabBtn('Custom', 'custom');
+        expSubBar.appendChild(toSubBtn);
+        expSubBar.appendChild(customSubBtn);
+
+        function updateExpSubTabStyle() {
+            [toSubBtn, customSubBtn].forEach(btn => {
+                const active = btn.dataset.expsubtab === expSubTab;
+                btn.style.color = active ? '#ffcc77' : '#8a6a3a';
+                btn.style.background = active ? '#332200' : '#1a1000';
+                btn.style.borderColor = active ? '#aa7744' : '#5a3a1a';
+            });
+        }
+
+        // Custom export config bar: origin toggle, coords, sector, item, qty.
+        const expCustomBar = document.createElement('div');
+        expCustomBar.style.cssText = 'padding:4px 7px;border-bottom:1px solid #5a3a1a;display:none;gap:6px;align-items:center;flex-wrap:wrap;font-size:9px;';
+        wrap.appendChild(expCustomBar);
+
+        let expOriginMode = GM_getValue('exports_custom_origin', 'current');
+
+        // Origin toggle buttons
+        const originToggleLabel = document.createElement('span');
+        originToggleLabel.textContent = 'Origin:';
+        originToggleLabel.style.cssText = 'color:#8a6a3a;';
+        expCustomBar.appendChild(originToggleLabel);
+
+        function makeOriginBtn(label, mode) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = label;
+            btn.dataset.originmode = mode;
+            btn.style.cssText = 'cursor:pointer;font-size:9px;padding:2px 6px;border:1px solid #5a3a1a;background:#1a1000;color:#8a6a3a;';
+            btn.addEventListener('click', () => {
+                expOriginMode = mode;
+                GM_setValue('exports_custom_origin', mode);
+                updateOriginToggleStyle();
+                expCoordsWrap.style.display = (mode === 'coords') ? 'flex' : 'none';
+                renderBody();
+            });
+            return btn;
+        }
+        const originCurrentBtn = makeOriginBtn('Current', 'current');
+        const originCoordsBtn = makeOriginBtn('Coords', 'coords');
+        expCustomBar.appendChild(originCurrentBtn);
+        expCustomBar.appendChild(originCoordsBtn);
+
+        function updateOriginToggleStyle() {
+            [originCurrentBtn, originCoordsBtn].forEach(btn => {
+                const active = btn.dataset.originmode === expOriginMode;
+                btn.style.color = active ? '#ffcc77' : '#8a6a3a';
+                btn.style.background = active ? '#332200' : '#1a1000';
+                btn.style.borderColor = active ? '#aa7744' : '#5a3a1a';
+            });
+        }
+        updateOriginToggleStyle();
+
+        // Coords + sector inputs (shown only in coords mode)
+        const expCoordsWrap = document.createElement('div');
+        expCoordsWrap.style.cssText = 'display:' + (expOriginMode === 'coords' ? 'flex' : 'none') + ';gap:4px;align-items:center;flex-wrap:wrap;';
+        expCustomBar.appendChild(expCoordsWrap);
+
+        const expCoordsInput = document.createElement('input');
+        expCoordsInput.type = 'text';
+        expCoordsInput.placeholder = 'x,y';
+        expCoordsInput.title = 'Origin coordinates (e.g. 12,5)';
+        expCoordsInput.value = GM_getValue('exports_custom_coords', '');
+        expCoordsInput.style.cssText = 'width:50px;background:#1a1000;color:#ffaa55;border:1px solid #5a3a3a;font-size:9px;padding:2px 4px;';
+        expCoordsWrap.appendChild(expCoordsInput);
+        expCoordsInput.addEventListener('change', () => {
+            GM_setValue('exports_custom_coords', expCoordsInput.value.trim());
+            renderBody();
+        });
+
+        const expSectorInput = document.createElement('input');
+        expSectorInput.type = 'text';
+        expSectorInput.placeholder = 'sector';
+        expSectorInput.title = 'Sector name (e.g. Artemis, Beta Hydri)';
+        expSectorInput.value = GM_getValue('exports_custom_sector', '');
+        expSectorInput.style.cssText = 'width:90px;background:#1a1000;color:#ffaa55;border:1px solid #5a3a3a;font-size:9px;padding:2px 4px;';
+        expCoordsWrap.appendChild(expSectorInput);
+        expSectorInput.addEventListener('change', () => {
+            GM_setValue('exports_custom_sector', expSectorInput.value.trim());
+            renderBody();
+        });
+
+        // Item name input with datalist autocomplete
+        const itemLabel = document.createElement('span');
+        itemLabel.textContent = 'Item:';
+        itemLabel.style.cssText = 'color:#8a6a3a;';
+        expCustomBar.appendChild(itemLabel);
+
+        const expItemInput = document.createElement('input');
+        expItemInput.type = 'text';
+        expItemInput.setAttribute('list', 'pardus-custom-item-list');
+        expItemInput.placeholder = 'item name';
+        expItemInput.title = 'Commodity to export (type the name)';
+        expItemInput.value = GM_getValue('exports_custom_item', '');
+        expItemInput.style.cssText = 'width:100px;background:#1a1000;color:#ffcc77;border:1px solid #5a3a3a;font-size:9px;padding:2px 4px;';
+        expCustomBar.appendChild(expItemInput);
+        expItemInput.addEventListener('change', () => {
+            GM_setValue('exports_custom_item', expItemInput.value.trim());
+            renderBody();
+        });
+
+        const expDatalist = document.createElement('datalist');
+        expDatalist.id = 'pardus-custom-item-list';
+        expCustomBar.appendChild(expDatalist);
+
+        // Quantity input
+        const qtyLabel = document.createElement('span');
+        qtyLabel.textContent = 'Qty:';
+        qtyLabel.style.cssText = 'color:#8a6a3a;';
+        expCustomBar.appendChild(qtyLabel);
+
+        const expQtyInput = document.createElement('input');
+        expQtyInput.type = 'number';
+        expQtyInput.min = '1';
+        expQtyInput.placeholder = 'qty';
+        expQtyInput.title = 'Units to transport for this export trip';
+        expQtyInput.value = GM_getValue('exports_custom_qty', '');
+        expQtyInput.style.cssText = 'width:50px;background:#1a1000;color:#88ccff;border:1px solid #5a3a3a;font-size:9px;padding:2px 4px;';
+        expCustomBar.appendChild(expQtyInput);
+        expQtyInput.addEventListener('change', () => {
+            GM_setValue('exports_custom_qty', expQtyInput.value.trim());
+            renderBody();
+        });
 
         const cfgBar = document.createElement('div');
         cfgBar.style.cssText = 'padding:4px 7px;border-bottom:1px solid #5a3a1a;display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:9px;';
@@ -3818,7 +4108,69 @@ const SECTOR_DATA = {
             renderActiveRunBar();
             if (activeTab === 'fwe') renderFweBody();
             else if (activeTab === 'opps') renderOpportunitiesBody(force);
-            else renderExportsBody();
+            else {
+                if (expSubTab === 'custom') renderCustomExportsBody();
+                else renderExportsBody();
+            }
+        }
+
+        function buildExportsRouteTable(routes) {
+            const t = document.createElement('table');
+            t.style.cssText = 'width:100%;border-collapse:collapse;font-size:9px;';
+            t.innerHTML = '<tr style="color:#8a6a3a;">' +
+                '<th style="text-align:left;">#</th>' +
+                '<th style="text-align:left;">Item</th>' +
+                '<th style="text-align:left;">Destination</th>' +
+                '<th>Units</th>' +
+                '<th>Buy</th>' +
+                '<th>Sell</th>' +
+                '<th>Profit</th>' +
+                '<th>AP</th>' +
+                '<th>cr/AP</th>' +
+                '</tr>';
+            routes.forEach((r, i) => {
+                const tr = document.createElement('tr');
+                tr.style.cssText = 'border-bottom:1px dashed #2a2a1a;color:#bbb;';
+                const typeIcon = r.dest.type === 'planet' ? '\u25cf' : (r.dest.type === 'starbase' ? '\u25b2' : '\u25a0');
+                const typeColor = r.dest.type === 'planet' ? '#aaffaa' : (r.dest.type === 'starbase' ? '#88ccff' : '#ffcc88');
+                const sameTag = r.sameSector ? '' : ' <span style="color:#5a5a3a;">(cross-sector)</span>';
+                const packTag = r.packed ? ' <span style="color:#cc88ff;">(packaging)</span>' : '';
+                const apTxt = (r.apCost == null)
+                    ? '<span style="color:#666;">?</span>'
+                    : (r.packed
+                        ? '<span style="color:#ffaa44;">' + r.apCost + '</span><span style="color:#5a5a3a;"> (incl. 400 pack)</span>'
+                        : '<span style="color:#ffaa44;">' + r.apCost + '</span>');
+                const ratioTxt = (r.ratio == null)
+                    ? '<span style="color:#666;">?</span>'
+                    : '<span style="color:#00ff88;font-weight:bold;">' + fmtRatio(r.ratio) + '</span>';
+                const profitTxt = (r.profit == null)
+                    ? '<span style="color:#666;">' + fmtCr(r.revenue) + '*</span>'
+                    : '<span style="color:' + (r.profit < 0 ? '#ff5555' : '#88ff88') + ';">' + fmtCr(r.profit) + '</span>';
+                const nameAttrs = ' class="export-fly-target" data-idx="' + i + '" title="Click to fly here" style="color:' + typeColor + ';cursor:pointer;text-decoration:underline;"';
+                tr.innerHTML =
+                    '<td>' + (i + 1) + '</td>' +
+                    '<td style="color:#ffcc77;">' + r.item + '</td>' +
+                    '<td><span style="color:' + typeColor + ';">' + typeIcon + '</span> ' +
+                        '<span' + nameAttrs + '>' + (r.dest.name || '?') + '</span> ' +
+                        '<span style="color:#666;">[' + r.coords.x + ',' + r.coords.y + ']' +
+                        (r.sector ? ' ' + r.sector : '') + sameTag + '</span></td>' +
+                    '<td style="text-align:right;">' + r.units + packTag + '</td>' +
+                    '<td style="text-align:right;color:#ffaa55;">' + (r.buyPrice != null ? fmtCr(r.buyPrice) : '?') + '</td>' +
+                    '<td style="text-align:right;color:#88cc88;">' + fmtCr(r.sellPerUnit) + '</td>' +
+                    '<td style="text-align:right;">' + profitTxt + '</td>' +
+                    '<td style="text-align:right;color:#ffaa44;">' + apTxt + '</td>' +
+                    '<td style="text-align:right;">' + ratioTxt + '</td>';
+                t.appendChild(tr);
+            });
+            t.addEventListener('click', function(e) {
+                const el = e.target.closest('.export-fly-target');
+                if (!el) return;
+                const idx = parseInt(el.dataset.idx, 10);
+                const r = routes[idx];
+                if (!r) return;
+                flyToCoords({ x: r.coords.x, y: r.coords.y, sector: r.sector }, (r.dest.name || '?') + ' [' + r.coords.x + ',' + r.coords.y + ']');
+            });
+            return t;
         }
 
         function renderExportsBody() {
@@ -3871,67 +4223,73 @@ const SECTOR_DATA = {
                 return;
             }
 
-            const t = document.createElement('table');
-            t.style.cssText = 'width:100%;border-collapse:collapse;font-size:9px;';
-            t.innerHTML = '<tr style="color:#8a6a3a;">' +
-                '<th style="text-align:left;">#</th>' +
-                '<th style="text-align:left;">Item</th>' +
-                '<th style="text-align:left;">Destination</th>' +
-                '<th>Units</th>' +
-                '<th>Buy</th>' +
-                '<th>Sell</th>' +
-                '<th>Profit</th>' +
-                '<th>AP</th>' +
-                '<th>cr/AP</th>' +
-                '</tr>';
-
-            res.routes.forEach((r, i) => {
-                const tr = document.createElement('tr');
-                tr.style.cssText = 'border-bottom:1px dashed #2a2a1a;color:#bbb;';
-                const typeIcon = r.dest.type === 'planet' ? '\u25cf' : (r.dest.type === 'starbase' ? '\u25b2' : '\u25a0');
-                const typeColor = r.dest.type === 'planet' ? '#aaffaa' : (r.dest.type === 'starbase' ? '#88ccff' : '#ffcc88');
-                const sameTag = r.sameSector ? '' : ' <span style="color:#5a5a3a;">(cross-sector)</span>';
-                const packTag = r.packed ? ' <span style="color:#cc88ff;">(packaging)</span>' : '';
-                const apTxt = (r.apCost == null)
-                    ? '<span style="color:#666;">?</span>'
-                    : (r.packed
-                        ? '<span style="color:#ffaa44;">' + r.apCost + '</span><span style="color:#5a5a3a;"> (incl. 400 pack)</span>'
-                        : '<span style="color:#ffaa44;">' + r.apCost + '</span>');
-                const ratioTxt = (r.ratio == null)
-                    ? '<span style="color:#666;">?</span>'
-                    : '<span style="color:#00ff88;font-weight:bold;">' + fmtRatio(r.ratio) + '</span>';
-                const profitTxt = (r.profit == null)
-                    ? '<span style="color:#666;">' + fmtCr(r.revenue) + '*</span>'
-                    : '<span style="color:' + (r.profit < 0 ? '#ff5555' : '#88ff88') + ';">' + fmtCr(r.profit) + '</span>';
-                const nameAttrs = ' class="export-fly-target" data-idx="' + i + '" title="Click to fly here" style="color:' + typeColor + ';cursor:pointer;text-decoration:underline;"';
-                tr.innerHTML =
-                    '<td>' + (i + 1) + '</td>' +
-                    '<td style="color:#ffcc77;">' + r.item + '</td>' +
-                    '<td><span style="color:' + typeColor + ';">' + typeIcon + '</span> ' +
-                        '<span' + nameAttrs + '>' + (r.dest.name || '?') + '</span> ' +
-                        '<span style="color:#666;">[' + r.coords.x + ',' + r.coords.y + ']' +
-                        (r.sector ? ' ' + r.sector : '') + sameTag + '</span></td>' +
-                    '<td style="text-align:right;">' + r.units + packTag + '</td>' +
-                    '<td style="text-align:right;color:#ffaa55;">' + (r.buyPrice != null ? fmtCr(r.buyPrice) : '?') + '</td>' +
-                    '<td style="text-align:right;color:#88cc88;">' + fmtCr(r.sellPerUnit) + '</td>' +
-                    '<td style="text-align:right;">' + profitTxt + '</td>' +
-                    '<td style="text-align:right;color:#ffaa44;">' + apTxt + '</td>' +
-                    '<td style="text-align:right;">' + ratioTxt + '</td>';
-                t.appendChild(tr);
-            });
-            t.addEventListener('click', function(e) {
-                const el = e.target.closest('.export-fly-target');
-                if (!el) return;
-                const idx = parseInt(el.dataset.idx, 10);
-                const r = res.routes[idx];
-                if (!r) return;
-                flyToCoords({ x: r.coords.x, y: r.coords.y, sector: r.sector }, (r.dest.name || '?') + ' [' + r.coords.x + ',' + r.coords.y + ']');
-            });
-            body.appendChild(t);
+            body.appendChild(buildExportsRouteTable(res.routes));
 
             const note = document.createElement('div');
             note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
             note.innerHTML = 'Click a destination name to auto-fly there. Cross-sector flights use wormhole routing. One-way AP from TO via pathfinder (same-sector Dijkstra or cross-sector HPA*). "?" only when pathfinder data is missing or the target is unreachable. Sell = price buyer pays you. *revenue shown (no buy price). cr/AP = net profit per AP.<br><span style="color:#5a5a3a;">(packaging) = D&gt;400 AP + buyer room&gt;200: 400 AP overhead doubles cargo to 400 for that trip (apCost = D+400). Finite 400-package stock not depleted across ranked routes.</span>';
+            body.appendChild(note);
+        }
+
+        function renderCustomExportsBody() {
+            body.innerHTML = '';
+
+            // Populate datalist with tracked commodity names (cheap; rebuild only if count changed)
+            const store0 = getTrackerStore();
+            const nameMap0 = buildExportNameToResIdMap(store0);
+            const trackedNames = Object.keys(nameMap0).sort();
+            if (expDatalist.childElementCount !== trackedNames.length) {
+                expDatalist.innerHTML = trackedNames.map(n => '<option value="' + n.charAt(0).toUpperCase() + n.slice(1) + '">').join('');
+            }
+
+            const opts = {
+                originMode: expOriginMode,
+                coordsStr: expCoordsInput.value.trim(),
+                sectorStr: expSectorInput.value.trim(),
+                itemName: expItemInput.value.trim(),
+                qty: expQtyInput.value.trim(),
+                buyOverride: parseInt(GM_getValue('config_export_buy_price', ''), 10)
+            };
+            const res = computeCustomExportRoutes(opts);
+
+            if (res.error) {
+                body.innerHTML = '<div style="color:#ff8866;padding:6px;text-align:center;">' + res.error + '</div>';
+                return;
+            }
+
+            // Summary
+            const originLabel = opts.originMode === 'current' ? 'Current position' : 'Coords';
+            let sumHtml = '<div style="margin-bottom:4px;">' +
+                '<span style="color:#88ccff;">Origin:</span> ' + originLabel +
+                ' <span style="color:#666;">[' + res.originCoords.x + ',' + res.originCoords.y + ']</span>' +
+                (res.originSector ? ' <span style="color:#666;">' + res.originSector + '</span>' : '') +
+                '</div>';
+            sumHtml += '<div style="color:#aaa;margin-bottom:4px;">' +
+                '<span style="color:#ffcc77;">' + res.itemName + '</span>' +
+                ' \u00b7 qty <span style="color:#88ccff;">' + res.qty + '</span>' +
+                ' \u00b7 buy <span style="color:#ffaa55;">' + (res.buyPrice != null ? fmtCr(res.buyPrice) : '?') + '</span>' +
+                (res.buySource ? ' <span style="color:#666;">(' + res.buySource + ')</span>' : '') +
+                '</div>';
+            if (res.usedFallback) {
+                sumHtml += '<div style="color:#8a6a3a;margin-bottom:4px;">\u26a0 No sector map data \u2014 AP unavailable (?). Load static_ext.txt.</div>';
+            }
+            const sumDiv = document.createElement('div');
+            sumDiv.innerHTML = sumHtml;
+            body.appendChild(sumDiv);
+
+            if (res.routes.length === 0) {
+                const empty = document.createElement('div');
+                empty.style.cssText = 'color:#888;text-align:center;padding:8px;';
+                empty.textContent = 'No buyers found for ' + res.itemName + '. Open more starbase/planet trade screens to capture them.';
+                body.appendChild(empty);
+                return;
+            }
+
+            body.appendChild(buildExportsRouteTable(res.routes));
+
+            const note = document.createElement('div');
+            note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
+            note.innerHTML = 'One-way export from the chosen origin. Click a destination name to auto-fly there. AP = travel (same-sector Dijkstra or cross-sector HPA* wormhole routing). "?" when pathfinder data is missing or target unreachable. Units capped by quantity, buyer room, and cargo capacity. (packaging) = D&gt;400 AP + buyer room&gt;200: 400 AP overhead doubles cargo for that trip.';
             body.appendChild(note);
         }
 
