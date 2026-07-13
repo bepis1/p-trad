@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.93
+// @version      6.94
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v6.94: Tracker Item Search — click a location name to auto-fly there (mirrors opps panel fly-target pattern), and hide zero-stock matches so only locations that actually carry the item are listed. Additive UI; no computation change (test_routing.js + test_opportunities.js green).
 // @description  v6.93: Add Trade Tracker "Item Search" tab (item-centric view sorted by AP distance, lazy distance compute on first search) and sector hover tooltips on Opportunities panel location names (tables + active run bar). Additive UI only; no route/opps computation change (test_routing.js + test_opportunities.js green).
 // @description  v6.92: Cut L2 deserialize ~976ms→~22ms — flat Int16Array dist/next matrices are now the primary in-memory macro graph representation (eliminates 1.2M Map.set calls from Map-of-Maps rebuild). Wire format unchanged (schema 2); route output byte-identical (test_routing.js green).
 // @description  v6.91: Fix ~5s F5 refresh lag — switch HPA* macro table serialization from Float32/Int32 (12.5 MB, over GM_setValue's ~10 MB limit) to Int16/Int16 (6.3 MB). Schema bumped to 2; -1 sentinel for unreachable pairs. Route output byte-identical (test_routing.js green).
 // @description  v6.90: Cut post-trade recalc cost — memoize location parsing (locOf cache) and replace JSON deep-clone of flat cargo map with shallow spread in optimizeFactoryRuns. No algorithm change; route output byte-identical (test_routing.js green).
-// @description  v6.89: Defer route recalc off critical path — nav paints first, itinerary updates after. Moves recalculateRouteOnTheFly into setTimeout(0) and injectNavHUD into the deferred panels block so the HUD reads the fresh route.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2177,6 +2177,20 @@ const SECTOR_DATA = {
         itemSearchResults.style.cssText = 'max-height:480px;overflow:auto;';
         itemSearchView.appendChild(itemSearchResults);
 
+        itemSearchResults.addEventListener('click', (ev) => {
+            const el = ev.target.closest('.tracker-item-fly');
+            if (!el) return;
+            const loc = parseInt(el.dataset.loc, 10);
+            if (!loc) return;
+            const sector = getSectorFromTileId(loc);
+            if (!sector) return;
+            const coords = getLocalCoordsFromTileId(loc, sector);
+            if (!coords) return;
+            try {
+                flyToCoords({ x: coords.x, y: coords.y, sector: sector }, el.textContent + ' ' + deriveDisplayCoords(loc));
+            } catch (err) { console.error('[pardus-tracker] fly error:', err); }
+        });
+
         function applyViewVisibility() {
             tabBar.style.display = collapsed ? 'none' : 'flex';
             const showLoc = !collapsed && activeTab === 'locations';
@@ -2228,6 +2242,7 @@ const SECTOR_DATA = {
                     const c = e.commodities[rid];
                     if (!c || !c.name) continue;
                     if (c.name.toLowerCase().indexOf(itemSearchTerm) === -1) continue;
+                    if (!(c.stock > 0)) continue;
                     matches.push({ entry: e, com: c });
                 }
             }
@@ -2288,7 +2303,7 @@ const SECTOR_DATA = {
                 tr.style.cssText = 'border-bottom:1px dashed #2a3a2a;color:#bbb;';
                 tr.innerHTML = '<td style="color:#ffcc77;">' + c.name + '</td>' +
                     '<td><span style="color:' + typeColor + ';">' + typeIcon + '</span> ' +
-                        '<span style="color:' + typeColor + ';">' + (e.name || '?') + '</span>' +
+                        '<span class="tracker-item-fly" data-loc="' + e.userloc + '" title="Click to fly here" style="color:' + typeColor + ';cursor:pointer;text-decoration:underline;">' + (e.name || '?') + '</span>' +
                         ' <span style="color:#666;">' + eCoords + '</span></td>' +
                     '<td style="color:#888;">' + eSector + '</td>' +
                     '<td style="text-align:right;">' + apTxt + '</td>' +
