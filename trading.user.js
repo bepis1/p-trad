@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.97
+// @version      6.98
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v6.98: Fix Tracker Item Search "avail" column — was still showing raw stock (v6.97 edit landed on wrong line). Also fix root cause: amount_min page var is not populated on planet/starbase trade pages, so c.min was always 0. Now captures min from the trade table DOM (3 cells before buy input). Re-visit locations to populate min (test_routing.js green).
 // @description  v6.97: Tracker Item Search "stk" column renamed to "avail" and now shows stock minus the location's sell minimum (max 0) — the quantity actually buyable, matching trackerProjectBuy. Additive UI; no computation change (test_routing.js green).
 // @description  v6.96: Wire cross-sector AP (HPA* macro wormhole router) into Exports and FWE tabs — cross-sector buyers/starbases previously showed "?" (and were skipped in FWE entirely). Unblocks the 400t packing feature for cross-sector destinations >400 AP away with >200 buyer room. Same-sector Dijkstra path unchanged (test_fwe.js + test_fwe_gate.js + test_cross_sector.js green).
 // @description  v6.95: Add Take-All gather mode — enter comma-separated item names, sim visits every producing building and buys all available stock, dumping non-protected cargo into the TO when the ship is too full for a complete pickup. New calculateTakeAllRoute function (same step shape); existing supply-chain engine untouched (test_routing.js green).
 // @description  v6.94: Tracker Item Search — click a location name to auto-fly there (mirrors opps panel fly-target pattern), and hide zero-stock matches so only locations that actually carry the item are listed. Additive UI; no computation change (test_routing.js + test_opportunities.js green).
-// @description  v6.93: Add Trade Tracker "Item Search" tab (item-centric view sorted by AP distance, lazy distance compute on first search) and sector hover tooltips on Opportunities panel location names (tables + active run bar). Additive UI only; no route/opps computation change (test_routing.js + test_opportunities.js green).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -1531,6 +1531,29 @@ const SECTOR_DATA = {
         }
         const capacity = isPlanet ? Infinity : (freeSpace + totalUsed);
 
+        // DOM-based min capture: amount_min page var is not populated on
+        // all trade screen types. Read min from the trade table directly.
+        // Column layout (buy rows): [..][Min][Max][Price][input] — Min is
+        // always 3 cells before the buy input cell, regardless of whether
+        // a Balance column exists (building vs planet/starbase).
+        const tradeForm = document.querySelector(
+            'form[name="building_trade"], form[name="planet_trade"], form[name="starbase_trade"]'
+        );
+        if (tradeForm) {
+            const buyInputs = tradeForm.querySelectorAll('input[name^="buy_"]');
+            for (const inp of buyInputs) {
+                const rid = inp.name.substring(4);
+                if (!commodities[rid]) continue;
+                const row = inp.closest('tr');
+                if (!row) continue;
+                const cells = Array.from(row.querySelectorAll('td'));
+                const inputIdx = cells.indexOf(inp.closest('td'));
+                if (inputIdx < 3) continue;
+                let minVal = parseInt(cells[inputIdx - 3].textContent.replace(/[^\d]/g, ''), 10);
+                if (!isNaN(minVal) && minVal >= 0) commodities[rid].min = minVal;
+            }
+        }
+
         const entry = {
             userloc: userloc,
             type: objType,
@@ -2002,7 +2025,7 @@ const SECTOR_DATA = {
                     const tr = document.createElement('tr');
                     tr.style.cssText = 'color:#bbb;';
                     tr.innerHTML = '<td>' + c.name + '</td>' +
-                    '<td style="text-align:right;">' + Math.max(0, c.stock - (c.min || 0)) + '</td>' +
+                    '<td style="text-align:right;">' + c.stock + '</td>' +
                         '<td style="text-align:right;">' + c.min + '</td>' +
                         '<td style="text-align:right;">' + c.max + '</td>' +
                         '<td style="text-align:right;color:#88ccff;">' + room + '</td>' +
@@ -2329,7 +2352,7 @@ const SECTOR_DATA = {
                         ' <span style="color:#666;">' + eCoords + '</span></td>' +
                     '<td style="color:#888;">' + eSector + '</td>' +
                     '<td style="text-align:right;">' + apTxt + '</td>' +
-                    '<td style="text-align:right;">' + c.stock + '</td>' +
+                    '<td style="text-align:right;">' + Math.max(0, c.stock - (c.min || 0)) + '</td>' +
                     '<td style="text-align:right;color:#ffaa55;">' + c.buyFromObjPrice + '</td>' +
                     '<td style="text-align:right;color:#88cc88;">' + c.sellToObjPrice + '</td>';
                 t.appendChild(tr);
