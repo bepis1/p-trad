@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.95
+// @version      6.96
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v6.96: Wire cross-sector AP (HPA* macro wormhole router) into Exports and FWE tabs — cross-sector buyers/starbases previously showed "?" (and were skipped in FWE entirely). Unblocks the 400t packing feature for cross-sector destinations >400 AP away with >200 buyer room. Same-sector Dijkstra path unchanged (test_fwe.js + test_fwe_gate.js + test_cross_sector.js green).
 // @description  v6.95: Add Take-All gather mode — enter comma-separated item names, sim visits every producing building and buys all available stock, dumping non-protected cargo into the TO when the ship is too full for a complete pickup. New calculateTakeAllRoute function (same step shape); existing supply-chain engine untouched (test_routing.js green).
 // @description  v6.94: Tracker Item Search — click a location name to auto-fly there (mirrors opps panel fly-target pattern), and hide zero-stock matches so only locations that actually carry the item are listed. Additive UI; no computation change (test_routing.js + test_opportunities.js green).
 // @description  v6.93: Add Trade Tracker "Item Search" tab (item-centric view sorted by AP distance, lazy distance compute on first search) and sector hover tooltips on Opportunities panel location names (tables + active run bar). Additive UI only; no route/opps computation change (test_routing.js + test_opportunities.js green).
 // @description  v6.92: Cut L2 deserialize ~976ms→~22ms — flat Int16Array dist/next matrices are now the primary in-memory macro graph representation (eliminates 1.2M Map.set calls from Map-of-Maps rebuild). Wire format unchanged (schema 2); route output byte-identical (test_routing.js green).
-// @description  v6.91: Fix ~5s F5 refresh lag — switch HPA* macro table serialization from Float32/Int32 (12.5 MB, over GM_setValue's ~10 MB limit) to Int16/Int16 (6.3 MB). Schema bumped to 2; -1 sentinel for unreachable pairs. Route output byte-identical (test_routing.js green).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2813,13 +2813,18 @@ const SECTOR_DATA = {
 
                 const sameSector = !!(eSector && toSector && eSector === toSector);
 
-                // AP from TO: exact Dijkstra for same-sector; null when unknown
-                // (cross-sector, no map data, or unreachable — NO estimate;
-                // clicking still flies via wormholes).
+                // AP from TO: exact same-sector Dijkstra, or wormhole-aware
+                // HPA* routing for cross-sector buyers (same pathfinder the
+                // Opportunities tab uses). Unknown/unreachable → null → "?"
+                // display (no estimates, per AGENTS.md hard-fail policy).
                 let D = null;
                 if (sameSector && toDijkstra) {
                     const key = eCoords.x + ',' + eCoords.y;
                     D = (toDijkstra[key] !== undefined) ? toDijkstra[key] : null;
+                } else if (!sameSector && eSector && toSector) {
+                    try {
+                        D = getCrossSectorAPFast(toCoords, toSector, eCoords, eSector, null, null);
+                    } catch (e) { D = null; }
                 }
 
                 // Packaging: spend PACK_AP (400) to double cargo capacity for one
@@ -2966,10 +2971,10 @@ const SECTOR_DATA = {
         const routes = [];
         // Diagnostic: track why each tracked starbase was rejected so the
         // empty-state message can explain itself instead of being a dead end.
-        // The first export tab does NOT filter by sector (it lists cross-sector
-        // buyers with "?" AP), but this FWE tab only lists same-sector-as-hub
-        // starbases — so a starbase visible in the exports tab can legitimately
-        // be absent here. The breakdown below makes that distinction visible.
+        // The exports tab lists cross-sector buyers too (with HPA* AP); this
+        // FWE tab also includes cross-sector starbases (routed via HPA*), so
+        // the only starbases that land in crossSector here are truly
+        // unresolved tiles (no coords extractable from the tile ID).
         const stats = {
             totalStarbases: 0,
             notStarbase: 0,
@@ -3016,12 +3021,10 @@ const SECTOR_DATA = {
             const sbSector = rc.sector;
             const sbCoords = rc.coords;
 
-            // Only same-sector starbases (pathfinder can't route cross-sector).
-            if (!hubSector || sbSector !== hubSector) {
-                stats.crossSector.push((sb.name || '?') +
-                    ' [in ' + (sbSector || '?') + ', hub in ' + (hubSector || '?') + ']');
-                continue;
-            }
+            // Cross-sector starbases are routed via HPA* (same pathfinder as
+            // the exports tab and Opportunities tab). Unresolved sector/coords
+            // still rejected above; unreachable targets → null AP → "?".
+            const sameSectorFwe = !!(sbSector && hubSector && sbSector === hubSector);
 
             // Actual food qty = min(hub can sell, starbase can buy).
             const hubFoodProj = trackerProjectBuy(hubEntry, foodId, desiredFood);
@@ -3079,14 +3082,18 @@ const SECTOR_DATA = {
                           + (energySell ? energySell.totalRevenue : 0);
             const profit = revenue - cost;
 
-            // Round-trip travel AP (hub -> starbase -> hub). Dijkstra only —
-            // when the distance is unknown (no map data / unreachable) AP and
-            // ratio stay null (rendered '?') instead of an estimated guess.
+            // Round-trip travel AP (hub -> starbase -> hub). Same-sector via
+            // Dijkstra; cross-sector via HPA* wormhole routing. Unknown → null
+            // → '?' (no estimates, per AGENTS.md).
             let oneWayAp = null;
-            if (hubDijkstra) {
+            if (sameSectorFwe && hubDijkstra) {
                 const key = sbCoords.x + ',' + sbCoords.y;
                 const d = (hubDijkstra[key] !== undefined) ? hubDijkstra[key] : null;
                 if (d != null) oneWayAp = d;
+            } else if (!sameSectorFwe && sbSector && hubSector) {
+                try {
+                    oneWayAp = getCrossSectorAPFast(hubCoords, hubSector, sbCoords, sbSector, null, null);
+                } catch (e) { oneWayAp = null; }
             }
             const apCost = (oneWayAp != null) ? (oneWayAp * 2 + TRADE_AP) : null;
             const ratio = (apCost != null && apCost > 0) ? profit / apCost : null;
@@ -3889,7 +3896,7 @@ const SECTOR_DATA = {
 
             const note = document.createElement('div');
             note.style.cssText = 'color:#5a5a3a;font-size:8px;margin-top:4px;';
-            note.innerHTML = 'Click a destination name to auto-fly there. Cross-sector flights use wormhole routing. One-way AP from TO via pathfinder. Cross-sector AP = ? (not computed for display). Sell = price buyer pays you. *revenue shown (no buy price). cr/AP = net profit per AP.<br><span style="color:#5a5a3a;">(packaging) = D&gt;400 AP + buyer room&gt;200: 400 AP overhead doubles cargo to 400 for that trip (apCost = D+400). Finite 400-package stock not depleted across ranked routes.</span>';
+            note.innerHTML = 'Click a destination name to auto-fly there. Cross-sector flights use wormhole routing. One-way AP from TO via pathfinder (same-sector Dijkstra or cross-sector HPA*). "?" only when pathfinder data is missing or the target is unreachable. Sell = price buyer pays you. *revenue shown (no buy price). cr/AP = net profit per AP.<br><span style="color:#5a5a3a;">(packaging) = D&gt;400 AP + buyer room&gt;200: 400 AP overhead doubles cargo to 400 for that trip (apCost = D+400). Finite 400-package stock not depleted across ranked routes.</span>';
             body.appendChild(note);
         }
 
@@ -3929,8 +3936,8 @@ const SECTOR_DATA = {
                     lines.push('No starbases captured yet \u2014 open starbase trade screens (starbase_trade.php) to capture them.');
                 } else {
                     if (st.crossSector && st.crossSector.length) {
-                        lines.push('Cross-sector / unresolved (' + st.crossSector.length + '): ' + st.crossSector.join(', ') +
-                            '\n  (the Exports tab lists these too \u2014 it does NOT filter by sector, unlike FWE)');
+                        lines.push('Unresolved tiles (' + st.crossSector.length + '): ' + st.crossSector.join(', ') +
+                            '\n  (tile IDs that couldn\'t be mapped to sector/coords — re-open the starbase trade screen to capture them)');
                     }
                     if (st.missingCommodity && st.missingCommodity.length) {
                         lines.push('Missing F/W/E data (' + st.missingCommodity.length + '): ' + st.missingCommodity.join(', ') +
