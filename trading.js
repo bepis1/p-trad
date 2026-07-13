@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.00
+// @version      7.01
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v7.01: Live terrain scraping overlay — scrape real terrain from the #navarea HTML on every nav page load, accumulate in GM_setValue, and overlay it on the static_ext grid in hpaParseMap (ground truth wins over static_ext, including padded 'b' rows). Fixes the Ras Elased [27,39] starbase unreachability; static_ext row mismatches self-correct as the player explores. Macro graph cache auto-invalidates on new terrain discovery (terrainVersion in cache key). HPA* functions stay pure (liveTerrain passed as a parameter) (ADR 009; test_terrain_overlay.js + test_routing.js green).
 // @description  v7.00: Wire cross-sector AP (HPA* wormhole router) into the Trade Tracker panel — cross-sector tracked locations previously showed "?" for AP distance. Now calls getCrossSectorAPFast, matching the exports/FWE/opportunities tabs (ADR 008). Same-sector Dijkstra path unchanged (test_cross_sector.js + test_pathfinder_facade.js green).
 // @description  v6.99: Tracker Item Search filter now matches the displayed "avail" column (stock minus min) instead of raw stock — entries showing 0 avail are hidden, fixing the case where stock was positive but at/below the location's keep threshold.
 // @description  v6.98: Fix Tracker Item Search "avail" column — was still showing raw stock (v6.97 edit landed on wrong line). Also fix root cause: amount_min page var is not populated on planet/starbase trade pages, so c.min was always 0. Now captures min from the trade table DOM (3 cells before buy input). Re-visit locations to populate min (test_routing.js green).
 // @description  v6.97: Tracker Item Search "stk" column renamed to "avail" and now shows stock minus the location's sell minimum (max 0) — the quantity actually buyable, matching trackerProjectBuy. Additive UI; no computation change (test_routing.js green).
-// @description  v6.96: Wire cross-sector AP (HPA* macro wormhole router) into Exports and FWE tabs — cross-sector buyers/starbases previously showed "?" (and were skipped in FWE entirely). Unblocks the 400t packing feature for cross-sector destinations >400 AP away with >200 buyer room. Same-sector Dijkstra path unchanged (test_fwe.js + test_fwe_gate.js + test_cross_sector.js green).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -4887,6 +4887,25 @@ const SECTOR_DATA = {
         return null;
     }
 
+    // >> Canonical NAME resolver — returns the canonical SECTOR_DATA key STRING
+    // (e.g. "Betelgeuse" for the fragment "Betelgeuse East"), or null. Unlike
+    // hpaResolveSectorName() above — which returns the data ENTRY object
+    // ({start,cols,rows}) — this returns the NAME so callers can key external
+    // maps whose keys are canonical sector-name strings (e.g. the live-terrain
+    // store populated by scrapeAndStoreTerrain in part 15). Pure: takes
+    // sectorMeta as an argument, no closure over IIFE globals.
+    function hpaResolveSectorNameKey(name, sectorMeta) {
+        if (!name || !sectorMeta) return null;
+        if (sectorMeta[name]) return name;
+        const parent = name.replace(/ (East|West|North|South|Inner|NE|SE|NW|SW)$/, '');
+        if (parent !== name && sectorMeta[parent]) return parent;
+        const spaced = name.replace(/^([A-Za-z.-]+)(\d)/, '$1 $2');
+        if (spaced !== name && sectorMeta[spaced]) return spaced;
+        const parentSpaced = parent.replace(/^([A-Za-z.-]+)(\d)/, '$1 $2');
+        if (parentSpaced !== parent && sectorMeta[parentSpaced]) return parentSpaced;
+        return null;
+    }
+
     // >> Fragment resolver — given a canonical sector name + (x,y), find which
     // parsed fragment actually contains that tile (non-'b'). This is the key
     // to handling Betelgeuse: "Betelgeuse" + (5,10) → "Betelgeuse West",
@@ -4929,7 +4948,7 @@ const SECTOR_DATA = {
     // >> Parser — parse static_ext.txt into separate sector fragments.
     // NO merging. Each `sector Name:cols,rows` block becomes one entry in
     // the returned Map. Grids are padded to SECTOR_DATA dimensions with 'b'.
-    function hpaParseMap(rawText, sectorMeta) {
+    function hpaParseMap(rawText, sectorMeta, liveTerrain) {
         const sectors = new Map();
         const lines = rawText.split(/[\r\n]+/);
         let cur = null;
@@ -4982,6 +5001,30 @@ const SECTOR_DATA = {
             while (sec.grid.length < tRows) sec.grid.push(new Array(tCols).fill('b'));
             for (const row of sec.grid) {
                 while (row.length < tCols) row.push('b');
+            }
+        }
+
+        // >> Live-terrain overlay — runs AFTER padding so live tiles overwrite
+        // padded 'b' rows (e.g. Ras Elased y=38,39), and BEFORE return. Live
+        // terrain is ground truth and always wins over static_ext values.
+        // Passed in from hpaGetTable() (the IIFE bridge) to keep hpaParseMap
+        // pure — no GM_* here. Keys are canonical sector-name strings, resolved
+        // via hpaResolveSectorNameKey so fragment names (e.g. "Betelgeuse
+        // East") match their canonical store key ("Betelgeuse").
+        if (liveTerrain) {
+            for (const [name, sec] of sectors) {
+                if (sec.grid.length === 0) continue;
+                const canonical = hpaResolveSectorNameKey(name, sectorMeta);
+                if (!canonical) continue;
+                const live = liveTerrain[canonical];
+                if (!live) continue;
+                for (const [key, char] of Object.entries(live)) {
+                    const parts = key.split(',');
+                    const x = +parts[0], y = +parts[1];
+                    if (y >= 0 && y < sec.grid.length && x >= 0 && x < sec.grid[0].length) {
+                        sec.grid[y][x] = char;
+                    }
+                }
             }
         }
 
@@ -5230,8 +5273,8 @@ const SECTOR_DATA = {
     // >> Compile — one-time build. Pure function (no IIFE globals).
     // Called synchronously by hpaGetTable() on first query.
     // Returns a table with Map/Set (structured-clone safe if ever offloaded).
-    function hpaCompile(rawText, sectorMeta, terrainAP, wjump, sealed) {
-        const sectors = hpaParseMap(rawText, sectorMeta);
+    function hpaCompile(rawText, sectorMeta, terrainAP, wjump, sealed, liveTerrain) {
+        const sectors = hpaParseMap(rawText, sectorMeta, liveTerrain);
         const macro = hpaBuildMacroGraph(sectors, terrainAP, wjump || 10, sealed || new Set());
         return { sectors, macro, terrainAP, wjump: wjump || 10, dijCache: new Map() };
     }
@@ -5299,7 +5342,7 @@ const SECTOR_DATA = {
     // terrainAP is passed in (not deserialized) because JSON.stringify
     // converts Infinity → null, which would make impassable tiles passable.
     // Returns null when schema or cacheKey doesn't match.
-    function hpaDeserializeTable(storedJson, expectedKey, rawText, sectorMeta, terrainAP) {
+    function hpaDeserializeTable(storedJson, expectedKey, rawText, sectorMeta, terrainAP, liveTerrain) {
         const stored = JSON.parse(storedJson);
         if (stored.schema !== HPA_MACRO_SCHEMA) return null;
         if (stored.key !== expectedKey) return null;
@@ -5327,7 +5370,7 @@ const SECTOR_DATA = {
             }
         }
 
-        const sectors = hpaParseMap(rawText, sectorMeta);
+        const sectors = hpaParseMap(rawText, sectorMeta, liveTerrain);
 
         return {
             sectors: sectors,
@@ -5561,13 +5604,18 @@ const SECTOR_DATA = {
         try {
             const rawText = localStorage.getItem("pardus_static_map_data");
             if (!rawText || rawText.includes("PASTE_YOUR_STATICXT_TXT_HERE")) return null;
+            // Live terrain scraped from nav pages (part 15). Ground truth over
+            // static_ext; version increments only when a NEW tile is discovered,
+            // which invalidates the macro-graph cache via the cache key below.
+            const liveTerrain = GM_getValue('pardus_terrain_v1', {});
+            const terrainVersion = GM_getValue('pardus_terrain_version', 0);
             const terrainAP = getTerrainAP();
             const shipOpt = getShipOptions();
             const wjump = Number(shipOpt.wormhole_cost) || 10;
             let sealed;
             try { sealed = getWormholeSeals(); } catch (e) { sealed = new Set(); }
             const key = JSON.stringify(terrainAP) + '|' + wjump + '|' + [...sealed].sort().join(',')
-                        + '|' + rawText.length + '|' + HPA_MACRO_SCHEMA;
+                        + '|' + rawText.length + '|' + HPA_MACRO_SCHEMA + '|' + terrainVersion;
             if (_hpaTableKey === key && _hpaTable) return _hpaTable;
 
             // L1: top-window cache. The frameset (top) survives main-frame
@@ -5588,7 +5636,7 @@ const SECTOR_DATA = {
             console.log('[hpa] L2: ' + (storedJson ? (storedJson.length / 1024 / 1024).toFixed(1) + ' MB retrieved' : 'null (no persisted data)'));
             if (storedJson) {
                 try {
-                    const table = hpaDeserializeTable(storedJson, key, rawText, SECTOR_DATA, terrainAP);
+                    const table = hpaDeserializeTable(storedJson, key, rawText, SECTOR_DATA, terrainAP, liveTerrain);
                     if (table && table.macro.nodeCount > 0) {
                         console.log('[hpa] L2: deserialize OK (nodeCount=' + table.macro.nodeCount + ')');
                         _hpaTable = table;
@@ -5607,7 +5655,7 @@ const SECTOR_DATA = {
 
             // Full compile (first load or cache miss).
             console.log('[hpa] L3: full compile (L2 miss)');
-            _hpaTable = hpaCompile(rawText, SECTOR_DATA, terrainAP, wjump, sealed);
+            _hpaTable = hpaCompile(rawText, SECTOR_DATA, terrainAP, wjump, sealed, liveTerrain);
             _hpaTableKey = key;
             try {
                 top.__hpaTable = _hpaTable;
@@ -5716,6 +5764,112 @@ const SECTOR_DATA = {
     // so east (dx=+1) = +rows, north (dy=-1) = -1.
 
     const NAV_MAX_FIELD = 98;
+
+    // >> Live terrain scraper — decode terrain types from the #navarea HTML.
+    // The nav page fully exposes terrain via image filename prefixes:
+    //   navClear cells                 -> terrain in the inner <img> src
+    //                                    (.../backgrounds/<prefix><n>.png)
+    //   navBuilding/navNpc/navPlanet   -> terrain in the <td> inline style
+    //                                    background-image:url(...) (the inner
+    //                                    <img> is the FOREGROUND icon, not terrain)
+    //   navImpassable                  -> 'b' (blocked)
+    // static_ext.txt is user-maintained and proven unreliable: e.g. Ras Elased
+    // declares 38 terrain rows but SECTOR_DATA says 40, so the 2 missing rows
+    // pad with 'b' and make any destination there permanently unreachable (the
+    // starbase at [27,39]). Live terrain is ground truth and always wins over
+    // static_ext (including padded 'b'). Accumulated into GM_setValue and
+    // overlaid in hpaParseMap(). See ADR 009.
+    const TERRAIN_PREFIX_MAP = {
+        'space': 'f', 'nebula': 'g', 'energy': 'e', 'asteroids': 'o',
+        'viral_cloud': 'v', 'exotic_matter': 'm'
+    };
+
+    // >> Read the 9x11 nav grid, decode terrain, return
+    // { sector: canonicalName, tiles: { "x,y": char } } or null when not on a
+    // nav page / unknown sector. Pure w.r.t. the DOM (no GM_* side effects);
+    // scrapeAndStoreTerrain() handles persistence.
+    function scrapeNavTerrain() {
+        const navarea = document.getElementById('navarea');
+        if (!navarea) return null;                      // not on the nav page
+        const sectorEl = document.getElementById('sector');
+        const sectorName = sectorEl ? sectorEl.textContent.trim() : null;
+        if (!sectorName) return null;
+        const canonical = _resolveSectorName(sectorName);
+        if (!canonical) return null;                    // unknown sector
+        const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+        const uloc = w.userloc;
+        if (uloc === undefined || uloc === null) return null;
+        const player = getLocalCoordsFromTileId(uloc, canonical);
+        if (!player) return null;
+        const playerX = player.x, playerY = player.y;
+        const sd = getSectorData(canonical);
+        if (!sd) return null;
+        const navSizeHor = w.navSizeHor || 11;
+        const navSizeVer = w.navSizeVer || 9;
+        const centerCol = Math.floor(navSizeHor / 2);
+        const centerRow = Math.floor(navSizeVer / 2);
+        const tiles = {};
+        const count = navSizeHor * navSizeVer;
+        for (let n = 0; n < count; n++) {
+            const td = document.getElementById('tdNavField' + n);
+            if (!td) continue;
+            const col = n % navSizeHor;
+            const row = Math.floor(n / navSizeHor);
+            const absX = playerX + (col - centerCol);
+            const absY = playerY + (row - centerRow);
+            // Skip tiles outside sector bounds.
+            if (absX < 0 || absY < 0 || absX >= sd.cols || absY >= sd.rows) continue;
+
+            let char = null;
+            if (td.classList.contains('navImpassable')) {
+                char = 'b';
+            } else {
+                // Terrain image: <td> inline background-image (navBuilding/
+                // navNpc/navPlanet) or inner <img> src (navClear).
+                let url = null;
+                const style = td.getAttribute('style') || '';
+                const sm = style.match(/background-image:\s*url\(["']?([^"')]+)["']?\)/);
+                if (sm) {
+                    url = sm[1];
+                } else {
+                    const img = td.querySelector('img');
+                    if (img) url = img.getAttribute('src') || '';
+                }
+                if (url) {
+                    const fname = url.substring(url.lastIndexOf('/') + 1).replace(/\.png$/i, '');
+                    const pm = fname.match(/^([a-z_]+?)(\d+|max)$/);
+                    if (pm) char = TERRAIN_PREFIX_MAP[pm[1]] || null;
+                }
+            }
+            // Unknown terrain prefixes are skipped (never stored) — hard-fail
+            // policy: no guesses for tiles we can't decode.
+            if (char !== null) tiles[absX + ',' + absY] = char;
+        }
+        return { sector: canonical, tiles };
+    }
+
+    // >> IIFE-bridge: scrape + merge into the GM terrain store. Increments the
+    // terrain version ONLY when a tile is newly discovered or changes value —
+    // confirming already-known terrain does not trigger a macro-graph recompile.
+    // Called synchronously from the dispatcher on /main.php (part 20).
+    function scrapeAndStoreTerrain() {
+        const result = scrapeNavTerrain();
+        if (!result) return;
+        const store = GM_getValue('pardus_terrain_v1', {});
+        if (!store[result.sector]) store[result.sector] = {};
+        let changed = false;
+        for (const [key, char] of Object.entries(result.tiles)) {
+            if (store[result.sector][key] !== char) {
+                store[result.sector][key] = char;
+                changed = true;
+            }
+        }
+        if (changed) {
+            GM_setValue('pardus_terrain_v1', store);
+            GM_setValue('pardus_terrain_version', GM_getValue('pardus_terrain_version', 0) + 1);
+            console.log('[terrain] ' + result.sector + ': stored ' + Object.keys(result.tiles).length + ' tiles, version now ' + GM_getValue('pardus_terrain_version', 0));
+        }
+    }
 
     function scanNavForMonsters() {
         const monsters = new Set();
@@ -8995,6 +9149,12 @@ const SECTOR_DATA = {
 
     if (currentPath === '/main.php') {
         syncCargoFromNav();
+        // Scrape live terrain from #navarea BEFORE the deferred UI injection
+        // (below) calls hpaGetTable() — so the terrain store is up to date
+        // before any panel reads it. try/catch: a scrape failure must never
+        // break the rest of the script. See ADR 009.
+        try { scrapeAndStoreTerrain(); }
+        catch (e) { console.error('[terrain] scrape failed:', e); }
     } else if (currentPath === '/overview_buildings.php') {
         initBookkeeperParser();
     }
