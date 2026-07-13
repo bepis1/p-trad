@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.90
+// @version      6.91
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v6.91: Fix ~5s F5 refresh lag — switch HPA* macro table serialization from Float32/Int32 (12.5 MB, over GM_setValue's ~10 MB limit) to Int16/Int16 (6.3 MB). Schema bumped to 2; -1 sentinel for unreachable pairs. Route output byte-identical (test_routing.js green).
 // @description  v6.90: Cut post-trade recalc cost — memoize location parsing (locOf cache) and replace JSON deep-clone of flat cargo map with shallow spread in optimizeFactoryRuns. No algorithm change; route output byte-identical (test_routing.js green).
 // @description  v6.89: Defer route recalc off critical path — nav paints first, itinerary updates after. Moves recalculateRouteOnTheFly into setTimeout(0) and injectNavHUD into the deferred panels block so the HUD reads the fresh route.
 // @description  v6.88: Eliminate page-load lag — L1 top-window cache for HPA* table (skips GM deserialize on refresh), deferred UI injection via setTimeout(0), targeted DOM queries instead of body.innerText reflow.
-// @description  v6.86: Enforce hard-fail policy in simTravelAP/simCrossTravelAP/getCrossSectorAPFast — null coords and unknown sectors now throw instead of returning 0/Infinity/null. hpaGetTable logs compile errors. Added pathfinder facade test suite with bug-museum regressions and golden-master snapshot.
 // @description  v6.87: Persist HPA* macro graph across page loads via GM_setValue — eliminates ~5s Dijkstra+Floyd-Warshall recompile on every navigation. Compact typed-array format (Float32Array/Int32Array + base64). Cache key includes terrainAP, wjump, sealed, rawText.length, and schema version for auto-invalidation.
 // @author       You
 // @match        https://*.pardus.at/main.php*
@@ -4999,7 +4999,7 @@ const SECTOR_DATA = {
     }
 
     // >> Persistence schema version — bump when serialize format changes.
-    const HPA_MACRO_SCHEMA = 1;
+    const HPA_MACRO_SCHEMA = 2;
 
     // >> Base64 helpers for typed array serialization (chunked to avoid
     // call-stack limits on large arrays).
@@ -5020,16 +5020,16 @@ const SECTOR_DATA = {
     }
 
     // >> Serialize the HPA* table to a JSON string for GM_setValue.
-    // Converts Map-based dist/next to flat Float32Array/Int32Array (base64),
-    // reducing ~62 MB of JSON-with-string-keys to ~13 MB.
+    // Converts Map-based dist/next to flat Int16Array (base64, -1 = unreachable),
+    // ~6 MB — under GM_setValue's practical ~10 MB storage limit.
     function hpaSerializeTable(table, cacheKey) {
         const n = table.macro.nodeCount;
         const nodes = table.macro.nodes;
         const keyToIdx = new Map();
         nodes.forEach((nd, i) => keyToIdx.set(nd.key, i));
 
-        const distFlat = new Float32Array(n * n);
-        const nextFlat = new Int32Array(n * n);
+        const distFlat = new Int16Array(n * n);
+        const nextFlat = new Int16Array(n * n);
         for (let i = 0; i < n; i++) {
             const dm = table.macro.distMap.get(nodes[i].key);
             const nm = table.macro.nextMap.get(nodes[i].key);
@@ -5039,11 +5039,11 @@ const SECTOR_DATA = {
                     nextFlat[i * n + j] = j;
                 } else if (dm) {
                     const d = dm.get(nodes[j].key);
-                    distFlat[i * n + j] = (d !== undefined) ? d : Infinity;
+                    distFlat[i * n + j] = (d !== undefined && isFinite(d)) ? d : -1;
                     const nx = nm ? nm.get(nodes[j].key) : null;
                     nextFlat[i * n + j] = (nx != null) ? (keyToIdx.has(nx) ? keyToIdx.get(nx) : -1) : -1;
                 } else {
-                    distFlat[i * n + j] = Infinity;
+                    distFlat[i * n + j] = -1;
                     nextFlat[i * n + j] = -1;
                 }
             }
@@ -5091,8 +5091,8 @@ const SECTOR_DATA = {
 
         const distBytes = hpaBase64ToBytes(stored.dist);
         const nextBytes = hpaBase64ToBytes(stored.next);
-        const distFlat = new Float32Array(distBytes.buffer);
-        const nextFlat = new Int32Array(nextBytes.buffer);
+        const distFlat = new Int16Array(distBytes.buffer);
+        const nextFlat = new Int16Array(nextBytes.buffer);
 
         const distMap = new Map();
         const nextMap = new Map();
@@ -5101,7 +5101,7 @@ const SECTOR_DATA = {
             const dm = new Map();
             const nm = new Map();
             for (let j = 0; j < n; j++) {
-                if (i !== j && isFinite(distFlat[i * n + j])) {
+                if (i !== j && distFlat[i * n + j] >= 0) {
                     dm.set(nodes[j].key, distFlat[i * n + j]);
                     const nextIdx = nextFlat[i * n + j];
                     if (nextIdx >= 0 && nextIdx < n) {
@@ -5372,10 +5372,12 @@ const SECTOR_DATA = {
 
             // Try persistent cache (GM_setValue from a previous page load).
             const storedJson = GM_getValue('pardus_hpa_macro_v1', null);
+            console.log('[hpa] L2: ' + (storedJson ? (storedJson.length / 1024 / 1024).toFixed(1) + ' MB retrieved' : 'null (no persisted data)'));
             if (storedJson) {
                 try {
                     const table = hpaDeserializeTable(storedJson, key, rawText, SECTOR_DATA, terrainAP);
                     if (table && table.macro.nodeCount > 0) {
+                        console.log('[hpa] L2: deserialize OK (nodeCount=' + table.macro.nodeCount + ')');
                         _hpaTable = table;
                         _hpaTableKey = key;
                         try {
@@ -5386,11 +5388,12 @@ const SECTOR_DATA = {
                         return table;
                     }
                 } catch (e) {
-                    console.warn('hpaGetTable: deserialize failed, recompiling:', e.message);
+                    console.warn('[hpa] L2: deserialize failed:', e.message);
                 }
             }
 
             // Full compile (first load or cache miss).
+            console.log('[hpa] L3: full compile (L2 miss)');
             _hpaTable = hpaCompile(rawText, SECTOR_DATA, terrainAP, wjump, sealed);
             _hpaTableKey = key;
             try {
@@ -5402,9 +5405,11 @@ const SECTOR_DATA = {
             // Persist for next page load (non-fatal if quota exceeded).
             try {
                 const serialized = hpaSerializeTable(_hpaTable, key);
+                console.log('[hpa] L2: persisting ' + (serialized.length / 1024 / 1024).toFixed(1) + ' MB');
                 GM_setValue('pardus_hpa_macro_v1', serialized);
+                console.log('[hpa] L2: persist OK');
             } catch (e) {
-                console.warn('hpaGetTable: persist failed (non-fatal):', e.message);
+                console.warn('[hpa] L2: persist FAILED:', e.message);
             }
 
             return _hpaTable;
