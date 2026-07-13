@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.92
+// @version      6.93
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v6.93: Add Trade Tracker "Item Search" tab (item-centric view sorted by AP distance, lazy distance compute on first search) and sector hover tooltips on Opportunities panel location names (tables + active run bar). Additive UI only; no route/opps computation change (test_routing.js + test_opportunities.js green).
 // @description  v6.92: Cut L2 deserialize ~976ms→~22ms — flat Int16Array dist/next matrices are now the primary in-memory macro graph representation (eliminates 1.2M Map.set calls from Map-of-Maps rebuild). Wire format unchanged (schema 2); route output byte-identical (test_routing.js green).
 // @description  v6.91: Fix ~5s F5 refresh lag — switch HPA* macro table serialization from Float32/Int32 (12.5 MB, over GM_setValue's ~10 MB limit) to Int16/Int16 (6.3 MB). Schema bumped to 2; -1 sentinel for unreachable pairs. Route output byte-identical (test_routing.js green).
 // @description  v6.90: Cut post-trade recalc cost — memoize location parsing (locOf cache) and replace JSON deep-clone of flat cargo map with shallow spread in optimizeFactoryRuns. No algorithm change; route output byte-identical (test_routing.js green).
 // @description  v6.89: Defer route recalc off critical path — nav paints first, itinerary updates after. Moves recalculateRouteOnTheFly into setTimeout(0) and injectNavHUD into the deferred panels block so the HUD reads the fresh route.
-// @description  v6.88: Eliminate page-load lag — L1 top-window cache for HPA* table (skips GM deserialize on refresh), deferred UI injection via setTimeout(0), targeted DOM queries instead of body.innerText reflow.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2082,9 +2082,7 @@ const SECTOR_DATA = {
                 GM_setValue('pardus_tracker_ui_pos', { top: wrap.style.top, left: wrap.style.left });
             } else {
                 collapsed = !collapsed;
-                body.style.display = collapsed ? 'none' : 'block';
-                filterBar.style.display = collapsed ? 'none' : 'block';
-                controls.style.display = collapsed ? 'none' : 'flex';
+                applyViewVisibility();
             }
         });
 
@@ -2138,7 +2136,172 @@ const SECTOR_DATA = {
         controls.appendChild(clearBtn);
         wrap.appendChild(controls);
 
+        // >> Tab bar: Locations | Item Search
+        let activeTab = 'locations';
+        const tabBar = document.createElement('div');
+        tabBar.style.cssText = 'display:flex;border-bottom:1px solid #2a5a2a;';
+        wrap.insertBefore(tabBar, filterBar);
+
+        function makeTrackerTabBtn(label, tabId) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = label;
+            btn.dataset.tab = tabId;
+            btn.style.cssText = 'flex:1;cursor:pointer;font-size:10px;padding:4px 8px;border:none;border-bottom:2px solid transparent;background:#0a1a0a;color:#5a8a5a;';
+            btn.addEventListener('click', () => switchTab(tabId));
+            return btn;
+        }
+        const locTabBtn = makeTrackerTabBtn('Locations', 'locations');
+        const itemTabBtn = makeTrackerTabBtn('Item Search', 'itemsearch');
+        tabBar.appendChild(locTabBtn);
+        tabBar.appendChild(itemTabBtn);
+
+        // >> Item Search view
+        const itemSearchView = document.createElement('div');
+        itemSearchView.style.cssText = 'padding:4px 7px;display:none;';
+        wrap.insertBefore(itemSearchView, body);
+
+        const itemSearchInput = document.createElement('input');
+        itemSearchInput.type = 'text';
+        itemSearchInput.placeholder = 'search item name...';
+        itemSearchInput.style.cssText = 'width:100%;box-sizing:border-box;background:#001a00;color:#88ff88;border:1px solid #2a5a2a;font-size:9px;padding:2px 4px;margin-bottom:4px;';
+        let itemSearchTerm = '';
+        let itemSearchDistTried = false;
+        itemSearchInput.addEventListener('input', () => {
+            itemSearchTerm = itemSearchInput.value.toLowerCase().trim();
+            renderItemSearch();
+        });
+        itemSearchView.appendChild(itemSearchInput);
+
+        const itemSearchResults = document.createElement('div');
+        itemSearchResults.style.cssText = 'max-height:480px;overflow:auto;';
+        itemSearchView.appendChild(itemSearchResults);
+
+        function applyViewVisibility() {
+            tabBar.style.display = collapsed ? 'none' : 'flex';
+            const showLoc = !collapsed && activeTab === 'locations';
+            const showItem = !collapsed && activeTab === 'itemsearch';
+            filterBar.style.display = showLoc ? 'block' : 'none';
+            body.style.display = showLoc ? 'block' : 'none';
+            controls.style.display = showLoc ? 'flex' : 'none';
+            itemSearchView.style.display = showItem ? 'block' : 'none';
+        }
+
+        function switchTab(tabId) {
+            activeTab = tabId;
+            [locTabBtn, itemTabBtn].forEach(btn => {
+                const on = btn.dataset.tab === tabId;
+                btn.style.borderBottom = on ? '2px solid #88ff88' : '2px solid transparent';
+                btn.style.color = on ? '#aaffaa' : '#5a8a5a';
+                btn.style.background = on ? '#113311' : '#0a1a0a';
+            });
+            applyViewVisibility();
+            if (tabId === 'itemsearch') renderItemSearch();
+        }
+
+        // >> Item Search renderer
+        // Lists every tracked location carrying the searched commodity,
+        // sorted by AP distance (closest first); null-AP (cross-sector /
+        // no map) grouped last. Reuses distanceMap; computes it lazily
+        // (on-demand, deferred via setTimeout) if not yet populated — no
+        // heavy work at load time. Unknown AP renders '?' (hard-fail
+        // policy: no estimates).
+        function renderItemSearch() {
+            const r = itemSearchResults;
+            r.innerHTML = '';
+            const s = getTrackerStore();
+            const ks = Object.keys(s);
+            if (ks.length === 0) {
+                r.innerHTML = '<div style="color:#888;text-align:center;padding:8px;">No locations tracked yet.</div>';
+                return;
+            }
+            if (!itemSearchTerm) {
+                r.innerHTML = '<div style="color:#5a8a5a;text-align:center;padding:8px;">Type an item name to search tracked locations.</div>';
+                return;
+            }
+
+            const matches = [];
+            for (const k of ks) {
+                const e = s[k];
+                if (!e || !e.commodities) continue;
+                for (const rid in e.commodities) {
+                    const c = e.commodities[rid];
+                    if (!c || !c.name) continue;
+                    if (c.name.toLowerCase().indexOf(itemSearchTerm) === -1) continue;
+                    matches.push({ entry: e, com: c });
+                }
+            }
+            if (matches.length === 0) {
+                r.innerHTML = '<div style="color:#888;text-align:center;padding:8px;">No items matching "' + itemSearchTerm + '".</div>';
+                return;
+            }
+
+            // Lazy distance compute: one-shot, deferred so the
+            // "calculating..." state paints first. If compute fails
+            // (no userloc / no map) distanceMap stays null and AP
+            // renders '?' below — no estimates.
+            if (!distanceMap && !itemSearchDistTried) {
+                itemSearchDistTried = true;
+                r.innerHTML = '<div style="color:#8a6a3a;text-align:center;padding:8px;">Calculating AP distances...</div>';
+                setTimeout(() => {
+                    const result = computeTrackerDistances();
+                    if (!result.error) {
+                        distanceMap = result.distances;
+                        distInfo = { playerSector: result.playerSector, playerCoords: result.playerCoords, usedFallback: result.usedFallback };
+                    }
+                    renderItemSearch();
+                }, 10);
+                return;
+            }
+
+            matches.sort((a, b) => {
+                const da = distanceMap ? distanceMap[String(a.entry.userloc)] : null;
+                const db = distanceMap ? distanceMap[String(b.entry.userloc)] : null;
+                if (da == null && db == null) return (a.entry.name || '') < (b.entry.name || '') ? -1 : 1;
+                if (da == null) return 1;
+                if (db == null) return -1;
+                return da - db;
+            });
+
+            const t = document.createElement('table');
+            t.style.cssText = 'width:100%;border-collapse:collapse;font-size:9px;';
+            t.innerHTML = '<tr style="color:#5a8a5a;">' +
+                '<th style="text-align:left;">Item</th>' +
+                '<th style="text-align:left;">From</th>' +
+                '<th>Sector</th>' +
+                '<th>AP</th>' +
+                '<th>stk</th>' +
+                '<th>buy</th>' +
+                '<th>sell</th></tr>';
+            for (const m of matches) {
+                const e = m.entry;
+                const c = m.com;
+                const typeColor = e.type === 'planet' ? '#aaffaa' : (e.type === 'starbase' ? '#88ccff' : '#ffcc88');
+                const typeIcon = e.type === 'planet' ? '\u25cf' : (e.type === 'starbase' ? '\u25b2' : '\u25a0');
+                const eSector = getSectorFromTileId(e.userloc) || '?';
+                const eCoords = deriveDisplayCoords(e.userloc);
+                const distVal = distanceMap ? distanceMap[String(e.userloc)] : null;
+                const apTxt = (distVal != null)
+                    ? '<span style="color:#ffaa44;">' + distVal + '</span>'
+                    : '<span style="color:#666;">?</span>';
+                const tr = document.createElement('tr');
+                tr.style.cssText = 'border-bottom:1px dashed #2a3a2a;color:#bbb;';
+                tr.innerHTML = '<td style="color:#ffcc77;">' + c.name + '</td>' +
+                    '<td><span style="color:' + typeColor + ';">' + typeIcon + '</span> ' +
+                        '<span style="color:' + typeColor + ';">' + (e.name || '?') + '</span>' +
+                        ' <span style="color:#666;">' + eCoords + '</span></td>' +
+                    '<td style="color:#888;">' + eSector + '</td>' +
+                    '<td style="text-align:right;">' + apTxt + '</td>' +
+                    '<td style="text-align:right;">' + c.stock + '</td>' +
+                    '<td style="text-align:right;color:#ffaa55;">' + c.buyFromObjPrice + '</td>' +
+                    '<td style="text-align:right;color:#88cc88;">' + c.sellToObjPrice + '</td>';
+                t.appendChild(tr);
+            }
+            r.appendChild(t);
+        }
+
         renderBody();
+        switchTab('locations');
         const mount = document.body || document.documentElement;
         if (mount) mount.appendChild(wrap);
         console.log('[pardus-tracker] panel injected on', currentPath, 'with', keys.length, 'locations');
@@ -3824,19 +3987,19 @@ const SECTOR_DATA = {
             if (run.subTab === 'oneway') {
                 inner += '<div style="color:#ccc;">' +
                     'Buy <span style="color:#ffcc77;">' + run.item + '</span> at ' +
-                    '<span class="opps-active-fly" data-target="seller" style="color:#aaffaa;cursor:pointer;text-decoration:underline;">' + run.sellerName + ' [' + run.sellerCoords.x + ',' + run.sellerCoords.y + ']</span>' +
+                    '<span class="opps-active-fly" data-target="seller" title="Sector: ' + (run.sellerSector||'?') + '" style="color:#aaffaa;cursor:pointer;text-decoration:underline;">' + run.sellerName + ' [' + run.sellerCoords.x + ',' + run.sellerCoords.y + ']</span>' +
                     ' \u2192 Sell at ' +
-                    '<span class="opps-active-fly" data-target="buyer" style="color:#88ccff;cursor:pointer;text-decoration:underline;">' + run.buyerName + ' [' + run.buyerCoords.x + ',' + run.buyerCoords.y + ']</span>' +
+                    '<span class="opps-active-fly" data-target="buyer" title="Sector: ' + (run.buyerSector||'?') + '" style="color:#88ccff;cursor:pointer;text-decoration:underline;">' + run.buyerName + ' [' + run.buyerCoords.x + ',' + run.buyerCoords.y + ']</span>' +
                     '</div>';
                 inner += '<div style="color:#888;font-size:8px;margin-top:1px;">' + run.units + 'u \u00b7 buy ' + fmtCr(run.buyPerUnit) + ' \u00b7 sell ' + fmtCr(run.sellPerUnit) + ' \u00b7 profit ' + fmtCr(run.profit) + ' cr</div>';
             } else {
                 inner += '<div style="color:#ccc;">' +
                     'Buy <span style="color:#ffcc77;">' + run.fwdItem + '</span> at ' +
-                    '<span class="opps-active-fly" data-target="A" style="color:#aaffaa;cursor:pointer;text-decoration:underline;">' + run.Aname + ' [' + run.Acoords.x + ',' + run.Acoords.y + ']</span>' +
+                    '<span class="opps-active-fly" data-target="A" title="Sector: ' + (run.Asector||'?') + '" style="color:#aaffaa;cursor:pointer;text-decoration:underline;">' + run.Aname + ' [' + run.Acoords.x + ',' + run.Acoords.y + ']</span>' +
                     ' \u2192 Sell ' + run.fwdItem + ' / Buy <span style="color:#88ccff;">' + run.retItem + '</span> at ' +
-                    '<span class="opps-active-fly" data-target="B" style="color:#88ccff;cursor:pointer;text-decoration:underline;">' + run.Bname + ' [' + run.Bcoords.x + ',' + run.Bcoords.y + ']</span>' +
+                    '<span class="opps-active-fly" data-target="B" title="Sector: ' + (run.Bsector||'?') + '" style="color:#88ccff;cursor:pointer;text-decoration:underline;">' + run.Bname + ' [' + run.Bcoords.x + ',' + run.Bcoords.y + ']</span>' +
                     ' \u2192 Sell ' + run.retItem + ' at ' +
-                    '<span class="opps-active-fly" data-target="A" style="color:#aaffaa;cursor:pointer;text-decoration:underline;">' + run.Aname + '</span>' +
+                    '<span class="opps-active-fly" data-target="A" title="Sector: ' + (run.Asector||'?') + '" style="color:#aaffaa;cursor:pointer;text-decoration:underline;">' + run.Aname + '</span>' +
                     '</div>';
                 inner += '<div style="color:#888;font-size:8px;margin-top:1px;">Fwd: ' + run.fwdQty + ' ' + run.fwdItem + ' (+' + fmtCr(run.fwdProfit) + ') \u00b7 Ret: ' + run.retQty + ' ' + run.retItem + ' (+' + fmtCr(run.retProfit) + ') \u00b7 Total: ' + fmtCr(run.profit) + ' cr</div>';
             }
@@ -4009,11 +4172,11 @@ const SECTOR_DATA = {
                     '<td>' + (i + 1) + ' <span class="opps-pin" data-idx="' + i + '" style="cursor:pointer;color:#8a6a3a;font-size:8px;">pin</span></td>' +
                     '<td style="color:#ffcc77;">' + r.item + '</td>' +
                     '<td><span style="color:' + sColor + ';">' + sIcon + '</span> ' +
-                        '<span class="export-fly-target" data-idx="' + i + '" data-target="seller" title="Click to fly to seller" style="color:' + sColor + ';cursor:pointer;text-decoration:underline;">' + (r.seller.name || '?') + '</span>' +
+                        '<span class="export-fly-target" data-idx="' + i + '" data-target="seller" title="Sector: ' + r.sellerSector + ' (click to fly)" style="color:' + sColor + ';cursor:pointer;text-decoration:underline;">' + (r.seller.name || '?') + '</span>' +
                         ' <span style="color:#5a5a3a;">[' + r.sellerCoords.x + ',' + r.sellerCoords.y + ']</span>' +
                         ' <span style="color:#8a6a3a;">\u2192</span> ' +
                         '<span style="color:' + bColor + ';">' + bIcon + '</span> ' +
-                        '<span class="export-fly-target" data-idx="' + i + '" data-target="buyer" title="Click to fly to buyer" style="color:' + bColor + ';cursor:pointer;text-decoration:underline;">' + (r.buyer.name || '?') + '</span>' +
+                        '<span class="export-fly-target" data-idx="' + i + '" data-target="buyer" title="Sector: ' + r.buyerSector + ' (click to fly)" style="color:' + bColor + ';cursor:pointer;text-decoration:underline;">' + (r.buyer.name || '?') + '</span>' +
                         ' <span style="color:#5a5a3a;">[' + r.buyerCoords.x + ',' + r.buyerCoords.y + ']</span></td>' +
                     '<td style="text-align:right;">' + r.units + '</td>' +
                     '<td style="text-align:right;color:#ffaa55;">' + fmtCr(r.buyPerUnit) + '</td>' +
@@ -4174,11 +4337,11 @@ const SECTOR_DATA = {
                 tr.innerHTML =
                     '<td>' + (i + 1) + ' <span class="opps-pin" data-idx="' + i + '" style="cursor:pointer;color:#8a6a3a;font-size:8px;">pin</span></td>' +
                     '<td><span style="color:' + aColor + ';">' + aIcon + '</span> ' +
-                        '<span class="export-fly-target" data-idx="' + i + '" data-target="A" title="Click to fly to A" style="color:' + aColor + ';cursor:pointer;text-decoration:underline;">' + (r.A.name || '?') + '</span>' +
+                        '<span class="export-fly-target" data-idx="' + i + '" data-target="A" title="Sector: ' + r.Asector + ' (click to fly)" style="color:' + aColor + ';cursor:pointer;text-decoration:underline;">' + (r.A.name || '?') + '</span>' +
                         ' <span style="color:#5a5a3a;">[' + r.Acoords.x + ',' + r.Acoords.y + ']</span>' +
                         ' <span style="color:#8a6a3a;">\u2194</span> ' +
                         '<span style="color:' + bColor + ';">' + bIcon + '</span> ' +
-                        '<span class="export-fly-target" data-idx="' + i + '" data-target="B" title="Click to fly to B" style="color:' + bColor + ';cursor:pointer;text-decoration:underline;">' + (r.B.name || '?') + '</span>' +
+                        '<span class="export-fly-target" data-idx="' + i + '" data-target="B" title="Sector: ' + r.Bsector + ' (click to fly)" style="color:' + bColor + ';cursor:pointer;text-decoration:underline;">' + (r.B.name || '?') + '</span>' +
                         ' <span style="color:#5a5a3a;">[' + r.Bcoords.x + ',' + r.Bcoords.y + ']</span></td>' +
                     '<td style="text-align:right;color:#ffcc77;">' + r.fwdItem + '<br><span style="color:#5a5a3a;">' + r.fwdQty + 'u +' + fmtCr(r.fwdProfit) + '</span></td>' +
                     '<td style="text-align:right;color:#88ccff;">' + r.retItem + '<br><span style="color:#5a5a3a;">' + r.retQty + 'u +' + fmtCr(r.retProfit) + '</span></td>' +
