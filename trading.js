@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      6.94
+// @version      6.95
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
+// @description  v6.95: Add Take-All gather mode — enter comma-separated item names, sim visits every producing building and buys all available stock, dumping non-protected cargo into the TO when the ship is too full for a complete pickup. New calculateTakeAllRoute function (same step shape); existing supply-chain engine untouched (test_routing.js green).
 // @description  v6.94: Tracker Item Search — click a location name to auto-fly there (mirrors opps panel fly-target pattern), and hide zero-stock matches so only locations that actually carry the item are listed. Additive UI; no computation change (test_routing.js + test_opportunities.js green).
 // @description  v6.93: Add Trade Tracker "Item Search" tab (item-centric view sorted by AP distance, lazy distance compute on first search) and sector hover tooltips on Opportunities panel location names (tables + active run bar). Additive UI only; no route/opps computation change (test_routing.js + test_opportunities.js green).
 // @description  v6.92: Cut L2 deserialize ~976ms→~22ms — flat Int16Array dist/next matrices are now the primary in-memory macro graph representation (eliminates 1.2M Map.set calls from Map-of-Maps rebuild). Wire format unchanged (schema 2); route output byte-identical (test_routing.js green).
 // @description  v6.91: Fix ~5s F5 refresh lag — switch HPA* macro table serialization from Float32/Int32 (12.5 MB, over GM_setValue's ~10 MB limit) to Int16/Int16 (6.3 MB). Schema bumped to 2; -1 sentinel for unreachable pairs. Route output byte-identical (test_routing.js green).
-// @description  v6.90: Cut post-trade recalc cost — memoize location parsing (locOf cache) and replace JSON deep-clone of flat cargo map with shallow spread in optimizeFactoryRuns. No algorithm change; route output byte-identical (test_routing.js green).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -642,6 +642,28 @@ const SECTOR_DATA = {
                         } catch (e) {
                             GM_setValue('logistics_needs_recalc', true);
                             console.error('[pardus-sim] auto-sim failed (deferred to main.php):', e);
+                        }
+                    }
+                    window.location.href = 'main.php';
+                } else if (GM_getValue('logistics_take_all_mode', false)) {
+                    GM_deleteValue('logistics_take_all_mode');
+
+                    let rawData = GM_getValue('raw_bookkeeper_data', []);
+                    if (rawData.length > 0) {
+                        let start = GM_getValue('config_hub_coords', '[7,16]');
+                        let cap = GM_getValue('config_max_cargo', '200');
+                        let toCoord = GM_getValue('config_to_coords', '');
+                        let toCap = GM_getValue('config_to_cap', '');
+                        let takeAllItems = GM_getValue('config_take_all_items', '');
+                        let liveCargo = GM_getValue('logistics_live_cargo', '');
+
+                        try {
+                            let optimizedData = calculateTakeAllRoute(rawData, start, cap, toCoord, toCap, takeAllItems, liveCargo);
+                            optimizedData.history = [];
+                            GM_setValue('logistics_route_v5', optimizedData);
+                        } catch (e) {
+                            GM_setValue('logistics_needs_recalc', true);
+                            console.error('[pardus-sim] take-all auto-sim failed (deferred to main.php):', e);
                         }
                     }
                     window.location.href = 'main.php';
@@ -6731,6 +6753,7 @@ const SECTOR_DATA = {
         let savedToCap = GM_getValue('config_to_cap', '');
         let savedMinTrade = GM_getValue('config_min_trade', '25');
         let savedExports = GM_getValue('config_export_items', '');
+        let savedTakeAllItems = GM_getValue('config_take_all_items', '');
         let savedLiveCargo = GM_getValue('logistics_live_cargo', '');
         let savedAutoRetreat = GM_getValue('config_auto_retreat', true);
 
@@ -6888,6 +6911,11 @@ const SECTOR_DATA = {
                     <input type="text" id="nav-live-cargo" value="${savedLiveCargo}" style="width: 140px; background: #111; color: #ffff55; border: 1px solid #444;" readonly>
                 </div>
 
+                <div style="display: flex; gap: 4px; align-items: center; margin-top: 4px;">
+                    <input type="text" id="nav-takeall-items" value="${savedTakeAllItems}" placeholder="Items to gather..." style="flex: 1; background: #111; color: #ff88ff; border: 1px solid #444;">
+                    <button id="nav-btn-takeall" style="cursor: pointer; padding: 4px; background: #420044; color: #fff; border: 1px solid #f0f;">Take All</button>
+                </div>
+
                 <div style="display: flex; justify-content: space-between; margin-top: 4px;">
                     <button id="nav-btn-sim" style="cursor: pointer; padding: 4px; background: #004400; color: #fff; border: 1px solid #0f0; flex-grow: 1; margin-right: 2px;">Sync & Sim</button>
                     <button id="nav-btn-clear" style="cursor: pointer; padding: 4px; background: #422; color: #ccc; border: 1px solid #555;">Clear Route</button>
@@ -6962,6 +6990,16 @@ const SECTOR_DATA = {
             GM_setValue('config_export_items', document.getElementById('nav-export-items').value);
 
             GM_setValue('logistics_auto_sim', true);
+            window.location.href = 'overview_buildings.php';
+        });
+
+        document.getElementById('nav-btn-takeall').addEventListener('click', () => {
+            GM_setValue('config_hub_coords', normalizeCoords(document.getElementById('nav-hub-coords').value));
+            GM_setValue('config_max_cargo', document.getElementById('nav-max-cargo').value);
+            GM_setValue('config_to_coords', normalizeCoords(document.getElementById('nav-to-coords').value));
+            GM_setValue('config_to_cap', document.getElementById('nav-to-cargo').value);
+            GM_setValue('config_take_all_items', document.getElementById('nav-takeall-items').value);
+            GM_setValue('logistics_take_all_mode', true);
             window.location.href = 'overview_buildings.php';
         });
 
@@ -8719,23 +8757,188 @@ const SECTOR_DATA = {
         return { steps: routeSteps, toInventory: toInventory };
     }
 
+    // >> Take-All gather route
+    function calculateTakeAllRoute(rawNodes, currentLocStr, maxCargo, toCoordStr, toCapacity, takeAllItemsStr, liveCargoStr) {
+        let routeSteps = [];
+        let toInventory = {};
+
+        let shipCargo = parseLiveCargo(liveCargoStr);
+        const PROTECTED_CARGO = new Set(['hydrogen fuel', 'phantom protection']);
+        let autoShipSpace = parseInt(GM_getValue('logistics_ship_space', '0'), 10);
+        let maxC = (autoShipSpace > 0 ? autoShipSpace : (parseInt(maxCargo, 10) || 200));
+        let magScoopUsed = parseInt(GM_getValue('logistics_mag_scoop_used', '0'), 10) || 0;
+        let shipSpace = maxC;
+        for (let amt of Object.values(shipCargo)) {
+            shipSpace -= amt;
+        }
+        shipSpace += magScoopUsed;
+        shipSpace = Math.max(0, shipSpace);
+
+        let simMagScoopUsed = magScoopUsed;
+
+        let toSpace = parseInt(toCapacity, 10) || 0;
+
+        let simSector = simResolveSector();
+        let simDijCache = {};
+
+        let hasTO = toCoordStr && toCoordStr.match(/\[\d+,\d+\]/) && toSpace > 0;
+        let toLoc = hasTO ? parseCoords(toCoordStr) : null;
+        let currentLoc = parseCoords(currentLocStr || "[7,16]");
+        let startLoc = currentLoc;
+
+        let initialShipCargo = JSON.parse(JSON.stringify(shipCargo));
+        let initialShipSpace = shipSpace;
+        let initialSimMagScoopUsed = simMagScoopUsed;
+
+        if (!hasTO) throw new Error('calculateTakeAllRoute: no Trading Outpost configured (set TO Coords + TO Space). Take-All requires a TO to dump gathered cargo.');
+        let targetSet = new Set((takeAllItemsStr || '').split(',').map(s => s.trim().toLowerCase()).filter(s => s.length > 0));
+        if (targetSet.size === 0) throw new Error('calculateTakeAllRoute: no items specified in the take-all list.');
+
+        let nameToIdMap = {};
+        rawNodes.forEach(n => {
+            Object.entries(n.pickups).forEach(([name, data]) => nameToIdMap[name.toLowerCase()] = data.id);
+            Object.entries(n.dropoffs).forEach(([name, data]) => nameToIdMap[name.toLowerCase()] = data.id);
+        });
+
+        let unvisited = [];
+        for (let n of rawNodes) {
+            let clonedPickups = {};
+            for (let rawItem in n.pickups) {
+                let lc = rawItem.toLowerCase();
+                if (targetSet.has(lc) && n.pickups[rawItem].amount > 0) {
+                    clonedPickups[rawItem] = { amount: n.pickups[rawItem].amount, id: n.pickups[rawItem].id };
+                }
+            }
+            if (Object.keys(clonedPickups).length > 0) {
+                unvisited.push({ location: n.location, name: n.name, pickups: clonedPickups, dropoffs: {} });
+            }
+        }
+
+        if (unvisited.length === 0) {
+            return { steps: [], toInventory: {}, mode: 'take_all' };
+        }
+
+        function totalRemaining() {
+            let total = 0;
+            for (let n of unvisited) {
+                for (let rawItem in n.pickups) {
+                    total += n.pickups[rawItem].amount;
+                }
+            }
+            return total;
+        }
+
+        function tryDumpToTO() {
+            let dumpable = {};
+            for (let item in shipCargo) {
+                if (PROTECTED_CARGO.has(item)) continue;
+                if (shipCargo[item] > 0) dumpable[item] = shipCargo[item];
+            }
+            let totalDumpable = 0;
+            for (let item in dumpable) totalDumpable += dumpable[item];
+            if (totalDumpable === 0 || toSpace <= 0) return false;
+
+            let stepRecord = { location: toCoordStr, name: "Trading Outpost (Take-All Dump)", pickups: {}, dropoffs: {}, destinationType: "to" };
+            for (let item in dumpable) {
+                if (toSpace <= 0) break;
+                let dropAmt = Math.min(dumpable[item], toSpace);
+                if (dropAmt <= 0) continue;
+                shipCargo[item] = (shipCargo[item] || 0) - dropAmt;
+                let fromMag = Math.min(dropAmt, simMagScoopUsed);
+                simMagScoopUsed -= fromMag;
+                shipSpace += (dropAmt - fromMag);
+                toSpace -= dropAmt;
+                toInventory[item] = (toInventory[item] || 0) + dropAmt;
+                let displayName = item.charAt(0).toUpperCase() + item.slice(1);
+                stepRecord.dropoffs[displayName] = { amount: dropAmt, id: nameToIdMap[item] || item.replace(/\s/g, '_') };
+            }
+            routeSteps.push(stepRecord);
+            currentLoc = toLoc;
+            return true;
+        }
+
+        while (true) {
+            if (totalRemaining() === 0) break;
+
+            let bestIdx = -1, bestScore = -1, bestNodePickup = 0;
+            for (let i = 0; i < unvisited.length; i++) {
+                let n = unvisited[i];
+                let nodeTargetPickup = 0;
+                for (let rawItem in n.pickups) {
+                    nodeTargetPickup += n.pickups[rawItem].amount;
+                }
+                let canTake = Math.min(nodeTargetPickup, shipSpace);
+                if (canTake <= 0) continue;
+                let dist = simTravelAP(currentLoc, parseCoords(n.location), simSector, simDijCache);
+                let apCost = dist + 5;
+                let score = Math.pow(canTake, 1.5) / Math.pow(apCost, 1.2);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestIdx = i;
+                    bestNodePickup = nodeTargetPickup;
+                }
+            }
+
+            if (bestIdx < 0) {
+                if (!tryDumpToTO()) break;
+                continue;
+            }
+
+            if (bestNodePickup > shipSpace) {
+                if (tryDumpToTO()) continue;
+            }
+
+            let chosen = unvisited[bestIdx];
+            let stepRecord = { location: chosen.location, name: chosen.name, pickups: {}, dropoffs: {}, destinationType: "factory" };
+            for (let rawItem in chosen.pickups) {
+                let avail = chosen.pickups[rawItem].amount;
+                if (avail <= 0) continue;
+                let takeAmt = Math.min(avail, shipSpace);
+                if (takeAmt <= 0) continue;
+                let item = rawItem.toLowerCase();
+                shipCargo[item] = (shipCargo[item] || 0) + takeAmt;
+                shipSpace -= takeAmt;
+                stepRecord.pickups[rawItem] = { amount: takeAmt, id: chosen.pickups[rawItem].id };
+                chosen.pickups[rawItem].amount -= takeAmt;
+            }
+            routeSteps.push(stepRecord);
+            currentLoc = parseCoords(chosen.location);
+
+            let remainingPick = 0;
+            for (let rawItem in chosen.pickups) remainingPick += chosen.pickups[rawItem].amount;
+            if (remainingPick === 0) {
+                unvisited.splice(bestIdx, 1);
+            }
+        }
+
+        tryDumpToTO();
+
+        routeSteps = optimizeFactoryRuns(routeSteps, initialShipCargo, initialShipSpace, initialSimMagScoopUsed, simSector, startLoc);
+
+        return { steps: routeSteps, toInventory: toInventory, mode: 'take_all' };
+    }
+
     function recalculateRouteOnTheFly(sectorState) {
         let activeData = GM_getValue('logistics_route_v5', { steps: [], history: [] });
         let currentLoc = activeData.history.length > 0 ? activeData.history[activeData.history.length - 1].location : GM_getValue('config_hub_coords', '[7,16]');
         try { currentLoc = document.getElementById('coords').innerText; } catch(e){}
 
         let cap = GM_getValue('config_max_cargo', '200');
-        let hubLoc = GM_getValue('config_hub_coords', '[7,16]');
         let toCoord = GM_getValue('config_to_coords', '');
         let toCap = GM_getValue('config_to_cap', '');
-        let hubType = GM_getValue('config_hub_type', 'starbase');
-        let minTrade = GM_getValue('config_min_trade', '25');
-        let exports = GM_getValue('config_export_items', '');
         let liveCargoStr = GM_getValue('logistics_live_cargo', '');
 
-        let optimizedData = calculateOptimalRoute(
-            sectorState, currentLoc, hubLoc, cap, toCoord, toCap, hubType, minTrade, exports, liveCargoStr
-        );
+        let optimizedData;
+        if (activeData.mode === 'take_all') {
+            let takeAllItems = GM_getValue('config_take_all_items', '');
+            optimizedData = calculateTakeAllRoute(sectorState, currentLoc, cap, toCoord, toCap, takeAllItems, liveCargoStr);
+        } else {
+            let hubLoc = GM_getValue('config_hub_coords', '[7,16]');
+            let hubType = GM_getValue('config_hub_type', 'starbase');
+            let minTrade = GM_getValue('config_min_trade', '25');
+            let exports = GM_getValue('config_export_items', '');
+            optimizedData = calculateOptimalRoute(sectorState, currentLoc, hubLoc, cap, toCoord, toCap, hubType, minTrade, exports, liveCargoStr);
+        }
         optimizedData.history = activeData.history;
         GM_setValue('logistics_route_v5', optimizedData);
         return optimizedData;
