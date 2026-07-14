@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.05
+// @version      7.06
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
 // @description  v7.03: Debounce terrain recompile + compile-time optimizations. Terrain version bump is now deferred 15s after the last nav step (dirty-flag pattern in scrapeAndStoreTerrain + deferred timer in dispatcher), eliminating the ~8-10s per-step freeze during active exploration. Binary min-heap (_hpaBinHeap) replaces pq.sort()+shift() in hpaLocalDijkstra/hpaLocalAStar (O(n log n)→O(log n) per pop). Flat Float64Array/Int32Array Floyd-Warshall in hpaBuildMacroGraph (cache-friendly, no array-of-arrays pointer chasing). Serialization + GM_setValue deferred to setTimeout(0) so UI panels render first. No signature changes; no estimate fallbacks (ADR 011; all 5 test harnesses green).
 // @description  v7.02: Custom export sub-tab on the Exports Calculator — plan a single-item export trip from a flexible origin (current position or chosen coords+sector) with user-specified quantity. Buy price auto-detected via resolveExportBuyPrice with shared cfgBar override. Table rendering extracted into buildExportsRouteTable helper (shared by both sub-tabs). Hard-fail on unknown sector/item; no estimate fallbacks (ADR 010; test_opportunities.js + test_to.js + test_routing.js + test_prices.js green).
-// @description  v7.01: Live terrain scraping overlay — scrape real terrain from the #navarea HTML on every nav page load, accumulate in GM_setValue, and overlay it on the static_ext grid in hpaParseMap (ground truth wins over static_ext, including padded 'b' rows). Fixes the Ras Elased [27,39] starbase unreachability; static_ext row mismatches self-correct as the player explores. Macro graph cache auto-invalidates on new terrain discovery (terrainVersion in cache key). HPA* functions stay pure (liveTerrain passed as a parameter) (ADR 009; test_terrain_overlay.js + test_routing.js green).
 // @description  v7.04: Dump All button — sell-off inverse of Take All. Sells every non-protected cargo item (excludes hydrogen fuel + phantom protection) to the highest-priced tracked buyer in the current sector. Buy prices sourced from the trade tracker (sellToObjPrice); unpriced buyers are ignored (no estimate fallbacks). New calculateDumpAllRoute in sim engine; mirrors take-all plumbing (button → logistics_dump_all_mode → bookkeeper branch → route) (ADR 014; test_dump_all.js green).
 // @description  v7.05: Auto-run trading speedup — 6x reduction in per-stop overhead (~3700ms→~575ms) and 2x faster per-tile flying (~250ms→~130ms) by tuning fixed setTimeout delays to match actual DOM/AJAX response times. Post-click delay 1500ms→100ms (adaptive: detects button-disable or page-nav), page-load resume 1000ms→200ms, disabled-poll 400ms→150ms, inter-tile 150ms→80ms, movement/jump polls 100ms→50ms. No logic changes; only timing constants (ADR 015; test_routing + test_flyhere_plot + test_to + test_cross_sector green).
+// @description  v7.06: Fix auto-run stall after flight arrival — autoStepTick now disables the next-btn immediately after clicking it, preventing re-entry races where the 100ms post-click delay fires before page navigation completes (causing duplicate trade-link clicks that stalled the browser). Button is re-enabled by autoStepResume on the next page load or by the flight callback (ADR 015).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2546,6 +2546,8 @@ const SECTOR_DATA = {
         if (!btn) { GM_setValue('logistics_auto_step', false); return; }
         if (btn.disabled) { setTimeout(autoStepTick, 150); return; }
         btn.click();
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
         setTimeout(autoStepTick, 100);
     }
 
@@ -2582,6 +2584,8 @@ const SECTOR_DATA = {
         if (!GM_getValue('logistics_auto_step', false)) return;
         const btn = document.getElementById('qol-next-btn');
         if (!btn) { GM_setValue('logistics_auto_step', false); return; }
+        btn.disabled = false;
+        btn.style.opacity = '1';
         const autoBtn = document.getElementById('qol-auto-btn');
         const stopBtn = document.getElementById('qol-stop-btn');
         if (autoBtn) { autoBtn.disabled = true; autoBtn.style.opacity = '0.5'; }
