@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.10
+// @version      7.11
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
 // @description  v7.04: Dump All button — sell-off inverse of Take All. Sells every non-protected cargo item (excludes hydrogen fuel + phantom protection) to the highest-priced tracked buyer in the current sector. Buy prices sourced from the trade tracker (sellToObjPrice); unpriced buyers are ignored (no estimate fallbacks). New calculateDumpAllRoute in sim engine; mirrors take-all plumbing (button → logistics_dump_all_mode → bookkeeper branch → route) (ADR 014; test_dump_all.js green).
 // @description  v7.05: Auto-run trading speedup — 6x reduction in per-stop overhead (~3700ms→~575ms) and 2x faster per-tile flying (~250ms→~130ms) by tuning fixed setTimeout delays to match actual DOM/AJAX response times. Post-click delay 1500ms→100ms (adaptive: detects button-disable or page-nav), page-load resume 1000ms→200ms, disabled-poll 400ms→150ms, inter-tile 150ms→80ms, movement/jump polls 100ms→50ms. No logic changes; only timing constants (ADR 015; test_routing + test_flyhere_plot + test_to + test_cross_sector green).
@@ -10,6 +10,7 @@
 // @description  v7.08: Fix perf instrumentation loss across page navigations — auto-dump output was cleared by Firefox console on page navigation. Reports now persist in GM storage (logistics_perf_last_report); __perfLastReport() retrieves the last report even after console is cleared. When no new marks exist, __perfReport() prints the stored last report instead of "no marks collected" (ADR 017).
 // @description  v7.09: Reduce autoStepResume page-load delay 200ms→80ms. Perf data showed ~200ms floor on every page_arrival→qol_next gap (3 per trade stop), saving ~360ms/stop. 80ms matches the proven inter-tile delay floor (ADR 015, ADR 017).
 // @description  v7.10: Add Escape hotkey to stop auto-run. With faster delays the Stop button was unclickable during rapid page navigations. Escape now calls stopAutoStep from any page. Also exposes __stopAuto() on unsafeWindow as a console fallback.
+// @description  v7.11: Skip non-essential panel injection during auto-run (R2). 4 of 5 main.php panels (nav HUD, fly-here, exports calculator, tracker) are skipped when logistics_auto_step is true — only injectDraggableUI runs (has Stop button + autoStepResume). injectSkippedPanels() restores them when auto-run stops or route completes. ~300-400ms saved per main.php page load during auto-run (ADR 019).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2600,6 +2601,7 @@ const SECTOR_DATA = {
             if (stopBtn) { stopBtn.disabled = true; stopBtn.style.opacity = '0.5'; }
             const statusEl = document.getElementById('qol-status');
             if (statusEl) statusEl.innerText = qolDescribeNextStep();
+            injectSkippedPanels();
             __perfReport();
             return;
         }
@@ -2631,7 +2633,29 @@ const SECTOR_DATA = {
         if (stopBtn) { stopBtn.disabled = true; stopBtn.style.opacity = '0.5'; }
         const statusEl = document.getElementById('qol-status');
         if (statusEl) statusEl.innerText = qolDescribeNextStep();
+        injectSkippedPanels();
         __perfReport();
+    }
+
+    function injectSkippedPanels() {
+        const path = window.location.pathname;
+        if (path !== '/main.php' && !path.endsWith('/main.php')) return;
+        if (!document.getElementById('nav-btn-fly-here')) {
+            try { injectNavHUD(); }
+            catch (e) { console.error('[pardus-nav] HUD inject failed:', e); }
+        }
+        if (!document.getElementById('pardus-flyhere-panel')) {
+            try { injectFlyHerePanel(); }
+            catch (e) { console.error('[pardus-flyhere] panel inject failed:', e); }
+        }
+        if (!document.getElementById('pardus-exports-panel')) {
+            try { injectExportsCalculator(); }
+            catch (e) { console.error('[pardus-exports] panel inject failed:', e); }
+        }
+        if (!document.getElementById('pardus-tracker-panel')) {
+            try { injectTrackerPanel(); }
+            catch (e) { console.error('[pardus-tracker] panel inject failed:', e); }
+        }
     }
 
     function bindQolAutoButtons() {
@@ -9845,16 +9869,19 @@ const SECTOR_DATA = {
         // Dijkstra), fly-here (~250 options), and tracker.
         setTimeout(() => {
             const __tInj = performance.now();
-            try { injectNavHUD(); }
-            catch (e) { console.error('[pardus-nav] HUD inject failed:', e); }
+            const autoActive = GM_getValue('logistics_auto_step', false);
             try { injectDraggableUI(); }
             catch (e) { console.error('[pardus-ui] draggable inject failed:', e); }
-            try { injectFlyHerePanel(); }
-            catch (e) { console.error('[pardus-flyhere] panel inject failed:', e); }
-            try { injectExportsCalculator(); }
-            catch (e) { console.error('[pardus-exports] panel inject failed:', e); }
-            try { injectTrackerPanel(); }
-            catch (e) { console.error('[pardus-tracker] panel inject failed:', e); }
+            if (!autoActive) {
+                try { injectNavHUD(); }
+                catch (e) { console.error('[pardus-nav] HUD inject failed:', e); }
+                try { injectFlyHerePanel(); }
+                catch (e) { console.error('[pardus-flyhere] panel inject failed:', e); }
+                try { injectExportsCalculator(); }
+                catch (e) { console.error('[pardus-exports] panel inject failed:', e); }
+                try { injectTrackerPanel(); }
+                catch (e) { console.error('[pardus-tracker] panel inject failed:', e); }
+            }
             if (GM_getValue('logistics_perf_enabled', false)) console.log('[perf] nav_inject: ' + (performance.now() - __tInj).toFixed(1) + 'ms');
         }, 0);
         try { resumeFlightAfterAmbush(); }
