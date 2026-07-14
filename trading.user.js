@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.04
+// @version      7.05
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
 // @description  v7.03: Debounce terrain recompile + compile-time optimizations. Terrain version bump is now deferred 15s after the last nav step (dirty-flag pattern in scrapeAndStoreTerrain + deferred timer in dispatcher), eliminating the ~8-10s per-step freeze during active exploration. Binary min-heap (_hpaBinHeap) replaces pq.sort()+shift() in hpaLocalDijkstra/hpaLocalAStar (O(n log n)→O(log n) per pop). Flat Float64Array/Int32Array Floyd-Warshall in hpaBuildMacroGraph (cache-friendly, no array-of-arrays pointer chasing). Serialization + GM_setValue deferred to setTimeout(0) so UI panels render first. No signature changes; no estimate fallbacks (ADR 011; all 5 test harnesses green).
 // @description  v7.02: Custom export sub-tab on the Exports Calculator — plan a single-item export trip from a flexible origin (current position or chosen coords+sector) with user-specified quantity. Buy price auto-detected via resolveExportBuyPrice with shared cfgBar override. Table rendering extracted into buildExportsRouteTable helper (shared by both sub-tabs). Hard-fail on unknown sector/item; no estimate fallbacks (ADR 010; test_opportunities.js + test_to.js + test_routing.js + test_prices.js green).
 // @description  v7.01: Live terrain scraping overlay — scrape real terrain from the #navarea HTML on every nav page load, accumulate in GM_setValue, and overlay it on the static_ext grid in hpaParseMap (ground truth wins over static_ext, including padded 'b' rows). Fixes the Ras Elased [27,39] starbase unreachability; static_ext row mismatches self-correct as the player explores. Macro graph cache auto-invalidates on new terrain discovery (terrainVersion in cache key). HPA* functions stay pure (liveTerrain passed as a parameter) (ADR 009; test_terrain_overlay.js + test_routing.js green).
-// @description  v7.00: Wire cross-sector AP (HPA* wormhole router) into the Trade Tracker panel — cross-sector tracked locations previously showed "?" for AP distance. Now calls getCrossSectorAPFast, matching the exports/FWE/opportunities tabs (ADR 008). Same-sector Dijkstra path unchanged (test_cross_sector.js + test_pathfinder_facade.js green).
 // @description  v7.04: Dump All button — sell-off inverse of Take All. Sells every non-protected cargo item (excludes hydrogen fuel + phantom protection) to the highest-priced tracked buyer in the current sector. Buy prices sourced from the trade tracker (sellToObjPrice); unpriced buyers are ignored (no estimate fallbacks). New calculateDumpAllRoute in sim engine; mirrors take-all plumbing (button → logistics_dump_all_mode → bookkeeper branch → route) (ADR 014; test_dump_all.js green).
+// @description  v7.05: Auto-run trading speedup — 6x reduction in per-stop overhead (~3700ms→~575ms) and 2x faster per-tile flying (~250ms→~130ms) by tuning fixed setTimeout delays to match actual DOM/AJAX response times. Post-click delay 1500ms→100ms (adaptive: detects button-disable or page-nav), page-load resume 1000ms→200ms, disabled-poll 400ms→150ms, inter-tile 150ms→80ms, movement/jump polls 100ms→50ms. No logic changes; only timing constants (ADR 015; test_routing + test_flyhere_plot + test_to + test_cross_sector green).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2544,9 +2544,9 @@ const SECTOR_DATA = {
         }
         const btn = document.getElementById('qol-next-btn');
         if (!btn) { GM_setValue('logistics_auto_step', false); return; }
-        if (btn.disabled) { setTimeout(autoStepTick, 400); return; }
+        if (btn.disabled) { setTimeout(autoStepTick, 150); return; }
         btn.click();
-        setTimeout(autoStepTick, 1500);
+        setTimeout(autoStepTick, 100);
     }
 
     function startAutoStep() {
@@ -2588,7 +2588,7 @@ const SECTOR_DATA = {
         if (stopBtn) { stopBtn.disabled = false; stopBtn.style.opacity = '1'; }
         const statusEl = document.getElementById('qol-status');
         if (statusEl) statusEl.innerText = '\u23a9 Auto-stepping...';
-        setTimeout(autoStepTick, 1000);
+        setTimeout(autoStepTick, 200);
     }
 
     function injectNavHUD() {
@@ -6511,14 +6511,14 @@ const SECTOR_DATA = {
                     if (cancelled) return;
                     const newSector = getCurrentSector();
                     if (newSector !== beforeSector) {
-                        setTimeout(flyNext, 200);
+                        setTimeout(flyNext, 100);
                         return;
                     }
                     if (Date.now() > deadline) {
                         fail('\u26a0 Wormhole jump did not trigger. Try moving manually and re-clicking.');
                         return;
                     }
-                    setTimeout(waitForJump, 100);
+                    setTimeout(waitForJump, 50);
                 })();
                 return;
             }
@@ -6578,7 +6578,7 @@ const SECTOR_DATA = {
                         if (cancelled) { GM_deleteValue('logistics_ambush_resume'); return; }
                         if (currentTileId() !== before) { GM_deleteValue('logistics_ambush_resume'); setTimeout(onSuccess, afterMs); return; }
                         if (Date.now() > dl) { GM_deleteValue('logistics_ambush_resume'); fail(onFailMsg); return; }
-                        setTimeout(wait, 100);
+                        setTimeout(wait, 50);
                     })();
                 };
 
@@ -6663,7 +6663,7 @@ const SECTOR_DATA = {
                 if (cancelled) { GM_deleteValue('logistics_ambush_resume'); return; }
                 if (currentTileId() !== beforeId) {
                     GM_deleteValue('logistics_ambush_resume');
-                    setTimeout(flyNext, 150);
+                    setTimeout(flyNext, 80);
                     return;
                 }
                 if (Date.now() > deadline) {
@@ -6671,7 +6671,7 @@ const SECTOR_DATA = {
                     fail(`\u26a0 Nav did not update after moving to tile ${targetId}. Stopping.`);
                     return;
                 }
-                setTimeout(waitForMove, 100);
+                setTimeout(waitForMove, 50);
             })();
         }
 
