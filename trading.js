@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.06
+// @version      7.07
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
 // @description  v7.03: Debounce terrain recompile + compile-time optimizations. Terrain version bump is now deferred 15s after the last nav step (dirty-flag pattern in scrapeAndStoreTerrain + deferred timer in dispatcher), eliminating the ~8-10s per-step freeze during active exploration. Binary min-heap (_hpaBinHeap) replaces pq.sort()+shift() in hpaLocalDijkstra/hpaLocalAStar (O(n log n)→O(log n) per pop). Flat Float64Array/Int32Array Floyd-Warshall in hpaBuildMacroGraph (cache-friendly, no array-of-arrays pointer chasing). Serialization + GM_setValue deferred to setTimeout(0) so UI panels render first. No signature changes; no estimate fallbacks (ADR 011; all 5 test harnesses green).
-// @description  v7.02: Custom export sub-tab on the Exports Calculator — plan a single-item export trip from a flexible origin (current position or chosen coords+sector) with user-specified quantity. Buy price auto-detected via resolveExportBuyPrice with shared cfgBar override. Table rendering extracted into buildExportsRouteTable helper (shared by both sub-tabs). Hard-fail on unknown sector/item; no estimate fallbacks (ADR 010; test_opportunities.js + test_to.js + test_routing.js + test_prices.js green).
 // @description  v7.04: Dump All button — sell-off inverse of Take All. Sells every non-protected cargo item (excludes hydrogen fuel + phantom protection) to the highest-priced tracked buyer in the current sector. Buy prices sourced from the trade tracker (sellToObjPrice); unpriced buyers are ignored (no estimate fallbacks). New calculateDumpAllRoute in sim engine; mirrors take-all plumbing (button → logistics_dump_all_mode → bookkeeper branch → route) (ADR 014; test_dump_all.js green).
 // @description  v7.05: Auto-run trading speedup — 6x reduction in per-stop overhead (~3700ms→~575ms) and 2x faster per-tile flying (~250ms→~130ms) by tuning fixed setTimeout delays to match actual DOM/AJAX response times. Post-click delay 1500ms→100ms (adaptive: detects button-disable or page-nav), page-load resume 1000ms→200ms, disabled-poll 400ms→150ms, inter-tile 150ms→80ms, movement/jump polls 100ms→50ms. No logic changes; only timing constants (ADR 015; test_routing + test_flyhere_plot + test_to + test_cross_sector green).
 // @description  v7.06: Fix auto-run stall after flight arrival — autoStepTick now disables the next-btn immediately after clicking it, preventing re-entry races where the 100ms post-click delay fires before page navigation completes (causing duplicate trade-link clicks that stalled the browser). Button is re-enabled by autoStepResume on the next page load or by the flight callback (ADR 015).
+// @description  v7.07: Toggleable time-budget instrumentation for auto-run trade stops. 3 helper functions (__perfMark/__perfReport/__perfEnabled) + Date.now() marks at every phase boundary (page arrival, qol_next, trade GET/POST clicks, nav return, per-tile flight start/end) + performance.now() wrappers around injectTradeHUD and nav panel injection. Gated on logistics_perf_enabled (off by default, zero overhead). Auto-dumps timing breakdown to console on Stop or route complete; manual __perfReport()/__perfEnabled(true) via DevTools. Data prerequisite for R2-R5 optimization (ADR 017; test_benchmark_auto_run + test_routing + test_flyhere_plot green).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2400,7 +2400,35 @@ const SECTOR_DATA = {
 
     // --- 11. QOL Single-Step Advancer ---
 
+    // >> Performance instrumentation (R1 time-budget measurement — temporary, remove after data collected)
+    function __perfMark(label) {
+        if (!GM_getValue('logistics_perf_enabled', false)) return;
+        let m = GM_getValue('logistics_perf_marks', []);
+        m.push({ l: label, t: Date.now(), p: location.pathname });
+        GM_setValue('logistics_perf_marks', m);
+    }
+
+    function __perfReport() {
+        let m = GM_getValue('logistics_perf_marks', []);
+        if (!m.length) { console.log('[perf] no marks collected'); return; }
+        console.group('[perf] Timing breakdown (' + m.length + ' marks)');
+        for (let i = 1; i < m.length; i++) {
+            let dt = m[i].t - m[i - 1].t;
+            let cross = m[i - 1].p !== m[i].p ? ' [CROSS-PAGE]' : '';
+            console.log('  ' + i + ': ' + m[i - 1].l + ' \u2192 ' + m[i].l + ': ' + dt + 'ms' + cross);
+        }
+        console.groupEnd();
+        GM_setValue('logistics_perf_marks', []);
+    }
+
+    function __perfEnabled(on) {
+        GM_setValue('logistics_perf_enabled', on);
+        if (!on) GM_setValue('logistics_perf_marks', []);
+        console.log('[perf] instrumentation ' + (on ? 'ENABLED' : 'disabled'));
+    }
+
     function qolGoToNav() {
+        __perfMark('nav_return_click');
         try {
             top.frames.main.location.href = '/main.php?nav=1';
         } catch (err) {
@@ -2437,6 +2465,7 @@ const SECTOR_DATA = {
     }
 
     function qolNextStep() {
+        __perfMark('qol_next');
         const path = window.location.pathname;
 
         if (path === '/main.php' || path.endsWith('/main.php')) {
@@ -2483,6 +2512,7 @@ const SECTOR_DATA = {
             if (!tradeLink) tradeLink = document.querySelector('a[href*="building_trade.php"], a[href*="planet_trade.php"], a[href*="starbase_trade.php"]');
             if (tradeLink) {
                 GM_setValue('logistics_trade_loc', normalizeCoords(current));
+                __perfMark('trade_get_click');
                 tradeLink.click();
             } else {
                 alert('Arrived at ' + target.location + ' but no trade link found on the nav screen. Open the trade screen manually, then press Next Step again.');
@@ -2505,6 +2535,7 @@ const SECTOR_DATA = {
                 // Submit buys and sells together (same as the manual Transfer button).
                 // If the server rejects the simultaneous dual-trade, the on-screen
                 // "Execute ONLY Dropoffs / Pickups" split buttons handle it as a fallback.
+                __perfMark('trade_post_click');
                 submitTrade();
                 return;
             }
@@ -2540,6 +2571,7 @@ const SECTOR_DATA = {
             if (stopBtn) { stopBtn.disabled = true; stopBtn.style.opacity = '0.5'; }
             const statusEl = document.getElementById('qol-status');
             if (statusEl) statusEl.innerText = qolDescribeNextStep();
+            __perfReport();
             return;
         }
         const btn = document.getElementById('qol-next-btn');
@@ -2570,6 +2602,7 @@ const SECTOR_DATA = {
         if (stopBtn) { stopBtn.disabled = true; stopBtn.style.opacity = '0.5'; }
         const statusEl = document.getElementById('qol-status');
         if (statusEl) statusEl.innerText = qolDescribeNextStep();
+        __perfReport();
     }
 
     function bindQolAutoButtons() {
@@ -6655,6 +6688,7 @@ const SECTOR_DATA = {
                 timestamp: Date.now()
             });
             try {
+                __perfMark('flight_tile_start');
                 navFn(targetId);
             } catch (e) {
                 GM_deleteValue('logistics_ambush_resume');
@@ -6667,6 +6701,7 @@ const SECTOR_DATA = {
                 if (cancelled) { GM_deleteValue('logistics_ambush_resume'); return; }
                 if (currentTileId() !== beforeId) {
                     GM_deleteValue('logistics_ambush_resume');
+                    __perfMark('flight_tile_end');
                     setTimeout(flyNext, 80);
                     return;
                 }
@@ -9718,6 +9753,12 @@ const SECTOR_DATA = {
     // it runs. Everything above is hoisted function declarations + literals.
     const currentPath = window.location.pathname;
 
+    __perfMark('page_arrival');
+    if (typeof unsafeWindow !== 'undefined') {
+        unsafeWindow.__perfReport = __perfReport;
+        unsafeWindow.__perfEnabled = __perfEnabled;
+    }
+
     if (currentPath === '/main.php') {
         syncCargoFromNav();
         // Scrape live terrain from #navarea BEFORE the deferred UI injection
@@ -9772,6 +9813,7 @@ const SECTOR_DATA = {
         // top-cache hit after first load), then the exports calc (1
         // Dijkstra), fly-here (~250 options), and tracker.
         setTimeout(() => {
+            const __tInj = performance.now();
             try { injectNavHUD(); }
             catch (e) { console.error('[pardus-nav] HUD inject failed:', e); }
             try { injectDraggableUI(); }
@@ -9782,13 +9824,16 @@ const SECTOR_DATA = {
             catch (e) { console.error('[pardus-exports] panel inject failed:', e); }
             try { injectTrackerPanel(); }
             catch (e) { console.error('[pardus-tracker] panel inject failed:', e); }
+            if (GM_getValue('logistics_perf_enabled', false)) console.log('[perf] nav_inject: ' + (performance.now() - __tInj).toFixed(1) + 'ms');
         }, 0);
         try { resumeFlightAfterAmbush(); }
         catch (e) { console.error('[pardus-ambush] resume failed:', e); }
     } else if (currentPath === '/overview_buildings.php') {
         injectBuildingsUI();
     } else if (currentPath.includes('trade.php') || currentPath.includes('building_management.php')) {
+        const __tHUD = performance.now();
         injectTradeHUD();
+        if (GM_getValue('logistics_perf_enabled', false)) console.log('[perf] injectTradeHUD: ' + (performance.now() - __tHUD).toFixed(1) + 'ms');
         if (currentPath.includes('building_management.php')) {
             try { capturePersonalToStock(); }
             catch (e) { console.error('[pardus-exports] TO stock capture failed:', e); }
