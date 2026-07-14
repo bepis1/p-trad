@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.07
+// @version      7.08
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v7.03: Debounce terrain recompile + compile-time optimizations. Terrain version bump is now deferred 15s after the last nav step (dirty-flag pattern in scrapeAndStoreTerrain + deferred timer in dispatcher), eliminating the ~8-10s per-step freeze during active exploration. Binary min-heap (_hpaBinHeap) replaces pq.sort()+shift() in hpaLocalDijkstra/hpaLocalAStar (O(n log n)→O(log n) per pop). Flat Float64Array/Int32Array Floyd-Warshall in hpaBuildMacroGraph (cache-friendly, no array-of-arrays pointer chasing). Serialization + GM_setValue deferred to setTimeout(0) so UI panels render first. No signature changes; no estimate fallbacks (ADR 011; all 5 test harnesses green).
 // @description  v7.04: Dump All button — sell-off inverse of Take All. Sells every non-protected cargo item (excludes hydrogen fuel + phantom protection) to the highest-priced tracked buyer in the current sector. Buy prices sourced from the trade tracker (sellToObjPrice); unpriced buyers are ignored (no estimate fallbacks). New calculateDumpAllRoute in sim engine; mirrors take-all plumbing (button → logistics_dump_all_mode → bookkeeper branch → route) (ADR 014; test_dump_all.js green).
 // @description  v7.05: Auto-run trading speedup — 6x reduction in per-stop overhead (~3700ms→~575ms) and 2x faster per-tile flying (~250ms→~130ms) by tuning fixed setTimeout delays to match actual DOM/AJAX response times. Post-click delay 1500ms→100ms (adaptive: detects button-disable or page-nav), page-load resume 1000ms→200ms, disabled-poll 400ms→150ms, inter-tile 150ms→80ms, movement/jump polls 100ms→50ms. No logic changes; only timing constants (ADR 015; test_routing + test_flyhere_plot + test_to + test_cross_sector green).
 // @description  v7.06: Fix auto-run stall after flight arrival — autoStepTick now disables the next-btn immediately after clicking it, preventing re-entry races where the 100ms post-click delay fires before page navigation completes (causing duplicate trade-link clicks that stalled the browser). Button is re-enabled by autoStepResume on the next page load or by the flight callback (ADR 015).
 // @description  v7.07: Toggleable time-budget instrumentation for auto-run trade stops. 3 helper functions (__perfMark/__perfReport/__perfEnabled) + Date.now() marks at every phase boundary (page arrival, qol_next, trade GET/POST clicks, nav return, per-tile flight start/end) + performance.now() wrappers around injectTradeHUD and nav panel injection. Gated on logistics_perf_enabled (off by default, zero overhead). Auto-dumps timing breakdown to console on Stop or route complete; manual __perfReport()/__perfEnabled(true) via DevTools. Data prerequisite for R2-R5 optimization (ADR 017; test_benchmark_auto_run + test_routing + test_flyhere_plot green).
+// @description  v7.08: Fix perf instrumentation loss across page navigations — auto-dump output was cleared by Firefox console on page navigation. Reports now persist in GM storage (logistics_perf_last_report); __perfLastReport() retrieves the last report even after console is cleared. When no new marks exist, __perfReport() prints the stored last report instead of "no marks collected" (ADR 017).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2410,7 +2410,21 @@ const SECTOR_DATA = {
 
     function __perfReport() {
         let m = GM_getValue('logistics_perf_marks', []);
-        if (!m.length) { console.log('[perf] no marks collected'); return; }
+        if (!m.length) {
+            let last = GM_getValue('logistics_perf_last_report', '');
+            if (last) { console.log('[perf] no new marks. Last report:\n' + last); }
+            else { console.log('[perf] no marks collected'); }
+            return;
+        }
+        let lines = [];
+        lines.push('Timing breakdown (' + m.length + ' marks):');
+        for (let i = 1; i < m.length; i++) {
+            let dt = m[i].t - m[i - 1].t;
+            let cross = m[i - 1].p !== m[i].p ? ' [CROSS-PAGE]' : '';
+            lines.push('  ' + i + ': ' + m[i - 1].l + ' \u2192 ' + m[i].l + ': ' + dt + 'ms' + cross);
+        }
+        let report = lines.join('\n');
+        GM_setValue('logistics_perf_last_report', report);
         console.group('[perf] Timing breakdown (' + m.length + ' marks)');
         for (let i = 1; i < m.length; i++) {
             let dt = m[i].t - m[i - 1].t;
@@ -2419,6 +2433,12 @@ const SECTOR_DATA = {
         }
         console.groupEnd();
         GM_setValue('logistics_perf_marks', []);
+    }
+
+    function __perfLastReport() {
+        let last = GM_getValue('logistics_perf_last_report', '');
+        if (last) console.log('[perf] Last report:\n' + last);
+        else console.log('[perf] no report stored yet');
     }
 
     function __perfEnabled(on) {
@@ -9757,6 +9777,7 @@ const SECTOR_DATA = {
     if (typeof unsafeWindow !== 'undefined') {
         unsafeWindow.__perfReport = __perfReport;
         unsafeWindow.__perfEnabled = __perfEnabled;
+        unsafeWindow.__perfLastReport = __perfLastReport;
     }
 
     if (currentPath === '/main.php') {
