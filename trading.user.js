@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.12
+// @version      7.13
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v7.08: Fix perf instrumentation loss across page navigations — auto-dump output was cleared by Firefox console on page navigation. Reports now persist in GM storage (logistics_perf_last_report); __perfLastReport() retrieves the last report even after console is cleared. When no new marks exist, __perfReport() prints the stored last report instead of "no marks collected" (ADR 017).
 // @description  v7.09: Reduce autoStepResume page-load delay 200ms→80ms. Perf data showed ~200ms floor on every page_arrival→qol_next gap (3 per trade stop), saving ~360ms/stop. 80ms matches the proven inter-tile delay floor (ADR 015, ADR 017).
 // @description  v7.10: Add Escape hotkey to stop auto-run. With faster delays the Stop button was unclickable during rapid page navigations. Escape now calls stopAutoStep from any page. Also exposes __stopAuto() on unsafeWindow as a console fallback.
 // @description  v7.11: Skip non-essential panel injection during auto-run (R2). 4 of 5 main.php panels (nav HUD, fly-here, exports calculator, tracker) are skipped when logistics_auto_step is true — only injectDraggableUI runs (has Stop button + autoStepResume). injectSkippedPanels() restores them when auto-run stops or route completes. ~300-400ms saved per main.php page load during auto-run (ADR 019).
 // @description  v7.12: Submit-on-load optimization (R3). During auto-run, injectTradeHUD submits the trade form directly (or returns to nav when no values remain) instead of routing through autoStepResume→autoStepTick→qolNextStep, and the form-interceptor delay drops 150ms→10ms (processTradeDOMBeforeUnload is synchronous, so 10ms suffices for event dispatch). ~310ms saved per trade stop (160ms autoStepResume chain + 150ms interceptor). Non-auto-run path untouched; cargo tracking via processTradeDOMBeforeUnload still runs via the interceptor (ADR 020; test_benchmark_auto_run + test_routing + test_flyhere_plot green).
+// @description  v7.13: Fix auto-run stuck-stop loop and reality-clamp per-commodity cap. checkStuckStop() circuit breaker halts auto-run after 3 consecutive trade-screen visits at the same step (visible red overlay). getTradeRowLimits('sell') now caps dropoffs at per-commodity Max−stock instead of global building free space, matching syncNodeWithReality (part 07). Auto-run no longer resubmits server-rejected trades: hasSpaceError → return to nav + logistics_needs_recalc. Non-synced nodes (nodeIndex===-1) now flag logistics_needs_recalc when a dropoff/pickup is clamped. All fixes guarded by logistics_auto_step except the cap correctness fix; speed gains preserved (ADR 021; test_benchmark_auto_run + test_routing + test_flyhere_plot green).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2632,6 +2632,30 @@ const SECTOR_DATA = {
         if (statusEl) statusEl.innerText = qolDescribeNextStep();
         injectSkippedPanels();
         __perfReport();
+    }
+
+    function checkStuckStop(stepLocation) {
+        if (!stepLocation) return false;
+        const last = GM_getValue('logistics_last_trade_step_loc', '');
+        let count = GM_getValue('logistics_stuck_count', 0);
+        if (normalizeCoords(last) === normalizeCoords(stepLocation)) {
+            count += 1;
+        } else {
+            count = 1;
+            GM_setValue('logistics_last_trade_step_loc', stepLocation);
+        }
+        GM_setValue('logistics_stuck_count', count);
+        if (count >= 3) {
+            stopAutoStep();
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed; top:0; left:0; width:100%; background:#660000; color:#ffff00; text-align:center; padding:12px; z-index:999999; font-weight:bold; font-size:14px; border-bottom:3px solid #ff0000; box-shadow:0px 4px 10px rgba(0,0,0,0.8);';
+            overlay.innerText = '⚠ AUTO-RUN STOPPED: Stuck at ' + stepLocation + ' (trade stop not completing after ' + count + ' attempts). Building may be full or trade rejected. Check and resume manually.';
+            document.body.appendChild(overlay);
+            GM_deleteValue('logistics_last_trade_step_loc');
+            GM_deleteValue('logistics_stuck_count');
+            return true;
+        }
+        return false;
     }
 
     function injectSkippedPanels() {
@@ -6924,6 +6948,10 @@ const SECTOR_DATA = {
             break;
         }
 
+        if (action === 'sell' && !isNaN(stock) && !isNaN(cap) && cap > 0) {
+            freeSpace = Math.max(0, cap - stock);
+        }
+
         return {
             found: !isNaN(stock) || !isNaN(freeSpace),
             stock: stock,
@@ -7107,6 +7135,10 @@ const SECTOR_DATA = {
 
         const currentStep = safeSteps[0];
 
+        if (GM_getValue('logistics_auto_step', false) && checkStuckStop(currentStep.location)) {
+            return;
+        }
+
         if (normalizeCoords(currentStep.location) !== normalizeCoords(currentCoords)) {
             const staleHud = document.createElement('div');
             staleHud.style.cssText = `background: #442200; color: #fff; text-align: center; padding: 10px; border-bottom: 2px solid #ffaa00; font-family: Verdana, sans-serif; font-size: 13px;`;
@@ -7183,6 +7215,8 @@ const SECTOR_DATA = {
                             realityPatched = true;
                         }
                     }
+                } else {
+                    GM_setValue('logistics_needs_recalc', true);
                 }
                 data.amount = dropAmt;
             }
@@ -7232,6 +7266,8 @@ const SECTOR_DATA = {
                             realityPatched = true;
                         }
                     }
+                } else {
+                    GM_setValue('logistics_needs_recalc', true);
                 }
                 data.amount = safeAmt;
             }
@@ -7332,6 +7368,15 @@ const SECTOR_DATA = {
         bindQolAutoButtons();
         bindQolHotkey();
         if (GM_getValue('logistics_auto_step', false)) {
+            if (hasSpaceError) {
+                GM_setValue('logistics_needs_recalc', true);
+                __perfMark('qol_next');
+                __perfMark('nav_return_click');
+                GM_deleteValue('logistics_trade_loc');
+                try { top.frames.main.location.href = '/main.php?nav=1'; }
+                catch (err) { top.location.href = '/main.php?nav=1'; }
+                return;
+            }
             const inputs = Array.from(document.querySelectorAll(allTradeInputSelector()));
             const hasSell = inputs.some(i => classifyTradeInput(i) === 'sell' && parseInt(i.value, 10) > 0);
             const hasBuy = inputs.some(i => classifyTradeInput(i) === 'buy' && parseInt(i.value, 10) > 0);
