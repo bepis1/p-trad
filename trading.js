@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.15
+// @version      7.16
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v7.11: Skip non-essential panel injection during auto-run (R2). 4 of 5 main.php panels (nav HUD, fly-here, exports calculator, tracker) are skipped when logistics_auto_step is true — only injectDraggableUI runs (has Stop button + autoStepResume). injectSkippedPanels() restores them when auto-run stops or route completes. ~300-400ms saved per main.php page load during auto-run (ADR 019).
 // @description  v7.12: Submit-on-load optimization (R3). During auto-run, injectTradeHUD submits the trade form directly (or returns to nav when no values remain) instead of routing through autoStepResume→autoStepTick→qolNextStep, and the form-interceptor delay drops 150ms→10ms (processTradeDOMBeforeUnload is synchronous, so 10ms suffices for event dispatch). ~310ms saved per trade stop (160ms autoStepResume chain + 150ms interceptor). Non-auto-run path untouched; cargo tracking via processTradeDOMBeforeUnload still runs via the interceptor (ADR 020; test_benchmark_auto_run + test_routing + test_flyhere_plot green).
 // @description  v7.13: Fix auto-run stuck-stop loop and reality-clamp per-commodity cap. checkStuckStop() circuit breaker halts auto-run after 3 consecutive trade-screen visits at the same step (visible red overlay). getTradeRowLimits('sell') now caps dropoffs at per-commodity Max−stock instead of global building free space, matching syncNodeWithReality (part 07). Auto-run no longer resubmits server-rejected trades: hasSpaceError → return to nav + logistics_needs_recalc. Non-synced nodes (nodeIndex===-1) now flag logistics_needs_recalc when a dropoff/pickup is clamped. All fixes guarded by logistics_auto_step except the cap correctness fix; speed gains preserved (ADR 021; test_benchmark_auto_run + test_routing + test_flyhere_plot green).
 // @description  v7.14: Frame-budget watchdog + heavy-op attribution (ADR 022). rAF loop records frames blocked >100ms tagged with the running function (__currentOp lingering label set at entry of 10 heavy functions). __heavyT0/__heavyT1 duration guards wrap the 3× optimizeFactoryRuns call sites and hpaCompile call site to disambiguate which invocation is slow. In-memory ring buffers (no GM_setValue in the hot path). Gated on logistics_perf_enabled (off by default, zero overhead); enable via __perfEnabled(true), dump via __perfDump(). Measurement only — no behavior change; prerequisite for adaptive degradation (ADR 023).
-// @description  v7.15: Firefox-safe unsafeWindow exposure for console helpers (ADR 023). Direct unsafeWindow.X = X assignment is silently swallowed by Firefox Xray wrappers — __perfEnabled/__perfReport/__perfLastReport/__perfDump/__stopAuto were ReferenceError when called from the Firefox devtools console (the documented entry point, e.g. __perfEnabled(true)). Replaced with an expose() helper that prefers exportFunction (the Gecko sandbox→content API, available when @grant unsafeWindow is set) and falls back to wrappedJSObject then direct assignment for Chrome. Chrome behavior unchanged; block-scoped const inside the existing if-block preserves the no-TDZ dispatcher invariant (test_routing green).
+// @description  v7.15: Firefox-safe unsafeWindow exposure for console helpers (ADR 023). Direct unsafeWindow.X = X assignment is silently swallowed by Firefox Xray wrappers — __perfEnabled/__perfReport/__perfLastReport/__perfDump/__stopAuto were ReferenceError when called from the Firefox devtools console. Replaced with an expose() helper that prefers exportFunction (Gecko sandbox→content API) and falls back to wrappedJSObject then direct assignment for Chrome. Chrome behavior unchanged; block-scoped const inside the existing if-block preserves the no-TDZ dispatcher invariant (test_routing green).
+// @description  v7.16: Fix v7.15 console helper exposure — exportFunction is NOT available in Tampermonkey's Firefox sandbox (it's a Greasemonkey/Components.utils API), so all three v7.15 fallbacks failed silently. Replaced with a script-tag event bridge: inject a page-context <script> defining stub functions that dispatch CustomEvents on document (which crosses the Xray boundary); sandbox-side listeners call the real functions. Also added 5 GM_registerMenuCommand entries (Enable/Disable perf, Dump/Show last report, Stop auto-step) as a reliable cross-browser fallback accessible from the Tampermonkey toolbar menu. __perfEnabled(true) etc. now callable from Firefox devtools console (ADR 023 revised; test_routing green).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -9938,21 +9938,37 @@ const SECTOR_DATA = {
     const currentPath = window.location.pathname;
 
     __perfMark('page_arrival');
-    if (typeof unsafeWindow !== 'undefined') {
-        const expose = (name, fn) => {
-            if (typeof exportFunction === 'function') {
-                exportFunction(fn, unsafeWindow, { defineAs: name });
-            } else if (unsafeWindow.wrappedJSObject) {
-                unsafeWindow.wrappedJSObject[name] = fn;
-            } else {
-                unsafeWindow[name] = fn;
-            }
-        };
-        expose('__perfReport', __perfReport);
-        expose('__perfEnabled', __perfEnabled);
-        expose('__perfLastReport', __perfLastReport);
-        expose('__perfDump', __perfDump);
-        expose('__stopAuto', stopAutoStep);
+    // Firefox Xray wrappers prevent direct unsafeWindow.X = fn from being
+    // visible in the page console, and Tampermonkey (unlike Greasemonkey)
+    // does not expose exportFunction as a sandbox global. Use a script-tag
+    // event bridge: inject a page-context <script> that defines stub
+    // functions dispatching CustomEvents on document (which crosses the
+    // Xray boundary); the sandbox listens and calls the real functions.
+    // Also register GM_registerMenuCommand entries as a reliable
+    // cross-browser fallback. (ADR 023)
+    document.addEventListener('pardus-perf-enabled', function(e) { __perfEnabled(e.detail); });
+    document.addEventListener('pardus-perf-report', function() { __perfReport(); });
+    document.addEventListener('pardus-perf-last', function() { __perfLastReport(); });
+    document.addEventListener('pardus-perf-dump', function() { __perfDump(); });
+    document.addEventListener('pardus-stop-auto', function() { stopAutoStep(); });
+    const __bridge = document.createElement('script');
+    __bridge.textContent = [
+        "(function(){",
+        "window.__perfEnabled=function(on){document.dispatchEvent(new CustomEvent('pardus-perf-enabled',{detail:!!on}));};",
+        "window.__perfReport=function(){document.dispatchEvent(new CustomEvent('pardus-perf-report'));};",
+        "window.__perfLastReport=function(){document.dispatchEvent(new CustomEvent('pardus-perf-last'));};",
+        "window.__perfDump=function(){document.dispatchEvent(new CustomEvent('pardus-perf-dump'));};",
+        "window.__stopAuto=function(){document.dispatchEvent(new CustomEvent('pardus-stop-auto'));};",
+        "})();"
+    ].join('');
+    (document.head || document.documentElement).appendChild(__bridge);
+    __bridge.remove();
+    if (typeof GM_registerMenuCommand === 'function') {
+        GM_registerMenuCommand('Pardus: Enable perf instrumentation', function() { __perfEnabled(true); });
+        GM_registerMenuCommand('Pardus: Disable perf instrumentation', function() { __perfEnabled(false); });
+        GM_registerMenuCommand('Pardus: Dump perf report', function() { __perfDump(); });
+        GM_registerMenuCommand('Pardus: Show last perf report', function() { __perfLastReport(); });
+        GM_registerMenuCommand('Pardus: Stop auto-step', function() { stopAutoStep(); });
     }
     __startWatchdog();
 
