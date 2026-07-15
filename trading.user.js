@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.16
+// @version      7.17
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v7.12: Submit-on-load optimization (R3). During auto-run, injectTradeHUD submits the trade form directly (or returns to nav when no values remain) instead of routing through autoStepResume→autoStepTick→qolNextStep, and the form-interceptor delay drops 150ms→10ms (processTradeDOMBeforeUnload is synchronous, so 10ms suffices for event dispatch). ~310ms saved per trade stop (160ms autoStepResume chain + 150ms interceptor). Non-auto-run path untouched; cargo tracking via processTradeDOMBeforeUnload still runs via the interceptor (ADR 020; test_benchmark_auto_run + test_routing + test_flyhere_plot green).
 // @description  v7.13: Fix auto-run stuck-stop loop and reality-clamp per-commodity cap. checkStuckStop() circuit breaker halts auto-run after 3 consecutive trade-screen visits at the same step (visible red overlay). getTradeRowLimits('sell') now caps dropoffs at per-commodity Max−stock instead of global building free space, matching syncNodeWithReality (part 07). Auto-run no longer resubmits server-rejected trades: hasSpaceError → return to nav + logistics_needs_recalc. Non-synced nodes (nodeIndex===-1) now flag logistics_needs_recalc when a dropoff/pickup is clamped. All fixes guarded by logistics_auto_step except the cap correctness fix; speed gains preserved (ADR 021; test_benchmark_auto_run + test_routing + test_flyhere_plot green).
 // @description  v7.14: Frame-budget watchdog + heavy-op attribution (ADR 022). rAF loop records frames blocked >100ms tagged with the running function (__currentOp lingering label set at entry of 10 heavy functions). __heavyT0/__heavyT1 duration guards wrap the 3× optimizeFactoryRuns call sites and hpaCompile call site to disambiguate which invocation is slow. In-memory ring buffers (no GM_setValue in the hot path). Gated on logistics_perf_enabled (off by default, zero overhead); enable via __perfEnabled(true), dump via __perfDump(). Measurement only — no behavior change; prerequisite for adaptive degradation (ADR 023).
 // @description  v7.15: Firefox-safe unsafeWindow exposure for console helpers (ADR 023). Direct unsafeWindow.X = X assignment is silently swallowed by Firefox Xray wrappers — __perfEnabled/__perfReport/__perfLastReport/__perfDump/__stopAuto were ReferenceError when called from the Firefox devtools console. Replaced with an expose() helper that prefers exportFunction (Gecko sandbox→content API) and falls back to wrappedJSObject then direct assignment for Chrome. Chrome behavior unchanged; block-scoped const inside the existing if-block preserves the no-TDZ dispatcher invariant (test_routing green).
 // @description  v7.16: Fix v7.15 console helper exposure — exportFunction is NOT available in Tampermonkey's Firefox sandbox (it's a Greasemonkey/Components.utils API), so all three v7.15 fallbacks failed silently. Replaced with a script-tag event bridge: inject a page-context <script> defining stub functions that dispatch CustomEvents on document (which crosses the Xray boundary); sandbox-side listeners call the real functions. Also added 5 GM_registerMenuCommand entries (Enable/Disable perf, Dump/Show last report, Stop auto-step) as a reliable cross-browser fallback accessible from the Tampermonkey toolbar menu. __perfEnabled(true) etc. now callable from Firefox devtools console (ADR 023 revised; test_routing green).
+// @description  v7.17: Web Worker heartbeat watchdog (ADR 024, supersedes ADR 022's rAF watchdog). The rAF watchdog couldn't detect infinite-loop lockups — rAF is a macrotask and can't fire during synchronous blocks, so `while(true)` loops were invisible. Replaced with a Blob URL Web Worker running setInterval(50ms) on its OWN thread (immune to main-thread blocking): detects missed heartbeats (100ms threshold), pushes block entries to the main thread in real-time. __setOp also writes to localStorage as crash forensics (survives hard refresh — auto-logs `⚠ PREVIOUS PAGE BLOCKED` on next page load). Fallback to localStorage-only if Worker creation fails (CSP). __heavyT0/__heavyT1 duration guards unchanged. test_routing green.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2445,24 +2445,43 @@ const SECTOR_DATA = {
     function __perfEnabled(on) {
         __perfOn = on;
         GM_setValue('logistics_perf_enabled', on);
-        if (!on) GM_setValue('logistics_perf_marks', []);
+        if (!on) {
+            GM_setValue('logistics_perf_marks', []);
+            try { localStorage.removeItem('pardus_perf_heartbeat'); } catch(e) {}
+            if (__worker) { try { __worker.terminate(); } catch(e) {} __worker = null; }
+            __watchdogRunning = false;
+            __frameLog.length = 0;
+            __heavyLog.length = 0;
+        }
         if (on) __startWatchdog();
         console.log('[perf] instrumentation ' + (on ? 'ENABLED' : 'disabled'));
     }
 
-    // >> Frame-budget watchdog + heavy-op attribution (ADR 022)
-    // Measurement only — no behavior change. Inert unless __perfEnabled(true).
-    // __currentOp is a lingering label: set at heavy-fn entry, never cleared
-    // (overwritten by next heavy op). When the rAF watchdog fires after a
-    // blocked frame, __currentOp still names the function that was running.
+    // >> Frame-budget watchdog + heavy-op attribution (ADR 022, revised ADR 024)
+    // ADR 022 used rAF for block detection — but rAF can't fire during
+    // synchronous blocks (infinite loops lock the main thread, no macrotask
+    // fires, no block is ever logged). ADR 024 replaces the rAF loop with a
+    // Web Worker heartbeat: the worker runs setInterval on its OWN thread
+    // (immune to main-thread blocking), detects missed heartbeats (100ms
+    // threshold), and pushes block entries back to the main thread in
+    // real-time. __setOp also writes to localStorage as crash forensics —
+    // survives hard refresh when the worker is killed mid-block, checked on
+    // the next page load by __startWatchdog().
     const __FRAME_THRESHOLD = 100;
     const __HEAVY_THRESHOLD  = 50;
     const __LOG_CAP = 200;
     let __currentOp = 'idle';
     const __frameLog = [];
     const __heavyLog = [];
+    let __worker = null;
+    let __watchdogRunning = false;
 
-    function __setOp(name) { if (__perfOn) __currentOp = name; }
+    function __setOp(name) {
+        if (!__perfOn) return;
+        __currentOp = name;
+        if (__worker) { try { __worker.postMessage({ type: 'op', op: name }); } catch(e) {} }
+        try { localStorage.setItem('pardus_perf_heartbeat', JSON.stringify({ op: name, t: Date.now(), path: location.pathname })); } catch(e) {}
+    }
     function __heavyT0(name) { __setOp(name); return performance.now(); }
     function __heavyT1(name, t0) {
         if (!__perfOn) return;
@@ -2473,28 +2492,92 @@ const SECTOR_DATA = {
         }
     }
 
-    let __watchdogRunning = false;
     function __startWatchdog() {
         if (__watchdogRunning || !__perfOn) return;
         __watchdogRunning = true;
-        let lastT = performance.now();
-        const tick = () => {
-            const now = performance.now();
-            const dt = now - lastT;
-            lastT = now;
-            if (dt >= __FRAME_THRESHOLD) {
-                __frameLog.push({ blocked: +dt.toFixed(1), op: __currentOp, t: Date.now(), path: location.pathname });
-                if (__frameLog.length > __LOG_CAP) __frameLog.shift();
+
+        // Crash forensics: check if the previous page was blocked (stale
+        // heartbeat in localStorage from a hard-refreshed infinite loop).
+        try {
+            const hb = JSON.parse(localStorage.getItem('pardus_perf_heartbeat') || 'null');
+            if (hb) {
+                const age = Date.now() - hb.t;
+                if (age > 2000) {
+                    console.warn('[perf-watchdog] \u26a0 PREVIOUS PAGE BLOCKED for >=' + age + 'ms @ ' + hb.op + ' (' + hb.path + ') \u2014 likely an infinite loop or very long synchronous block.');
+                }
             }
+        } catch(e) {}
+
+        // Worker source: runs setInterval on its own thread, immune to
+        // main-thread blocking. Detects missed heartbeats (100ms threshold)
+        // and pushes block entries back to the main thread in real-time.
+        const workerSrc = [
+            "var lastHb=Date.now(),lastOp='idle',lastPath='',blocking=false,blockStart=0;",
+            "var blocks=[],THRESHOLD=" + __FRAME_THRESHOLD + ",CAP=" + __LOG_CAP + ";",
+            "self.onmessage=function(e){",
+            "var m=e.data;",
+            "if(m.type==='op'){lastOp=m.op;}",
+            "else if(m.type==='heartbeat'){",
+            "if(blocking){var total=m.t-blockStart;var blk={blocked:+total.toFixed(0),op:lastOp,t:blockStart,path:lastPath,recovered:true};blocks.push(blk);if(blocks.length>CAP)blocks.shift();self.postMessage({type:'block',block:blk});blocking=false;}",
+            "lastHb=m.t;lastPath=m.path;",
+            "}",
+            "else if(m.type==='dump'){self.postMessage({type:'blocks',blocks:blocks});}",
+            "else if(m.type==='clear'){blocks.length=0;}",
+            "};",
+            "setInterval(function(){",
+            "var now=Date.now(),dt=now-lastHb;",
+            "if(dt>=THRESHOLD){",
+            "if(!blocking){blocking=true;blockStart=lastHb;var blk={blocked:+dt.toFixed(0),op:lastOp,t:blockStart,path:lastPath,ongoing:true};blocks.push(blk);if(blocks.length>CAP)blocks.shift();self.postMessage({type:'block',block:blk});}",
+            "else{if(blocks.length>0)blocks[blocks.length-1].blocked=+dt.toFixed(0);}",
+            "}",
+            "},50);"
+        ].join('\n');
+
+        try {
+            const blob = new Blob([workerSrc], { type: 'application/javascript' });
+            __worker = new Worker(URL.createObjectURL(blob));
+            __worker.onerror = function(e) { console.warn('[perf] Worker error:', e.message); };
+            __worker.onmessage = function(e) {
+                if (e.data.type === 'block') {
+                    __frameLog.push(e.data.block);
+                    if (__frameLog.length > __LOG_CAP) __frameLog.shift();
+                } else if (e.data.type === 'blocks') {
+                    __frameLog.length = 0;
+                    __frameLog.push.apply(__frameLog, e.data.blocks);
+                }
+            };
+            // Send initial heartbeat so the worker doesn't immediately log a
+            // false positive block before the first rAF tick arrives.
+            __worker.postMessage({ type: 'op', op: __currentOp });
+            __worker.postMessage({ type: 'heartbeat', t: Date.now(), path: location.pathname });
+            const tick = () => {
+                if (__worker) { try { __worker.postMessage({ type: 'heartbeat', t: Date.now(), path: location.pathname }); } catch(e) {} }
+                requestAnimationFrame(tick);
+            };
             requestAnimationFrame(tick);
-        };
-        requestAnimationFrame(tick);
+        } catch (e) {
+            console.warn('[perf] Worker creation failed, localStorage-only fallback:', e.message);
+            __worker = null;
+            const tick = () => {
+                try { localStorage.setItem('pardus_perf_heartbeat', JSON.stringify({ op: __currentOp, t: Date.now(), path: location.pathname })); } catch(e) {}
+                requestAnimationFrame(tick);
+            };
+            requestAnimationFrame(tick);
+        }
     }
 
     function __perfDump() {
+        try {
+            const hb = JSON.parse(localStorage.getItem('pardus_perf_heartbeat') || 'null');
+            if (hb) {
+                const age = Date.now() - hb.t;
+                if (age > 2000) console.warn('[perf-watchdog] Stale heartbeat: ' + age + 'ms @ ' + hb.op + ' (' + hb.path + ')');
+            }
+        } catch(e) {}
+        if (__worker) { try { __worker.postMessage({ type: 'dump' }); } catch(e) {} }
         console.group('[perf-watchdog] ' + new Date().toLocaleTimeString());
         console.log('Frame blocks (' + __frameLog.length + '):');
-        __frameLog.forEach(e => console.log('  ' + e.blocked + 'ms @ ' + e.op + ' (' + e.path + ')'));
+        __frameLog.forEach(e => console.log('  ' + e.blocked + 'ms @ ' + e.op + ' (' + e.path + ')' + (e.recovered ? ' [recovered]' : e.ongoing ? ' [ongoing]' : '')));
         console.log('Heavy ops (' + __heavyLog.length + '):');
         __heavyLog.forEach(e => console.log('  ' + e.op + ': ' + e.ms + 'ms (' + e.path + ')'));
         console.groupEnd();
