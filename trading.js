@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.13
+// @version      7.14
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v7.09: Reduce autoStepResume page-load delay 200ms→80ms. Perf data showed ~200ms floor on every page_arrival→qol_next gap (3 per trade stop), saving ~360ms/stop. 80ms matches the proven inter-tile delay floor (ADR 015, ADR 017).
 // @description  v7.10: Add Escape hotkey to stop auto-run. With faster delays the Stop button was unclickable during rapid page navigations. Escape now calls stopAutoStep from any page. Also exposes __stopAuto() on unsafeWindow as a console fallback.
 // @description  v7.11: Skip non-essential panel injection during auto-run (R2). 4 of 5 main.php panels (nav HUD, fly-here, exports calculator, tracker) are skipped when logistics_auto_step is true — only injectDraggableUI runs (has Stop button + autoStepResume). injectSkippedPanels() restores them when auto-run stops or route completes. ~300-400ms saved per main.php page load during auto-run (ADR 019).
 // @description  v7.12: Submit-on-load optimization (R3). During auto-run, injectTradeHUD submits the trade form directly (or returns to nav when no values remain) instead of routing through autoStepResume→autoStepTick→qolNextStep, and the form-interceptor delay drops 150ms→10ms (processTradeDOMBeforeUnload is synchronous, so 10ms suffices for event dispatch). ~310ms saved per trade stop (160ms autoStepResume chain + 150ms interceptor). Non-auto-run path untouched; cargo tracking via processTradeDOMBeforeUnload still runs via the interceptor (ADR 020; test_benchmark_auto_run + test_routing + test_flyhere_plot green).
 // @description  v7.13: Fix auto-run stuck-stop loop and reality-clamp per-commodity cap. checkStuckStop() circuit breaker halts auto-run after 3 consecutive trade-screen visits at the same step (visible red overlay). getTradeRowLimits('sell') now caps dropoffs at per-commodity Max−stock instead of global building free space, matching syncNodeWithReality (part 07). Auto-run no longer resubmits server-rejected trades: hasSpaceError → return to nav + logistics_needs_recalc. Non-synced nodes (nodeIndex===-1) now flag logistics_needs_recalc when a dropoff/pickup is clamped. All fixes guarded by logistics_auto_step except the cap correctness fix; speed gains preserved (ADR 021; test_benchmark_auto_run + test_routing + test_flyhere_plot green).
+// @description  v7.14: Frame-budget watchdog + heavy-op attribution (ADR 022). rAF loop records frames blocked >100ms tagged with the running function (__currentOp lingering label set at entry of 10 heavy functions). __heavyT0/__heavyT1 duration guards wrap the 3× optimizeFactoryRuns call sites and hpaCompile call site to disambiguate which invocation is slow. In-memory ring buffers (no GM_setValue in the hot path). Gated on logistics_perf_enabled (off by default, zero overhead); enable via __perfEnabled(true), dump via __perfDump(). Measurement only — no behavior change; prerequisite for adaptive degradation (ADR 023).
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -2441,10 +2441,63 @@ const SECTOR_DATA = {
         else console.log('[perf] no report stored yet');
     }
 
+    let __perfOn = GM_getValue('logistics_perf_enabled', false);
     function __perfEnabled(on) {
+        __perfOn = on;
         GM_setValue('logistics_perf_enabled', on);
         if (!on) GM_setValue('logistics_perf_marks', []);
+        if (on) __startWatchdog();
         console.log('[perf] instrumentation ' + (on ? 'ENABLED' : 'disabled'));
+    }
+
+    // >> Frame-budget watchdog + heavy-op attribution (ADR 022)
+    // Measurement only — no behavior change. Inert unless __perfEnabled(true).
+    // __currentOp is a lingering label: set at heavy-fn entry, never cleared
+    // (overwritten by next heavy op). When the rAF watchdog fires after a
+    // blocked frame, __currentOp still names the function that was running.
+    const __FRAME_THRESHOLD = 100;
+    const __HEAVY_THRESHOLD  = 50;
+    const __LOG_CAP = 200;
+    let __currentOp = 'idle';
+    const __frameLog = [];
+    const __heavyLog = [];
+
+    function __setOp(name) { if (__perfOn) __currentOp = name; }
+    function __heavyT0(name) { __setOp(name); return performance.now(); }
+    function __heavyT1(name, t0) {
+        if (!__perfOn) return;
+        const dt = performance.now() - t0;
+        if (dt >= __HEAVY_THRESHOLD) {
+            __heavyLog.push({ op: name, ms: +dt.toFixed(1), t: Date.now(), path: location.pathname });
+            if (__heavyLog.length > __LOG_CAP) __heavyLog.shift();
+        }
+    }
+
+    let __watchdogRunning = false;
+    function __startWatchdog() {
+        if (__watchdogRunning || !__perfOn) return;
+        __watchdogRunning = true;
+        let lastT = performance.now();
+        const tick = () => {
+            const now = performance.now();
+            const dt = now - lastT;
+            lastT = now;
+            if (dt >= __FRAME_THRESHOLD) {
+                __frameLog.push({ blocked: +dt.toFixed(1), op: __currentOp, t: Date.now(), path: location.pathname });
+                if (__frameLog.length > __LOG_CAP) __frameLog.shift();
+            }
+            requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+    }
+
+    function __perfDump() {
+        console.group('[perf-watchdog] ' + new Date().toLocaleTimeString());
+        console.log('Frame blocks (' + __frameLog.length + '):');
+        __frameLog.forEach(e => console.log('  ' + e.blocked + 'ms @ ' + e.op + ' (' + e.path + ')'));
+        console.log('Heavy ops (' + __heavyLog.length + '):');
+        __heavyLog.forEach(e => console.log('  ' + e.op + ': ' + e.ms + 'ms (' + e.path + ')'));
+        console.groupEnd();
     }
 
     function qolGoToNav() {
@@ -2889,6 +2942,7 @@ const SECTOR_DATA = {
     }
 
     function computeExportRoutes() {
+        __setOp('computeExportRoutes');
         const toCoordsRaw = GM_getValue('config_to_coords', '');
         const toCoords = toCoordsRaw ? parseCoords(toCoordsRaw) : null;
         const exportsRaw = GM_getValue('config_export_items', '');
@@ -3458,6 +3512,7 @@ const SECTOR_DATA = {
     // loading is free via building_management), opportunities require actual
     // trade-form actions at both ends.
     function computeOpportunities() {
+        __setOp('computeOpportunities');
         const maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
         const TRADE_AP = 10;
         const minCrAp = parseFloat(GM_getValue('opps_min_crap', '0')) || 0;
@@ -3597,6 +3652,7 @@ const SECTOR_DATA = {
     // = combined sell+buy at each end, 5+5, steady-state). cr/AP = total
     // profit / total AP. Sorted by cr/AP descending.
     function computeTwoWayArbitrage() {
+        __setOp('computeTwoWayArbitrage');
         const maxCargo = parseInt(GM_getValue('config_max_cargo', '200'), 10) || 200;
         const TRADE_AP = 10;
         const minCrAp = parseFloat(GM_getValue('opps_min_crap', '0')) || 0;
@@ -5802,6 +5858,7 @@ const SECTOR_DATA = {
     // Called synchronously by hpaGetTable() on first query.
     // Returns a table with Map/Set (structured-clone safe if ever offloaded).
     function hpaCompile(rawText, sectorMeta, terrainAP, wjump, sealed, liveTerrain) {
+        __setOp('hpaCompile');
         const sectors = hpaParseMap(rawText, sectorMeta, liveTerrain);
         const macro = hpaBuildMacroGraph(sectors, terrainAP, wjump || 10, sealed || new Set());
         return { sectors, macro, terrainAP, wjump: wjump || 10, dijCache: new Map() };
@@ -6129,6 +6186,7 @@ const SECTOR_DATA = {
     // corrupt, or when GM_setValue quota is exceeded.
     let _hpaTable = null, _hpaTableKey = null;
     function hpaGetTable() {
+        __setOp('hpaGetTable');
         try {
             const rawText = localStorage.getItem("pardus_static_map_data");
             if (!rawText || rawText.includes("PASTE_YOUR_STATICXT_TXT_HERE")) return null;
@@ -6183,7 +6241,7 @@ const SECTOR_DATA = {
 
             // Full compile (first load or cache miss).
             console.log('[hpa] L3: full compile (L2 miss)');
-            _hpaTable = hpaCompile(rawText, SECTOR_DATA, terrainAP, wjump, sealed, liveTerrain);
+            { const __t = __heavyT0('hpaCompile'); _hpaTable = hpaCompile(rawText, SECTOR_DATA, terrainAP, wjump, sealed, liveTerrain); __heavyT1('hpaCompile', __t); }
             _hpaTableKey = key;
             try {
                 top.__hpaTable = _hpaTable;
@@ -8232,6 +8290,7 @@ const SECTOR_DATA = {
     // Dijkstra. NO estimation fallback: throws when the sector is unknown,
     // the static map isn't loaded, or the target is unreachable.
     function simTravelAP(fromCoords, toCoords, sectorName, dijCache) {
+        __setOp('simTravelAP');
         if (!fromCoords || !toCoords) {
             throw new Error('simTravelAP: null coords (from=' + JSON.stringify(fromCoords) + ', to=' + JSON.stringify(toCoords) + ')');
         }
@@ -8457,6 +8516,7 @@ const SECTOR_DATA = {
     // Hub/TO reload boundaries are never crossed. Only runs with all-unique
     // locations qualify (node-side supply/demand is order-independent).
     function optimizeFactoryRuns(routeSteps, initialCargo, initialSpace, initialMagScoopUsed, sectorName, startLoc) {
+        __setOp('optimizeFactoryRuns');
         if (!routeSteps || routeSteps.length < 3) return routeSteps;
         const dijCache = {};
         const travelAP = (a, b) => simTravelAP(a, b, sectorName, dijCache);
@@ -8606,6 +8666,7 @@ const SECTOR_DATA = {
     }
 
     function calculateOptimalRoute(rawNodes, currentLocStr, hubLocStr, maxCargo, toCoordStr, toCapacity, hubType, minTradeVol, exportItemsStr, liveCargoStr) {
+        __setOp('calculateOptimalRoute');
         let routeSteps = [];
         let toInventory = {};
 
@@ -9548,7 +9609,7 @@ const SECTOR_DATA = {
             }
         }
 
-        routeSteps = optimizeFactoryRuns(routeSteps, initialShipCargo, initialShipSpace, initialSimMagScoopUsed, simSector, startLoc);
+        { const __t = __heavyT0('optimizeFactoryRuns#1'); routeSteps = optimizeFactoryRuns(routeSteps, initialShipCargo, initialShipSpace, initialSimMagScoopUsed, simSector, startLoc); __heavyT1('optimizeFactoryRuns#1', __t); }
 
         return { steps: routeSteps, toInventory: toInventory };
     }
@@ -9709,7 +9770,7 @@ const SECTOR_DATA = {
 
         tryDumpToTO();
 
-        routeSteps = optimizeFactoryRuns(routeSteps, initialShipCargo, initialShipSpace, initialSimMagScoopUsed, simSector, startLoc);
+        { const __t = __heavyT0('optimizeFactoryRuns#2'); routeSteps = optimizeFactoryRuns(routeSteps, initialShipCargo, initialShipSpace, initialSimMagScoopUsed, simSector, startLoc); __heavyT1('optimizeFactoryRuns#2', __t); }
 
         return { steps: routeSteps, toInventory: toInventory, mode: 'take_all' };
     }
@@ -9835,12 +9896,13 @@ const SECTOR_DATA = {
             currentLoc = best.nLoc;
         }
 
-        routeSteps = optimizeFactoryRuns(routeSteps, initialShipCargo, initialShipSpace, initialSimMagScoopUsed, simSector, startLoc);
+        { const __t = __heavyT0('optimizeFactoryRuns#3'); routeSteps = optimizeFactoryRuns(routeSteps, initialShipCargo, initialShipSpace, initialSimMagScoopUsed, simSector, startLoc); __heavyT1('optimizeFactoryRuns#3', __t); }
 
         return { steps: routeSteps, toInventory: toInventory, mode: 'dump_all' };
     }
 
     function recalculateRouteOnTheFly(sectorState) {
+        __setOp('recalculateRouteOnTheFly');
         let activeData = GM_getValue('logistics_route_v5', { steps: [], history: [] });
         let currentLoc = activeData.history.length > 0 ? activeData.history[activeData.history.length - 1].location : GM_getValue('config_hub_coords', '[7,16]');
         try { currentLoc = document.getElementById('coords').innerText; } catch(e){}
@@ -9880,8 +9942,10 @@ const SECTOR_DATA = {
         unsafeWindow.__perfReport = __perfReport;
         unsafeWindow.__perfEnabled = __perfEnabled;
         unsafeWindow.__perfLastReport = __perfLastReport;
+        unsafeWindow.__perfDump = __perfDump;
         unsafeWindow.__stopAuto = stopAutoStep;
     }
+    __startWatchdog();
 
     if (currentPath === '/main.php') {
         syncCargoFromNav();
