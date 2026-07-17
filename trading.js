@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Pardus Logistics Router & Executer (Split-Transfer Bypass)
 // @namespace    http://tampermonkey.net/
-// @version      7.19
+// @version      7.20
 // @description  Pardus logistics router: true AP-density route simulation, per-location trade tracking, exports/FWE/opportunities calculators, wormhole-aware auto-fly, and private-repo self-update.
-// @description  v7.15: Firefox-safe unsafeWindow exposure for console helpers (ADR 023). Direct unsafeWindow.X = X assignment is silently swallowed by Firefox Xray wrappers — __perfEnabled/__perfReport/__perfLastReport/__perfDump/__stopAuto were ReferenceError when called from the Firefox devtools console. Replaced with an expose() helper that prefers exportFunction (Gecko sandbox→content API) and falls back to wrappedJSObject then direct assignment for Chrome. Chrome behavior unchanged; block-scoped const inside the existing if-block preserves the no-TDZ dispatcher invariant (test_routing green).
 // @description  v7.16: Fix v7.15 console helper exposure — exportFunction is NOT available in Tampermonkey's Firefox sandbox (it's a Greasemonkey/Components.utils API), so all three v7.15 fallbacks failed silently. Replaced with a script-tag event bridge: inject a page-context <script> defining stub functions that dispatch CustomEvents on document (which crosses the Xray boundary); sandbox-side listeners call the real functions. Also added 5 GM_registerMenuCommand entries (Enable/Disable perf, Dump/Show last report, Stop auto-step) as a reliable cross-browser fallback accessible from the Tampermonkey toolbar menu. __perfEnabled(true) etc. now callable from Firefox devtools console (ADR 023 revised; test_routing green).
 // @description  v7.17: Web Worker heartbeat watchdog (ADR 024, supersedes ADR 022). rAF-based frame-block detection cannot fire during a main-thread freeze (rAF stops). Replaced with a Web Worker running a 100ms setInterval independent of the main thread: heartbeats stop during a freeze, the worker detects the gap, and records a frame block attributed to __currentOp. Blocks persist to indexedDB; __perfCrashRecovery() auto-dumps them on next page load if perf is enabled. __perfDump() is now async (worker postMessage round-trip). Feature-detects Worker/Blob/URL.createObjectURL with graceful degradation (heavyLog still works). No new @grant lines (Worker/Blob/URL are DOM APIs; test_routing green).
 // @description  v7.18: Perf-watchdog branch attribution + heavyLog cross-page persistence (ADR 026). hpaGetTable L1/L2/L3/error branch returns now carry __heavyT1 duration guards (entry-timestamp __tEntry captured at function entry); existing hpaCompile-within-L3 guard stays complementary. __heavyLog persists across page navigation via GM_setValue('logistics_perf_heavy_log') on pagehide (listener registered in __startWatchdog — no load-time side effect in part 11); clears on enable/disable for a fresh session. Diagnoses the ADR 024 dump that reported 'Heavy ops (0)' during a 10.4s hpaGetTable block — next reproduction self-diagnoses the slow branch (hpaL1/hpaL2/hpaL3) or confirms downstream misattribution. Zero overhead when perf disabled (one branch + zero assignment, GM_getValue skipped). No new @grant (GM_setValue/GM_getValue already granted); test_routing + test_pathfinder_facade + test_flyhere_plot + test_dump_all + test_to + test_benchmark_auto_run green.
 // @description  v7.19: Memoize travelAP in optimizeFactoryRuns (ADR 027). The 2-opt/Or-opt local search makes O(L³) simTravelAP calls per pass (each a 5-layer function-call chain through HPA*) but only O(L²) unique location pairs — the same pairs repeat across candidates and passes. A direction-aware Map cache ('fromX,fromY|toX,toY') at the travelAP closure turns repeats into O(1) Map.get lookups; key is NOT sorted (Pardus terrain is asymmetric, travelAP(a,b)≠travelAP(b,a)). !== undefined sentinel (not !hit) handles same-tile AP=0 correctly; throws propagate uncached (hard-fail policy intact); per-invocation GC (3 call sites each get a fresh cache). Expected ~1.5s→~50ms on /overview_buildings.php. Pure cache: route output byte-identical (test_routing green). Same Map-memo pattern as _locCache (ADR 002). No new @grant; no new top-level symbols; static→volatile ordering preserved.
+// @description  v7.20: Memoize tracker projections in exports calculator (ADR 028). computeOpportunities (O(C×S×B) seller×buyer pairs) and computeTwoWayArbitrage (O(N²) location pairs) repeatedly call trackerProjectBuy/Sell at maxCargo for the same (entry, resId, maxCargo) across iterations — a direction+quantity+userloc-keyed Map cache (_projCache) deduplicates maxCargo projections from O(C×S×B)/O(N²×C) to O(C×(S+B))/O(N×C) computations + cache hits; actual-qty projections remain uncached (qty varies per pair). Also adds _rcCache to computeExportRoutes deduplicating realSectorAndCoords(e) across the export-items × store nested loop. All three are function-local const arrow closures (per-invocation GC, no top-level symbols, !== undefined sentinel for null returns), same pattern as _apCache (ADR 027) and _locCache (ADR 002). Pure cache: panel output byte-identical (test_opportunities green: 20k/6k/14k/26k). No new @grant; static→volatile ordering preserved.
 // @author       You
 // @match        https://*.pardus.at/main.php*
 // @match        https://*.pardus.at/overview_buildings.php*
@@ -3088,6 +3088,14 @@ self.onmessage = function(e) {
         if (Object.keys(store).length === 0) {
             return { error: 'No tracked locations yet. Open building/planet/starbase trade screens to capture them.' };
         }
+        const _rcCache = new Map();
+        const _rcOf = (e) => {
+            const hit = _rcCache.get(e.userloc);
+            if (hit !== undefined) return hit;
+            const rc = realSectorAndCoords(e);
+            _rcCache.set(e.userloc, rc);
+            return rc;
+        };
 
         const nameToResId = buildExportNameToResIdMap(store);
         const toEntry = findExportToEntry(store, toCoords);
@@ -3154,7 +3162,7 @@ self.onmessage = function(e) {
                 if (!c || c.sellToObjPrice <= 0) continue;
 
                 // Real sector + coords from tile ID (not stored e.sector/e.coords).
-                const rc = realSectorAndCoords(e);
+                const rc = _rcOf(e);
                 if (!rc.coords) continue;
                 const eSector = rc.sector;
                 const eCoords = rc.coords;
@@ -3680,6 +3688,15 @@ self.onmessage = function(e) {
         const routes = [];
         const usedFallback = false;
         let preFiltered = 0;
+        const _projCache = new Map();
+        const _proj = (entry, resId, qty, isBuy) => {
+            const k = entry.userloc + '|' + resId + '|' + qty + '|' + (isBuy ? 'b' : 's');
+            const hit = _projCache.get(k);
+            if (hit !== undefined) return hit;
+            const v = isBuy ? trackerProjectBuy(entry, resId, qty) : trackerProjectSell(entry, resId, qty);
+            _projCache.set(k, v);
+            return v;
+        };
 
         for (const resId in commodityIndex) {
             const ci = commodityIndex[resId];
@@ -3689,18 +3706,18 @@ self.onmessage = function(e) {
                 for (const buyer of ci.buyers) {
                     if (seller.entry.userloc === buyer.entry.userloc) continue;
 
-                    const buyProj = trackerProjectBuy(seller.entry, resId, maxCargo);
+                    const buyProj = _proj(seller.entry, resId, maxCargo, true);
                     if (!buyProj || buyProj.quantity <= 0) continue;
 
-                    const sellProj = trackerProjectSell(buyer.entry, resId, maxCargo);
+                    const sellProj = _proj(buyer.entry, resId, maxCargo, false);
                     if (!sellProj || sellProj.quantity <= 0) continue;
 
                     const qty = Math.min(buyProj.quantity, sellProj.quantity);
                     if (qty <= 0) continue;
 
                     // Re-project with actual quantity for accurate curve pricing.
-                    const finalBuy = trackerProjectBuy(seller.entry, resId, qty);
-                    const finalSell = trackerProjectSell(buyer.entry, resId, qty);
+                    const finalBuy = _proj(seller.entry, resId, qty, true);
+                    const finalSell = _proj(buyer.entry, resId, qty, false);
                     if (!finalBuy || !finalSell || finalBuy.quantity <= 0 || finalSell.quantity <= 0) continue;
 
                     const cost = finalBuy.totalCost;
@@ -3806,6 +3823,15 @@ self.onmessage = function(e) {
         const routes = [];
         const usedFallback = false;
         let preFiltered = 0;
+        const _projCache = new Map();
+        const _proj = (entry, resId, qty, isBuy) => {
+            const k = entry.userloc + '|' + resId + '|' + qty + '|' + (isBuy ? 'b' : 's');
+            const hit = _projCache.get(k);
+            if (hit !== undefined) return hit;
+            const v = isBuy ? trackerProjectBuy(entry, resId, qty) : trackerProjectSell(entry, resId, qty);
+            _projCache.set(k, v);
+            return v;
+        };
 
         for (let i = 0; i < locs.length; i++) {
             for (let j = i + 1; j < locs.length; j++) {
@@ -3825,12 +3851,12 @@ self.onmessage = function(e) {
 
                     // Forward: A sells X (buyFromObjPrice), B buys X (sellToObjPrice).
                     if (aComm.buyFromObjPrice > 0 && bComm.sellToObjPrice > 0) {
-                        const bp = trackerProjectBuy(A.entry, resId, maxCargo);
-                        const sp = trackerProjectSell(B.entry, resId, maxCargo);
+                        const bp = _proj(A.entry, resId, maxCargo, true);
+                        const sp = _proj(B.entry, resId, maxCargo, false);
                         if (bp && sp && bp.quantity > 0 && sp.quantity > 0) {
                             const q = Math.min(bp.quantity, sp.quantity);
-                            const fb = trackerProjectBuy(A.entry, resId, q);
-                            const fs = trackerProjectSell(B.entry, resId, q);
+                            const fb = _proj(A.entry, resId, q, true);
+                            const fs = _proj(B.entry, resId, q, false);
                             if (fb && fs && fb.quantity > 0 && fs.quantity > 0) {
                                 const p = fs.totalRevenue - fb.totalCost;
                                 if (p > 0) fwdCandidates.push({
@@ -3843,12 +3869,12 @@ self.onmessage = function(e) {
 
                     // Return: B sells Y (buyFromObjPrice), A buys Y (sellToObjPrice).
                     if (aComm.sellToObjPrice > 0 && bComm.buyFromObjPrice > 0) {
-                        const bp = trackerProjectBuy(B.entry, resId, maxCargo);
-                        const sp = trackerProjectSell(A.entry, resId, maxCargo);
+                        const bp = _proj(B.entry, resId, maxCargo, true);
+                        const sp = _proj(A.entry, resId, maxCargo, false);
                         if (bp && sp && bp.quantity > 0 && sp.quantity > 0) {
                             const q = Math.min(bp.quantity, sp.quantity);
-                            const fb = trackerProjectBuy(B.entry, resId, q);
-                            const fs = trackerProjectSell(A.entry, resId, q);
+                            const fb = _proj(B.entry, resId, q, true);
+                            const fs = _proj(A.entry, resId, q, false);
                             if (fb && fs && fb.quantity > 0 && fs.quantity > 0) {
                                 const p = fs.totalRevenue - fb.totalCost;
                                 if (p > 0) retCandidates.push({
